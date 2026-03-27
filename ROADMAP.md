@@ -150,50 +150,69 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 ## Phase 4: Server (`server`)
 
 ### Database (`db/`)
-- [ ] SQLite schema: `users` table
-- [ ] SQLite schema: `signed_prekeys` table
-- [ ] SQLite schema: `prekeys` table (one-time, atomic `DELETE RETURNING` on fetch)
-- [ ] SQLite schema: `message_queue` table with indexes on `(recipient_id, created_at)` and `created_at`
-- [ ] Schema versioning via `PRAGMA user_version`
-- [ ] `db/users.rs` — register user, lookup user, verify identity key
-- [ ] `db/prekeys.rs` — upload prekeys, fetch+delete bundle atomically, count remaining
-- [ ] `db/queue.rs` — enqueue message (dedup on message_id), dequeue for recipient, delete on ack
+- [x] SQLite schema: `users` table
+- [x] SQLite schema: `signed_prekeys` table
+- [x] SQLite schema: `prekeys` table (one-time, atomic `DELETE RETURNING` on fetch)
+- [x] SQLite schema: `message_queue` table with indexes on `(recipient_id, created_at)` and `created_at`
+- [x] Schema versioning via `PRAGMA user_version`
+- [x] `PRAGMA foreign_keys = ON` and `journal_mode = WAL`
+- [x] `db/users.rs` — `register_atomic` (single transaction), lookup, exists
+- [x] `db/prekeys.rs` — upload prekeys, fetch+delete bundle atomically, count remaining
+- [x] `db/queue.rs` — enqueue (dedup on `message_id`), get pending (with LIMIT), delete scoped to recipient
 
 ### Core server state
-- [ ] `AppState` struct (db connection, connection registry)
-- [ ] `ConnectionRegistry` using `DashMap<UserId, mpsc::UnboundedSender<ServerMessage>>`
-- [ ] Document: never iterate `DashMap` while holding a `Ref` guard (deadlock risk)
+- [x] `AppState` struct (db connection, connection registry, server_id)
+- [x] `ConnectionRegistry` using `DashMap` with conn_id for safe replacement
+- [x] `remove_if_match(conn_id)` — prevents old connection from evicting new one
+- [x] Displaced connection notified with 409 error before replacement
 
 ### WebSocket handler (`ws.rs`)
-- [ ] axum router with WebSocket upgrade at `GET /ws`
-- [ ] Per-connection tokio task (split into SplitStream + SplitSink)
-- [ ] mpsc channel per connection for server->client pushes
-- [ ] Connection cleanup on disconnect (remove from registry)
-- [ ] WebSocket ping/pong keepalive
+- [x] axum router with WebSocket upgrade at `GET /ws`
+- [x] Per-connection tokio task (split into SplitStream + SplitSink)
+- [x] Bounded `mpsc::channel(256)` per connection with `try_send` backpressure
+- [x] Connection cleanup on disconnect (conditional `remove_if_match`)
+- [x] `max_frame_size` / `max_message_size` set (512KB + 16KB headroom)
+- [ ] WebSocket ping/pong keepalive (deferred — operational concern)
 
 ### Auth handlers (`handlers/auth.rs`)
-- [ ] `Register` — store user + identity key + prekey bundle (TOFU)
-- [ ] `AuthChallenge` — generate 32-byte nonce + timestamp, store transiently
-- [ ] `AuthResponse` — verify Ed25519 signature over `nonce || timestamp || server_id`, time-limited (60s)
-- [ ] Mark connection as authenticated in registry
+- [x] `Register` — atomic TOFU with identity key validation (`VerifyingKey::from_bytes`) and SPK signature verification
+- [x] Rejects re-registration of existing users (must use challenge-response)
+- [x] Rejects registration from already-authenticated connections
+- [x] `AuthChallenge` — generate 32-byte nonce + timestamp, store transiently
+- [x] `AuthResponse` — verify Ed25519 signature over `nonce || timestamp || server_id`, time-limited (60s)
+- [x] Mark connection as authenticated with conn_id in registry
+- [x] `QueuedMessages` delivered after `AuthSuccess` is on the wire
 
 ### PreKey handlers (`handlers/prekey.rs`)
-- [ ] `FetchPreKeyBundle` — return identity key + signed prekey + one OPK (atomically deleted)
-- [ ] `UploadPreKeys` — store new one-time prekeys
-- [ ] `PreKeyLow` alert — send when count drops below threshold (e.g., 10)
+- [x] `FetchPreKeyBundle` — return identity key + signed prekey + one OPK (atomically deleted)
+- [x] `UploadPreKeys` — store new one-time prekeys (rejects invalid base64 batches)
+- [x] `PreKeyLow` alert — send when count drops below threshold (10)
+- [x] `MAX_PREKEYS_PER_UPLOAD` enforced on both register and upload
 
 ### Message handlers (`handlers/message.rs`)
-- [ ] `SendMessage` — store in queue, push to recipient if online, reply `MessageSent`
-- [ ] `QueuedMessages` — deliver all pending on connect
-- [ ] `Ack` — delete acknowledged messages from queue
+- [x] `SendMessage` — verify recipient exists (404), enforce `MAX_CIPHERTEXT_BYTES`, store in queue, push if online
+- [x] `QueuedMessages` — deliver pending on connect (limited by `MAX_QUEUED_MESSAGES`)
+- [x] `Ack` — delete scoped to authenticated user (`AND recipient_id = ?`), enforce `MAX_ACK_BATCH`
+- [x] Malformed queued messages logged with `warn!` (not silently dropped)
 
 ### Background tasks
-- [ ] Message queue GC (hourly, delete messages older than 30 days)
-- [ ] Rate limiting on prekey bundle requests and message sending
+- [x] Message queue GC (hourly, delete messages older than 30 days)
+- [ ] Rate limiting on prekey bundle requests and message sending (deferred)
 
 ### Server entry point
-- [ ] `main.rs` — parse config (bind address, db path), init DB, start axum server
-- [ ] Graceful shutdown on SIGINT/SIGTERM
+- [x] `main.rs` — env-based config (bind address, db path, server_id), init DB, start axum server
+- [x] Graceful shutdown on SIGINT/SIGTERM
+
+### Hardening (from code reviews)
+- [x] Atomic registration — partial failure cannot brick a user
+- [x] Identity key validated as Ed25519 before storage
+- [x] SPK signature verified at registration (defense-in-depth)
+- [x] Bounded WebSocket channels with backpressure
+- [x] Connection replacement race prevented via conn_id matching
+- [x] Ack authorization scoped to authenticated user
+- [x] All `protocol::consts` limits enforced
+- [x] Recipient existence checked before enqueue (404 vs FK 500)
+- [x] Silent error paths replaced with `warn!` logging
 
 ### Tests
 - [ ] Integration test: full auth flow (register -> challenge -> response -> authenticated)
@@ -201,8 +220,16 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [ ] Integration test: prekey fetch race condition (concurrent requests get different OPKs)
 - [ ] Integration test: store-and-forward (send while offline, connect, receive, ack, verify deleted)
 - [ ] Integration test: message deduplication (same message_id sent twice)
-- [ ] `cargo test -p server` passes
-- [ ] `cargo clippy -p server -- -D warnings` passes
+- [x] `cargo clippy -p server -- -D warnings` passes
+
+### Deferred (not M1 blockers)
+- [ ] `handle_upload` returns wrong response type — needs `ServerMessage::PreKeysUploaded` variant
+- [ ] Timestamps always 0 — needs `QueuedRow.created_at` propagation
+- [ ] Self-fetch drains own prekeys
+- [ ] Total prekey cap per user
+- [ ] WebSocket ping/pong keepalive
+- [ ] Prekey bundle fetch rate limiting
+- [ ] User existence oracle (404 vs generic error)
 
 ---
 

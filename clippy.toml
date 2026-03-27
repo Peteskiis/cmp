@@ -6,3 +6,7 @@ too-many-lines-threshold = 100
 
 # Maximum function arguments before warning
 too-many-arguments-threshold = 7
+
+# Allow expect()/unwrap() in #[cfg(test)] code — no manual #[allow] needed on test modules
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
