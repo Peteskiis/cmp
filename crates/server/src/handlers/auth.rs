@@ -112,7 +112,7 @@ pub async fn handle_auth_challenge(
 
     match db::users::exists(&state.db, uid).await {
         Ok(true) => {}
-        Ok(false) => return auth_failure("user not found"),
+        Ok(false) => return auth_failure("authentication failed"),
         Err(e) => {
             return {
                 tracing::error!("db error: {e}");
@@ -159,7 +159,7 @@ pub async fn handle_auth_response(
 
     let identity_bytes = match db::users::get_identity_key(&state.db, &challenge.user_id).await {
         Ok(Some(k)) => k,
-        Ok(None) => return auth_failure("user not found"),
+        Ok(None) => return auth_failure("authentication failed"),
         Err(e) => {
             return {
                 tracing::error!("db error: {e}");
