@@ -1,4 +1,5 @@
 mod app;
+mod crypto_mgr;
 mod net;
 mod ui;
 

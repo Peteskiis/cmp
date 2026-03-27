@@ -1,13 +1,11 @@
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers};
 use futures::StreamExt;
-use protocol::{
-    ClientMessage, EncryptedEnvelope, MessageId, ServerMessage, UserId, consts,
-    types::{MessageHeader, RatchetHeader},
-};
+use protocol::{ClientMessage, MessageId, ServerMessage, UserId, consts};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 
+use crate::crypto_mgr::CryptoManager;
 use crate::{net, ui};
 
 /// Events that flow into the main UI loop.
@@ -20,76 +18,66 @@ pub enum AppEvent {
     Server(ServerMessage),
 }
 
-#[allow(dead_code)] // user_id needed for future features (message display, ack scoping)
 struct App {
-    user_id: String,
     input: String,
     cursor_pos: usize,
-    /// Horizontal scroll offset for long input lines.
     input_scroll: usize,
-    target_user: Option<String>,
+    target_user: Option<UserId>,
     running: bool,
+    crypto: CryptoManager,
 }
 
 impl App {
-    fn new(user_id: &str) -> Self {
+    const fn new(crypto: CryptoManager) -> Self {
         Self {
-            user_id: user_id.to_owned(),
             input: String::new(),
             cursor_pos: 0,
             input_scroll: 0,
             target_user: None,
             running: true,
+            crypto,
         }
+    }
+
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor_pos = 0;
     }
 }
 
-/// Main entry point.
 pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
-    // Validate user ID once at startup
     let validated_uid = UserId::new(user_id)?;
 
-    // Generate ephemeral identity key (persistence deferred — see ROADMAP Phase 5 DB work)
-    let identity = crypto::keys::IdentityKeyPair::generate();
+    let data_dir = dirs_data_dir(user_id);
+    let crypto = CryptoManager::load_or_generate(&data_dir)?;
 
-    // Register with server first
-    if let Err(e) = register_with_server(user_id, server_url, &identity).await {
-        eprintln!("Registration failed: {e}");
-        // Continue — might already be registered, auth will handle it
+    if let Err(e) = register_with_server(user_id, server_url, crypto.identity()).await {
+        eprintln!("Registration: {e}");
     }
 
-    // Channels
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<ClientMessage>();
 
-    // Spawn network task with pre-validated UserId
     let net_url = server_url.to_owned();
     let net_uid = validated_uid.clone();
-    let net_identity = crypto::keys::IdentityKeyPair::from_bytes(&identity.to_bytes());
+    let net_identity = crypto::keys::IdentityKeyPair::from_bytes(&crypto.identity().to_bytes());
     tokio::spawn(async move {
         net::run(net_url, net_uid, &net_identity, event_tx, outgoing_rx).await;
     });
 
-    // Set up inline TUI
     let (mut terminal, _guard) = ui::init()?;
-
     ui::insert_status(&mut terminal, &format!("logged in as {user_id}"))?;
-    ui::insert_status(
-        &mut terminal,
-        "\u{26a0} messages are NOT encrypted (placeholder mode)",
-    )?;
     ui::insert_status(
         &mut terminal,
         "type /chat <username> to start a conversation",
     )?;
 
-    let mut app = App::new(user_id);
+    let mut app = App::new(crypto);
     let mut event_stream = EventStream::new();
 
     while app.running {
-        // Compute visible input slice for horizontal scrolling
         let term_width = terminal.size()?.width as usize;
-        let max_visible = term_width.saturating_sub(4); // 4 for " › " prefix
+        let max_visible = term_width.saturating_sub(4);
         update_scroll(&mut app, max_visible);
         let visible_input = visible_slice(&app.input, app.input_scroll, max_visible);
         let visible_cursor = app.cursor_pos.saturating_sub(app.input_scroll);
@@ -101,12 +89,17 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
                 handle_key_event(&mut app, &mut terminal, &outgoing_tx, event)?;
             }
             Some(event) = event_rx.recv() => {
-                handle_app_event(&app, &mut terminal, &outgoing_tx, event)?;
+                handle_app_event(&mut app, &mut terminal, &outgoing_tx, event)?;
             }
         }
     }
 
     Ok(())
+}
+
+fn dirs_data_dir(user_id: &str) -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+    std::path::PathBuf::from(home).join(".cmp").join(user_id)
 }
 
 const fn update_scroll(app: &mut App, max_visible: usize) {
@@ -168,7 +161,6 @@ fn handle_key_event(
                 app.cursor_pos += 1;
             }
         }
-        // Only insert printable chars without control/alt modifiers
         (KeyCode::Char(c), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
             let byte_pos = app
                 .input
@@ -180,7 +172,6 @@ fn handle_key_event(
         }
         _ => {}
     }
-
     Ok(())
 }
 
@@ -194,72 +185,75 @@ fn handle_enter(
         return Ok(());
     }
 
-    // Handle /chat command — validate username immediately
     if let Some(target) = text.strip_prefix("/chat ") {
         let target = target.trim();
         match UserId::new(target) {
-            Ok(_) => {
-                app.target_user = Some(target.to_owned());
-                ui::insert_status(terminal, &format!("chatting with {target}"))?;
+            Ok(uid) => {
+                if app.crypto.has_session(target) {
+                    ui::insert_status(
+                        terminal,
+                        &format!("chatting with {target} (E2EE active \u{1f512})"),
+                    )?;
+                } else {
+                    app.crypto.add_pending(target);
+                    let _ = outgoing_tx.send(ClientMessage::FetchPreKeyBundle {
+                        target_user_id: uid.clone(),
+                    });
+                    ui::insert_status(terminal, &format!("fetching keys for {target}..."))?;
+                }
+                app.target_user = Some(uid);
             }
             Err(e) => {
                 ui::insert_status(terminal, &format!("invalid username: {e}"))?;
             }
         }
-        app.input.clear();
-        app.cursor_pos = 0;
+        app.clear_input();
         return Ok(());
     }
 
     let Some(ref target) = app.target_user else {
         ui::insert_status(terminal, "use /chat <username> first")?;
-        app.input.clear();
-        app.cursor_pos = 0;
+        app.clear_input();
         return Ok(());
     };
+    let target_str = target.as_str();
 
-    // Check message size limit before sending
-    let ciphertext = B64.encode(text.as_bytes());
-    if ciphertext.len() > consts::MAX_CIPHERTEXT_BYTES {
-        ui::insert_status(terminal, "message too long")?;
-        app.input.clear();
-        app.cursor_pos = 0;
+    if !app.crypto.has_session(target_str) {
+        ui::insert_status(terminal, "waiting for session establishment...")?;
+        app.clear_input();
         return Ok(());
     }
 
-    let envelope = EncryptedEnvelope {
-        version: 1,
-        header: MessageHeader::Ratchet(RatchetHeader {
-            ratchet_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
-            previous_chain_length: 0,
-            message_number: 0,
-        }),
-        ciphertext,
-    };
-
-    // Defensive re-validation — /chat validates at set time, but target could
-    // theoretically be stale if validation rules change
-    let Ok(recipient) = UserId::new(target.as_str()) else {
-        ui::insert_status(terminal, "invalid recipient")?;
-        app.input.clear();
-        app.cursor_pos = 0;
+    // Check plaintext size BEFORE encrypting to avoid ratchet desync.
+    // Estimate: (plaintext + 16-byte AEAD tag + 2 padding) * 4/3 for base64
+    let estimated_b64_len = (text.len() + 18) / 3 * 4;
+    if estimated_b64_len > consts::MAX_CIPHERTEXT_BYTES {
+        ui::insert_status(terminal, "message too long")?;
+        app.clear_input();
         return Ok(());
+    }
+
+    let envelope = match app.crypto.encrypt(target_str, text.as_bytes()) {
+        Ok(env) => env,
+        Err(e) => {
+            ui::insert_status(terminal, &format!("encrypt error: {e}"))?;
+            app.clear_input();
+            return Ok(());
+        }
     };
 
     let _ = outgoing_tx.send(ClientMessage::SendMessage {
-        recipient_id: recipient,
+        recipient_id: target.clone(),
         message_id: MessageId::new(),
         envelope,
     });
     ui::insert_user_message(terminal, &text)?;
-
-    app.input.clear();
-    app.cursor_pos = 0;
+    app.clear_input();
     Ok(())
 }
 
 fn handle_app_event(
-    app: &App,
+    app: &mut App,
     terminal: &mut ui::Term,
     outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
     event: AppEvent,
@@ -277,38 +271,50 @@ fn handle_app_event(
     Ok(())
 }
 
+#[allow(clippy::cognitive_complexity)]
 fn handle_server_message(
-    _app: &App,
+    app: &mut App,
     terminal: &mut ui::Term,
     outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
     msg: ServerMessage,
 ) -> anyhow::Result<()> {
     match msg {
+        ServerMessage::PreKeyBundleResponse { user_id, bundle } => {
+            let peer = user_id.as_str().to_owned();
+            if app.crypto.is_pending(&peer) {
+                match app.crypto.init_session_from_bundle(&peer, &bundle) {
+                    Ok(()) => {
+                        ui::insert_status(
+                            terminal,
+                            &format!("E2EE session established with {peer} \u{1f512}"),
+                        )?;
+                    }
+                    Err(e) => {
+                        ui::insert_status(terminal, &format!("session init failed: {e}"))?;
+                    }
+                }
+            }
+        }
         ServerMessage::IncomingMessage(inbound) => {
-            let sender = inbound.sender_id.as_str();
-            let text = B64
-                .decode(&inbound.envelope.ciphertext)
-                .ok()
-                .and_then(|b| String::from_utf8(b).ok())
-                .unwrap_or_else(|| "[encrypted message]".to_owned());
-            ui::insert_friend_message(terminal, sender, &text)?;
-
-            // Ack the message so the server removes it from the queue
-            let _ = outgoing_tx.send(ClientMessage::Ack {
-                message_ids: vec![inbound.message_id],
-            });
+            let sender = inbound.sender_id.as_str().to_owned();
+            let (text, ok) = app.crypto.decrypt_to_text(&sender, &inbound.envelope);
+            ui::insert_friend_message(terminal, &sender, &text)?;
+            // Only ack if decryption succeeded — failed messages should be re-delivered
+            if ok {
+                let _ = outgoing_tx.send(ClientMessage::Ack {
+                    message_ids: vec![inbound.message_id],
+                });
+            }
         }
         ServerMessage::QueuedMessages { messages } => {
             let mut ack_ids = Vec::with_capacity(messages.len());
             for inbound in messages {
-                let sender = inbound.sender_id.as_str();
-                let text = B64
-                    .decode(&inbound.envelope.ciphertext)
-                    .ok()
-                    .and_then(|b| String::from_utf8(b).ok())
-                    .unwrap_or_else(|| "[encrypted message]".to_owned());
-                ui::insert_friend_message(terminal, sender, &text)?;
-                ack_ids.push(inbound.message_id);
+                let sender = inbound.sender_id.as_str().to_owned();
+                let (text, ok) = app.crypto.decrypt_to_text(&sender, &inbound.envelope);
+                ui::insert_friend_message(terminal, &sender, &text)?;
+                if ok {
+                    ack_ids.push(inbound.message_id);
+                }
             }
             if !ack_ids.is_empty() {
                 let _ = outgoing_tx.send(ClientMessage::Ack {
@@ -330,7 +336,6 @@ fn handle_server_message(
     Ok(())
 }
 
-/// Register with the server (first-time setup).
 async fn register_with_server(
     user_id: &str,
     server_url: &str,
@@ -372,7 +377,6 @@ async fn register_with_server(
     )
     .await?;
 
-    // Read response — fail explicitly on unexpected/missing responses
     let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
         futures::StreamExt::next(&mut stream).await
     else {
@@ -384,7 +388,7 @@ async fn register_with_server(
     }
     if let Ok(ServerMessage::AuthFailure { reason }) = serde_json::from_str(&text) {
         if reason.contains("already exists") {
-            return Ok(()); // Already registered — will auth via challenge-response
+            return Ok(());
         }
         anyhow::bail!("registration rejected: {reason}");
     }

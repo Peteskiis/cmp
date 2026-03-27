@@ -236,78 +236,104 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 ## Phase 5: Client (`client`)
 
 ### CLI entry point (`main.rs`)
-- [ ] clap CLI: `--user <name>`, `--server <ws://url>`, `--db-path <path>`
-- [ ] Default db path: `~/.cmp/<user_id>/client.db`
-
-### Local database (`db.rs`)
-- [ ] SQLCipher-encrypted SQLite (key derived via Argon2id from passphrase)
-- [ ] Schema: `identity`, `contacts`, `messages`, `sessions`, `skipped_message_keys`, `prekeys`, `signed_prekeys`
-- [ ] Schema versioning via `PRAGMA user_version`
-- [ ] Implement crypto `SessionStore` trait backed by SQLite
-- [ ] Implement crypto `PreKeyStore` trait backed by SQLite
-- [ ] Implement crypto `IdentityKeyStore` trait backed by SQLite
-- [ ] Message history CRUD (insert, query by conversation, mark status)
+- [x] clap CLI: `--user <name>`, `--server <ws://url>`
+- [x] Data directory: `~/.cmp/<user_id>/`
 
 ### Network layer (`net.rs`)
-- [ ] WebSocket client connection (tokio-tungstenite with rustls)
-- [ ] Reconnect with exponential backoff (1s, 2s, 4s, 8s, cap 30s)
-- [ ] Send `ClientMessage` to server via channel
-- [ ] Receive `ServerMessage` from server, forward to UI via `AppEvent` channel
-- [ ] Re-authenticate on reconnect, re-fetch queued messages
+- [x] WebSocket client connection (tokio-tungstenite with rustls)
+- [x] Reconnect with exponential backoff (1s → 30s cap, resets only after auth succeeds)
+- [x] Send `ClientMessage` to server via channel
+- [x] Receive `ServerMessage` from server, forward to UI via `AppEvent` channel
+- [x] Challenge-response authentication (Ed25519 signature)
+- [x] `AuthFailed` event for clear UX on persistent auth failure
+- [x] Unparseable server messages logged with `warn!` (not silently dropped)
 
-### Crypto integration (`crypto.rs`)
-- [ ] Initialize `CryptoManager` with store trait impls backed by local SQLite
-- [ ] Registration flow: generate identity key, signed prekey, 100 one-time prekeys
-- [ ] New conversation flow: fetch prekey bundle -> X3DH -> initialize session
-- [ ] Send: encrypt with Double Ratchet -> produce `EncryptedEnvelope`
-- [ ] Receive: decrypt `EncryptedEnvelope` -> store plaintext locally -> ack
+### Crypto integration (`crypto_mgr.rs`)
+- [x] `CryptoManager` — manages identity, sessions, encrypt/decrypt
+- [x] Persistent identity key (`~/.cmp/<user_id>/identity.key`, 0o600 permissions)
+- [x] Registration flow: generate identity key, signed prekey, 100 OPKs
+- [x] X3DH session init: `/chat <user>` → `FetchPreKeyBundle` → `init_session_from_bundle`
+- [x] Alice sends `PreKey` header on first message (ephemeral key + SPK/OPK IDs)
+- [x] Bob handles `PreKey` messages via `init_session_from_prekey` + `bob_respond`
+- [x] Send: encrypt with Double Ratchet → `EncryptedEnvelope`
+- [x] Receive: decrypt `EncryptedEnvelope` → display text
+- [x] Only ack messages that successfully decrypt (failed messages re-delivered)
+- [x] Plaintext size checked before encrypting (prevents ratchet desync)
+- [x] OPK decode failures return error (no silent 3-DH degradation)
+- [x] No plaintext fallback — decrypt failure shows `[undecryptable message]`
+- [x] `decrypt_to_text` returns `(text, ok)` for conditional ack
+- [x] `b64_decode_fixed::<N>()` helper with parameterized error variant
+- [x] Concurrent session inits via `HashSet<String>` (not single pending)
 
 ### Inline TUI (`ui.rs` + `app.rs`)
-- [ ] `Viewport::Inline(INPUT_HEIGHT)` terminal setup (not full-screen)
-- [ ] Raw mode with RAII `Drop` guard (scopeguard for cleanup on panic)
-- [ ] Input widget: dark bg `rgb(40,44,52)`, teal prompt `rgb(34,199,168)`, blinking cursor
-- [ ] Placeholder text when input is empty
-- [ ] Message rendering via `terminal.insert_before()`:
-  - [ ] Your messages: `"› "` bold+dim prefix, adaptive dark background
-  - [ ] Friend messages: `"• "` dim prefix, plain background
-  - [ ] Continuation lines: 2-space indent
-  - [ ] Line wrapping respecting terminal width
-- [ ] Adaptive background color (query terminal bg via crossterm, blend 12% white / 4% black)
-- [ ] Footer with keyboard hints
+- [x] `Viewport::Inline(INPUT_HEIGHT)` terminal setup (not full-screen)
+- [x] Raw mode with RAII `Drop` guard + panic hook (restores cursor style too)
+- [x] Input widget: dark bg `rgb(40,44,52)`, teal prompt `rgb(34,199,168)`, blinking cursor
+- [x] Placeholder text when input is empty
+- [x] Message rendering via `terminal.insert_before()`:
+  - [x] Your messages: `"› "` bold+dim prefix, dark background
+  - [x] Friend messages: `"• sender: "` dim prefix, plain background
+  - [x] Line wrapping with per-message-type prefix width
+- [x] Footer with keyboard hints
+- [x] Horizontal input scrolling for long messages
+- [x] Ctrl+modifier filtering (only printable chars inserted)
+- [ ] Adaptive background color (query terminal bg via crossterm)
 - [ ] Input history (up/down arrow)
 
 ### App event loop (`app.rs`)
-- [ ] `AppEvent` enum (Key, ServerMessage, Connected, Disconnected)
-- [ ] `App` struct owns `Terminal` exclusively — only task that calls `draw()`/`insert_before()`
-- [ ] `tokio::select!` loop: poll crossterm `EventStream` + network event channel
-- [ ] Enter to send message (encrypt + send + insert_before for local echo)
-- [ ] Display incoming messages (decrypt + insert_before)
-- [ ] Connection status display
-- [ ] Ctrl+D / Ctrl+C to quit (with raw mode cleanup)
+- [x] `AppEvent` enum (Key, ServerMessage, Connected, Disconnected, AuthFailed)
+- [x] `App` struct owns `Terminal` exclusively
+- [x] `tokio::select!` loop: poll crossterm `EventStream` + network event channel
+- [x] Enter to send message (encrypt + send + insert_before for local echo)
+- [x] Display incoming messages (decrypt + insert_before)
+- [x] Connection status display
+- [x] Ctrl+D / Ctrl+C to quit (with raw mode cleanup)
+- [x] `/chat <username>` command with UserId validation
 
 ### Tests
+- [x] `wrap_message` unit tests (7 tests: empty, short, long, overflow, zero width)
 - [ ] Crypto store trait SQLite implementation tests
-- [ ] Message rendering snapshot tests (ratatui `TestBackend`)
 - [ ] Network handler tests with mock WebSocket
-- [ ] `cargo test -p client` passes
-- [ ] `cargo clippy -p client -- -D warnings` passes
+- [x] `cargo test -p client` passes (7 tests)
+- [x] `cargo clippy -p client -- -D warnings` passes
+
+### Hardening (from code reviews)
+- [x] Identity key file permissions 0o600 on Unix
+- [x] No unauthenticated content displayed as message text
+- [x] Plaintext size check before encrypt (prevents ratchet desync)
+- [x] OPK decode failures are errors, not silent degradation
+- [x] Only ack successfully decrypted messages
+- [x] `CryptoError` uses `thiserror::Error` + `#[non_exhaustive]`
+- [x] Backoff only resets after successful authentication
+- [x] Auth challenge failure sends `AuthFailed`, not `Disconnected`
+
+### Deferred (not M1 blockers)
+- [ ] SQLCipher-encrypted local database
+- [ ] Session persistence to disk (currently in-memory only)
+- [ ] SPK/OPK private key persistence (Bob can't decrypt if keys lost between restarts)
+- [ ] Message history persistence
+- [ ] Adaptive terminal background color detection
 
 ---
 
 ## Phase 6: End-to-End Integration
 
-- [ ] Integration test: start server on random port
-- [ ] Integration test: two programmatic clients (no TUI) register
-- [ ] Integration test: Alice fetches Bob's prekey bundle, initiates session
-- [ ] Integration test: Alice sends encrypted message, Bob receives and decrypts
+- [x] Integration test: start server on random port
+- [x] Integration test: two programmatic clients (no TUI) register
+- [x] Integration test: Alice fetches Bob's prekey bundle
+- [ ] Integration test: Alice sends encrypted message, Bob receives and decrypts (blocked by SPK persistence)
 - [ ] Integration test: Bob replies, Alice receives and decrypts
-- [ ] Integration test: offline delivery (send while disconnected, reconnect, receive)
+- [x] Integration test: offline delivery (send while offline, connect, receive, ack)
+- [x] Integration test: ack removes from queue (no re-delivery)
+- [x] Integration test: send to nonexistent user fails
+- [x] Integration test: unauthenticated send rejected
+- [x] Integration test: auth with wrong key rejected
 - [ ] Manual test: run server + two TUI clients in separate terminals
-- [ ] Full workspace verification:
-  - [ ] `cargo check --workspace`
-  - [ ] `cargo test --workspace`
-  - [ ] `cargo clippy --workspace -- -D warnings`
-  - [ ] `cargo fmt --all -- --check`
+- [x] Full workspace verification:
+  - [x] `cargo check --workspace`
+  - [x] `cargo test --workspace` (89 tests)
+  - [x] `cargo clippy --workspace -- -D warnings`
+  - [x] `cargo fmt --all -- --check`
 
 ---
 
