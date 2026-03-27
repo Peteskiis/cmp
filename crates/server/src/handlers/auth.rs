@@ -296,6 +296,8 @@ fn parse_sqlite_datetime(s: &str) -> u64 {
     let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
     let leap_adj = i64::from(is_leap && month > 2);
     let m_idx = (month - 1).clamp(0, 11);
+    // All components derive from datetime('now') which is always >= 1970,
+    // so the sum is non-negative. cast_sign_loss is safe.
     #[allow(clippy::cast_sign_loss)]
     let total = ((days + month_days[m_idx as usize] + day - 1 + leap_adj) * 86400
         + hour * 3600

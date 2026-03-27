@@ -55,9 +55,10 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
         let client_msg: ClientMessage = match serde_json::from_str(&text) {
             Ok(m) => m,
             Err(e) => {
+                tracing::warn!("malformed client message: {e}");
                 let _ = tx.try_send(ServerMessage::Error {
                     code: 400,
-                    message: format!("invalid message: {e}"),
+                    message: "malformed message".to_owned(),
                 });
                 continue;
             }

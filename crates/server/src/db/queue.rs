@@ -16,24 +16,39 @@ pub async fn enqueue(
     let sender_id = sender_id.to_owned();
 
     conn.call(move |conn| {
-        // Check per-user queue depth before inserting
-        let count: i64 = conn.query_row(
+        // Wrap in transaction to prevent TOCTOU between COUNT and INSERT
+        let tx = conn.transaction()?;
+
+        // Check recipient exists (clear result vs FK constraint error)
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE user_id = ?1)",
+            [&recipient_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            tx.rollback()?;
+            return Ok(EnqueueResult::RecipientNotFound);
+        }
+
+        // Check per-user queue depth
+        let count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM message_queue WHERE recipient_id = ?1",
             [&recipient_id],
             |row| row.get(0),
         )?;
-        // i64 from SQLite, safe to compare as usize
-        // count is non-negative from COUNT(*), safe to compare directly
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        if (count as usize) >= max_queue_per_user {
+        // count is non-negative from COUNT(*); MAX_QUEUE_PER_USER (10,000) fits in i64
+        if count >= i64::try_from(max_queue_per_user).unwrap_or(i64::MAX) {
+            tx.rollback()?;
             return Ok(EnqueueResult::QueueFull);
         }
 
-        let changed = conn.execute(
+        let changed = tx.execute(
             "INSERT OR IGNORE INTO message_queue (message_id, recipient_id, sender_id, envelope)
              VALUES (?1, ?2, ?3, ?4)",
             (&message_id, &recipient_id, &sender_id, &envelope_json),
         )?;
+        tx.commit()?;
+
         if changed > 0 {
             Ok(EnqueueResult::Inserted)
         } else {
@@ -45,10 +60,12 @@ pub async fn enqueue(
 }
 
 /// Result of attempting to enqueue a message.
+#[non_exhaustive]
 pub enum EnqueueResult {
     Inserted,
     Duplicate,
     QueueFull,
+    RecipientNotFound,
 }
 
 /// Retrieve queued messages for a recipient, ordered by creation time.

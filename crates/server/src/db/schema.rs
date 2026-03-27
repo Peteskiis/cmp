@@ -13,7 +13,9 @@ pub async fn initialize(conn: &Connection) -> anyhow::Result<()> {
         let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
 
         if version < 1 {
-            conn.execute_batch(
+            // Wrap migration in a transaction — partial failure must not leave a broken schema
+            let tx = conn.transaction()?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS users (
                     user_id     TEXT PRIMARY KEY,
@@ -52,9 +54,10 @@ pub async fn initialize(conn: &Connection) -> anyhow::Result<()> {
                     ON message_queue(created_at);
                 ",
             )?;
+            tx.pragma_update(None, "user_version", CURRENT_VERSION)?;
+            tx.commit()?;
         }
 
-        conn.pragma_update(None, "user_version", CURRENT_VERSION)?;
         Ok(())
     })
     .await?;

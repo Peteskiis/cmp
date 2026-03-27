@@ -13,7 +13,7 @@ pub async fn handle_fetch(state: &AppState, target_user_id: UserId) -> ServerMes
 
     let identity_key = match db::users::get_identity_key(&state.db, uid).await {
         Ok(Some(k)) => B64.encode(k),
-        Ok(None) => return error_404(&format!("user not found: {uid}")),
+        Ok(None) => return error_404("not found"),
         Err(e) => {
             return {
                 tracing::error!("db error: {e}");
@@ -25,7 +25,7 @@ pub async fn handle_fetch(state: &AppState, target_user_id: UserId) -> ServerMes
     let (spk_id, spk_bytes, sig_bytes) = match db::prekeys::get_signed_prekey(&state.db, uid).await
     {
         Ok(Some(spk)) => spk,
-        Ok(None) => return error_404(&format!("no signed prekey for user: {uid}")),
+        Ok(None) => return error_404("not found"),
         Err(e) => {
             return {
                 tracing::error!("db error: {e}");

@@ -40,6 +40,9 @@ pub async fn handle_send(
         Ok(EnqueueResult::QueueFull) => {
             return error_400("recipient's message queue is full");
         }
+        Ok(EnqueueResult::RecipientNotFound) => {
+            return super::error_404("not found");
+        }
         Err(e) => {
             tracing::error!("failed to queue message: {e}");
             return error_500_generic();
