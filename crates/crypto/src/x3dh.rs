@@ -132,7 +132,6 @@ fn derive_x3dh_secret(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::keys::{IdentityKeyPair, SignedPreKey, generate_one_time_prekeys};

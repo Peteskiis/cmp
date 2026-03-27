@@ -39,7 +39,7 @@ cargo run -p client -- --user alice --server ws://127.0.0.1:3000/ws  # Run clien
 
 - Strict clippy: pedantic + nursery enabled, `unwrap_used` and `expect_used` are **denied**
 - Use `?` operator for error propagation, never `unwrap()` or `expect()`
-- Use `#[allow(clippy::expect_used)]` on test modules only
+- `expect()`/`unwrap()` are automatically allowed in `#[cfg(test)]` via `clippy.toml` — no manual `#[allow]` needed
 - Keep functions small and focused (max 100 lines, cognitive complexity < 10)
 - Handle errors explicitly via `Result` and `thiserror`/`anyhow`
 - All public enums must be `#[non_exhaustive]` for forward compatibility
@@ -66,6 +66,20 @@ cargo run -p client -- --user alice --server ws://127.0.0.1:3000/ws  # Run clien
 - Client TUI uses `ratatui::Viewport::Inline` with `insert_before()` — NOT full-screen alternate screen
 - Terminal is exclusively owned by the UI task; network task communicates via `mpsc` channels
 - `UserId` is ASCII-only to prevent Unicode normalization attacks
+
+## Server Rules
+
+- Registration must be **atomic** (single SQLite transaction for user + SPK + OPKs) — partial failure must not leave a user in the DB without keys
+- **Validate identity keys** as real Ed25519 (`VerifyingKey::from_bytes`) before storing — garbage keys permanently brick usernames under TOFU
+- **Verify SPK signatures** at registration time (defense-in-depth) — prevents garbage bundles that break X3DH for other users
+- Already-authenticated connections must not be allowed to re-register — prevents username squatting
+- Ack operations must be **scoped to the authenticated user** (`AND recipient_id = ?`) — otherwise any user can delete anyone's queued messages
+- Connection removal must use **conditional removal** (`remove_if_match` with conn_id) — prevents a closing old connection from evicting a newer one
+- Use **bounded channels** for WebSocket connections (`mpsc::channel(N)` + `try_send`) — unbounded channels allow slow/malicious clients to exhaust server memory
+- `QueuedMessages` must be delivered **after** `AuthSuccess` is on the wire — clients need auth confirmation before processing messages
+- **Auth guards must cover all auth-related messages** — if Register blocks re-auth, so must AuthChallenge and AuthResponse. Apply guards at the router level, not scattered across handlers.
+- **Validate all cryptographic key lengths at the server boundary** — Ed25519 keys (32 bytes), X25519 keys (32 bytes), signatures (64 bytes). Invalid lengths brick bundles for other users.
+- **Never send internal error details to clients** — log with `tracing::error!`, return generic "internal server error" to the wire. Rust/SQLite error strings leak schema details.
 
 ## Reference Implementations
 

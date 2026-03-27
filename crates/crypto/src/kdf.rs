@@ -104,7 +104,6 @@ fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> Result<[u8; 32], CryptoError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
