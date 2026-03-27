@@ -1,4 +1,4 @@
-.PHONY: help fmt fmt-check lint lint-fix test check
+.PHONY: help fmt fmt-check lint lint-fix test check build-cli
 .DEFAULT_GOAL := help
 
 help:
@@ -10,6 +10,7 @@ help:
 	@echo "  lint-fix   auto-fix clippy warnings"
 	@echo "  test       run all tests"
 	@echo "  check      fmt-check + lint + test"
+	@echo "  build-cli  build and install client + server to ~/.local/bin/"
 
 fmt:
 	cargo fmt --all
@@ -27,3 +28,10 @@ test:
 	cargo test --workspace
 
 check: fmt-check lint test
+
+build-cli:
+	cargo build --release -p client -p server
+	@mkdir -p $(HOME)/.local/bin
+	cp target/release/client $(HOME)/.local/bin/cmp
+	cp target/release/server $(HOME)/.local/bin/cmp-server
+	@echo "installed cmp and cmp-server to ~/.local/bin/"

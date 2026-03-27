@@ -1,19 +1,11 @@
-mod connection;
-mod db;
-mod handlers;
-mod state;
-mod ws;
-
 use std::net::SocketAddr;
 
-use axum::Router;
-use axum::routing::get;
 use tokio::signal;
 use tokio_rusqlite::Connection;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use state::AppState;
+use server::state::AppState;
 
 const DEFAULT_BIND: &str = "127.0.0.1:3000";
 const DEFAULT_DB_PATH: &str = "cmp-server.db";
@@ -35,14 +27,12 @@ async fn main() -> anyhow::Result<()> {
     let server_id = std::env::var("CMP_SERVER_ID").unwrap_or_else(|_| DEFAULT_SERVER_ID.to_owned());
 
     let conn = Connection::open(&db_path).await?;
-    db::schema::initialize(&conn).await?;
+    server::db::schema::initialize(&conn).await?;
 
     let state = AppState::new(conn.clone(), server_id);
     spawn_gc_task(conn);
 
-    let app = Router::new()
-        .route("/ws", get(ws::ws_upgrade))
-        .with_state(state);
+    let app = server::build_router(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     info!("listening on {bind_addr}");
@@ -60,7 +50,7 @@ fn spawn_gc_task(conn: Connection) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(GC_INTERVAL_SECS));
         loop {
             interval.tick().await;
-            match db::queue::gc_old_messages(&conn, GC_MAX_AGE_DAYS).await {
+            match server::db::queue::gc_old_messages(&conn, GC_MAX_AGE_DAYS).await {
                 Ok(n) if n > 0 => info!(deleted = n, "message queue GC"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!("message queue GC error: {e}"),
@@ -69,7 +59,7 @@ fn spawn_gc_task(conn: Connection) {
     });
 }
 
-#[allow(clippy::cognitive_complexity)] // Platform-specific signal handling is inherently branchy.
+#[allow(clippy::cognitive_complexity)]
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = signal::ctrl_c().await {

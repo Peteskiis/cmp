@@ -26,6 +26,12 @@ pub struct ConnectionRegistry {
     online: DashMap<String, ConnEntry>,
 }
 
+impl Default for ConnectionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConnectionRegistry {
     pub fn new() -> Self {
         Self {

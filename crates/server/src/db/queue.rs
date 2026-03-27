@@ -1,8 +1,9 @@
 use tokio_rusqlite::Connection;
 
-/// Enqueue an encrypted message for delivery. Deduplicates on `message_id`.
-/// Checks per-user queue depth before inserting.
-/// Accepts owned `envelope_json` to avoid cloning the largest allocation (~512KB) on the hot path.
+/// Enqueue an encrypted message for delivery.
+///
+/// Deduplicates on `message_id`. Checks per-user queue depth before inserting.
+/// Accepts owned `envelope_json` to avoid cloning ~512KB on the hot path.
 pub async fn enqueue(
     conn: &Connection,
     message_id: &str,

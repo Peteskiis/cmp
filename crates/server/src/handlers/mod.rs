@@ -16,6 +16,12 @@ pub struct Session {
     pub pending_challenge: Option<auth::PendingChallenge>,
 }
 
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Session {
     pub const fn new() -> Self {
         Self {
