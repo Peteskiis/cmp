@@ -1,0 +1,8 @@
+# Maximum cognitive complexity before warning
+cognitive-complexity-threshold = 10
+
+# Maximum lines per function before warning
+too-many-lines-threshold = 100
+
+# Maximum function arguments before warning
+too-many-arguments-threshold = 7

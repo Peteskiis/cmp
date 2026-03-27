@@ -1,0 +1,296 @@
+# CMP Roadmap
+
+Encrypted messaging service — milestone 1: 1:1 E2EE chat.
+
+---
+
+## Phase 1: Workspace Scaffolding
+
+- [x] Convert root `Cargo.toml` to workspace manifest
+- [x] Add `[workspace.dependencies]` with pinned versions for all shared deps
+- [x] Add `[workspace.lints.clippy]` with full pedantic + nursery + deny rules
+- [x] Create `clippy.toml` (cognitive-complexity=10, too-many-lines=100, too-many-arguments=7)
+- [x] Create `crates/protocol/` skeleton (Cargo.toml + `src/lib.rs`)
+- [x] Create `crates/crypto/` skeleton (Cargo.toml + `src/lib.rs`)
+- [x] Create `crates/server/` skeleton (Cargo.toml + `src/main.rs`)
+- [x] Create `crates/client/` skeleton (Cargo.toml + `src/main.rs`)
+- [x] Each crate has `[lints] workspace = true`
+- [x] Remove old `src/main.rs`
+- [x] Create `ROADMAP.md` (this file)
+- [x] Update `CLAUDE.md` for Rust project (cargo commands, Rust conventions, crypto rules)
+- [x] `cargo check --workspace` passes
+- [x] `cargo clippy --workspace -- -D warnings` passes
+- [x] `cargo fmt --all -- --check` passes
+
+---
+
+## Phase 2: Protocol Crate (`protocol`)
+
+### Wire types
+- [x] `UserId` newtype (ASCII-only, validated via `#[serde(try_from)]`)
+- [x] `MessageId` newtype (UUID v4 wrapper, no `Default`)
+- [x] `EncryptedEnvelope` struct (version, `MessageHeader`, ciphertext)
+- [x] `MessageHeader` enum (`PreKey` with X3DH material, `Ratchet` with DH header)
+- [x] `RatchetHeader` struct (ratchet_key, previous_chain_length, message_number)
+- [x] `PreKeyBundle` struct (identity_key, signed_prekey, one_time_prekey, signatures)
+- [x] `OneTimePreKey` struct (shared between bundle and upload)
+- [x] `InboundMessage` struct (shared between live and queued delivery)
+- [x] `consts` module (MAX_PREKEYS_PER_UPLOAD, MAX_ACK_BATCH, MAX_QUEUED_MESSAGES, MAX_CIPHERTEXT_BYTES)
+
+### Client -> Server messages (`ClientMessage` enum, `#[non_exhaustive]`)
+- [x] `Register { user_id, bundle, one_time_prekeys }`
+- [x] `AuthChallenge { user_id }`
+- [x] `AuthResponse { signature }` (base64 Ed25519)
+- [x] `UploadPreKeys { prekeys }`
+- [x] `FetchPreKeyBundle { target_user_id }`
+- [x] `SendMessage { recipient_id, message_id, envelope }`
+- [x] `Ack { message_ids }`
+
+### Server -> Client messages (`ServerMessage` enum, `#[non_exhaustive]`)
+- [x] `Challenge { nonce, timestamp, server_id }` (timestamp = seconds since epoch)
+- [x] `AuthSuccess`
+- [x] `AuthFailure { reason }`
+- [x] `PreKeyBundleResponse { user_id, bundle }`
+- [x] `IncomingMessage(InboundMessage)`
+- [x] `QueuedMessages { messages }`
+- [x] `MessageSent { message_id }`
+- [x] `PreKeyLow { remaining }`
+- [x] `Error { code, message }`
+
+### Error types
+- [x] `ProtocolError` enum (`#[non_exhaustive]`, no serde — internal only)
+- [x] Includes `UnsupportedVersion { got, max_supported }`
+
+### Hardening (from code reviews)
+- [x] `#[non_exhaustive]` on all public enums
+- [x] `#[serde(try_from = "String")]` on `UserId` — validation at deserialization boundary
+- [x] UserId rejects empty, whitespace-only, non-ASCII, control chars, >128 bytes
+- [x] `#![deny(unsafe_code)]` on crypto crate
+- [x] `.gitignore` covers `*.db`, `.env*`, `*.pem`, `*.key`
+- [x] `cast_possible_truncation` / `cast_sign_loss` promoted to warn (not silently allowed)
+- [x] `make check` uses `fmt-check` (no auto-fix in CI)
+- [x] Collection size limits documented via `consts` module
+
+### Tests
+- [x] Serde round-trip test for every `ClientMessage` variant
+- [x] Serde round-trip test for every `ServerMessage` variant
+- [x] Serde round-trip test for both `EncryptedEnvelope` header types (PreKey + Ratchet)
+- [x] Unknown fields are ignored (forward compatibility)
+- [x] Unknown enum variants are rejected
+- [x] UserId validation: empty, whitespace, control chars, non-ASCII, oversized, valid
+- [x] UserId deserialization enforces validation
+- [x] `make check` passes (28 tests)
+- [x] `cargo clippy -p protocol -- -D warnings` passes
+
+---
+
+## Phase 3: Crypto Crate (`crypto`)
+
+### Key types (`keys.rs`)
+- [ ] `IdentityKeyPair` (Ed25519 `SigningKey` + `VerifyingKey`)
+- [ ] `SignedPreKey` (X25519 keypair + signature + key_id)
+- [ ] `OneTimePreKey` (X25519 keypair + key_id)
+- [ ] `EphemeralKey` (X25519 keypair, zeroized after use)
+- [ ] `ZeroizingStaticSecret` newtype wrapper (manual `ZeroizeOnDrop` for `StaticSecret`)
+- [ ] Ed25519 <-> X25519 conversion helpers (`to_montgomery()`, `to_scalar_bytes()`)
+- [ ] Key generation functions (all using `OsRng`)
+- [ ] Tests: key generation, conversion round-trips
+
+### KDF functions (`kdf.rs`)
+- [ ] `kdf_rk(root_key, dh_output) -> (new_root_key, chain_key)` — HKDF with `info=b"CMP_RATCHET"`
+- [ ] `kdf_ck(chain_key) -> (new_chain_key, message_key)` — HMAC with 0x01 / 0x02
+- [ ] `derive_message_keys(message_key) -> (aes_key, nonce)` — HKDF with `info=b"CMP_MsgKey"`, 44 bytes output
+- [ ] Tests: known-answer tests with hardcoded inputs/outputs
+
+### AEAD (`aead.rs`)
+- [ ] `encrypt(message_key, plaintext, aad) -> ciphertext` — AES-256-GCM with deterministic nonce from HKDF
+- [ ] `decrypt(message_key, ciphertext, aad) -> plaintext`
+- [ ] Tests: encrypt/decrypt round-trip, tampered ciphertext fails, tampered AAD fails
+
+### X3DH (`x3dh.rs`)
+- [ ] `alice_initiate(ik_a, bundle_b) -> (shared_secret, x3dh_header)` — handles 3 and 4 DH cases
+- [ ] `bob_respond(ik_b, spk_b, opk_b, x3dh_header) -> shared_secret`
+- [ ] PreKey bundle signature verification (Ed25519 over SPK public key)
+- [ ] Exact byte-level IKM construction: `0xFF*32 || DH1 || DH2 || DH3 [|| DH4]`
+- [ ] HKDF with `salt=0x00*32`, `info=b"CMP_X3DH"`, output 32 bytes
+- [ ] Tests: Alice and Bob derive same shared secret (with OPK)
+- [ ] Tests: Alice and Bob derive same shared secret (without OPK)
+- [ ] Tests: invalid SPK signature is rejected
+
+### Double Ratchet (`ratchet.rs`)
+- [ ] `SessionState` struct (root_key, chains, ratchet keys, counters)
+- [ ] `SessionState` derives `Serialize`/`Deserialize` for persistence
+- [ ] `initialize_alice(shared_secret, bob_ratchet_pubkey) -> SessionState`
+- [ ] `initialize_bob(shared_secret, bob_ratchet_keypair) -> SessionState`
+- [ ] `encrypt(state, plaintext) -> (header, ciphertext)` — symmetric ratchet step
+- [ ] `decrypt(state, header, ciphertext) -> plaintext` — handles DH ratchet step if new key
+- [ ] Out-of-order message handling (skip and store message keys)
+- [ ] Skipped key limit (1000 per session)
+- [ ] Skipped key TTL (caller passes current timestamp — no `SystemTime` in crate)
+- [ ] `RatchetHeader` struct (ratchet_public_key, previous_chain_length, message_number) — used as AAD
+- [ ] Tests: multi-message exchange (Alice sends 3, Bob replies 2, Alice sends 1)
+- [ ] Tests: out-of-order delivery (deliver messages 3, 1, 2 — all decrypt)
+- [ ] Tests: skipped key limit exceeded returns error
+- [ ] Tests: session state serialize/deserialize round-trip
+
+### Storage traits (`store.rs`)
+- [ ] `trait SessionStore` (load_session, store_session)
+- [ ] `trait PreKeyStore` (load_prekey, remove_prekey)
+- [ ] `trait SignedPreKeyStore` (load_signed_prekey)
+- [ ] `trait IdentityKeyStore` (get_identity, get_local_registration_id)
+- [ ] All traits are **sync** (no async, no platform deps)
+
+### Crate-level
+- [ ] `CryptoManager` — high-level API composing X3DH + Double Ratchet + store traits
+- [ ] `cargo test -p crypto` passes
+- [ ] `cargo clippy -p crypto -- -D warnings` passes
+
+---
+
+## Phase 4: Server (`server`)
+
+### Database (`db/`)
+- [ ] SQLite schema: `users` table
+- [ ] SQLite schema: `signed_prekeys` table
+- [ ] SQLite schema: `prekeys` table (one-time, atomic `DELETE RETURNING` on fetch)
+- [ ] SQLite schema: `message_queue` table with indexes on `(recipient_id, created_at)` and `created_at`
+- [ ] Schema versioning via `PRAGMA user_version`
+- [ ] `db/users.rs` — register user, lookup user, verify identity key
+- [ ] `db/prekeys.rs` — upload prekeys, fetch+delete bundle atomically, count remaining
+- [ ] `db/queue.rs` — enqueue message (dedup on message_id), dequeue for recipient, delete on ack
+
+### Core server state
+- [ ] `AppState` struct (db connection, connection registry)
+- [ ] `ConnectionRegistry` using `DashMap<UserId, mpsc::UnboundedSender<ServerMessage>>`
+- [ ] Document: never iterate `DashMap` while holding a `Ref` guard (deadlock risk)
+
+### WebSocket handler (`ws.rs`)
+- [ ] axum router with WebSocket upgrade at `GET /ws`
+- [ ] Per-connection tokio task (split into SplitStream + SplitSink)
+- [ ] mpsc channel per connection for server->client pushes
+- [ ] Connection cleanup on disconnect (remove from registry)
+- [ ] WebSocket ping/pong keepalive
+
+### Auth handlers (`handlers/auth.rs`)
+- [ ] `Register` — store user + identity key + prekey bundle (TOFU)
+- [ ] `AuthChallenge` — generate 32-byte nonce + timestamp, store transiently
+- [ ] `AuthResponse` — verify Ed25519 signature over `nonce || timestamp || server_id`, time-limited (60s)
+- [ ] Mark connection as authenticated in registry
+
+### PreKey handlers (`handlers/prekey.rs`)
+- [ ] `FetchPreKeyBundle` — return identity key + signed prekey + one OPK (atomically deleted)
+- [ ] `UploadPreKeys` — store new one-time prekeys
+- [ ] `PreKeyLow` alert — send when count drops below threshold (e.g., 10)
+
+### Message handlers (`handlers/message.rs`)
+- [ ] `SendMessage` — store in queue, push to recipient if online, reply `MessageSent`
+- [ ] `QueuedMessages` — deliver all pending on connect
+- [ ] `Ack` — delete acknowledged messages from queue
+
+### Background tasks
+- [ ] Message queue GC (hourly, delete messages older than 30 days)
+- [ ] Rate limiting on prekey bundle requests and message sending
+
+### Server entry point
+- [ ] `main.rs` — parse config (bind address, db path), init DB, start axum server
+- [ ] Graceful shutdown on SIGINT/SIGTERM
+
+### Tests
+- [ ] Integration test: full auth flow (register -> challenge -> response -> authenticated)
+- [ ] Integration test: prekey upload and fetch (including OPK exhaustion)
+- [ ] Integration test: prekey fetch race condition (concurrent requests get different OPKs)
+- [ ] Integration test: store-and-forward (send while offline, connect, receive, ack, verify deleted)
+- [ ] Integration test: message deduplication (same message_id sent twice)
+- [ ] `cargo test -p server` passes
+- [ ] `cargo clippy -p server -- -D warnings` passes
+
+---
+
+## Phase 5: Client (`client`)
+
+### CLI entry point (`main.rs`)
+- [ ] clap CLI: `--user <name>`, `--server <ws://url>`, `--db-path <path>`
+- [ ] Default db path: `~/.cmp/<user_id>/client.db`
+
+### Local database (`db.rs`)
+- [ ] SQLCipher-encrypted SQLite (key derived via Argon2id from passphrase)
+- [ ] Schema: `identity`, `contacts`, `messages`, `sessions`, `skipped_message_keys`, `prekeys`, `signed_prekeys`
+- [ ] Schema versioning via `PRAGMA user_version`
+- [ ] Implement crypto `SessionStore` trait backed by SQLite
+- [ ] Implement crypto `PreKeyStore` trait backed by SQLite
+- [ ] Implement crypto `IdentityKeyStore` trait backed by SQLite
+- [ ] Message history CRUD (insert, query by conversation, mark status)
+
+### Network layer (`net.rs`)
+- [ ] WebSocket client connection (tokio-tungstenite with rustls)
+- [ ] Reconnect with exponential backoff (1s, 2s, 4s, 8s, cap 30s)
+- [ ] Send `ClientMessage` to server via channel
+- [ ] Receive `ServerMessage` from server, forward to UI via `AppEvent` channel
+- [ ] Re-authenticate on reconnect, re-fetch queued messages
+
+### Crypto integration (`crypto.rs`)
+- [ ] Initialize `CryptoManager` with store trait impls backed by local SQLite
+- [ ] Registration flow: generate identity key, signed prekey, 100 one-time prekeys
+- [ ] New conversation flow: fetch prekey bundle -> X3DH -> initialize session
+- [ ] Send: encrypt with Double Ratchet -> produce `EncryptedEnvelope`
+- [ ] Receive: decrypt `EncryptedEnvelope` -> store plaintext locally -> ack
+
+### Inline TUI (`ui.rs` + `app.rs`)
+- [ ] `Viewport::Inline(INPUT_HEIGHT)` terminal setup (not full-screen)
+- [ ] Raw mode with RAII `Drop` guard (scopeguard for cleanup on panic)
+- [ ] Input widget: dark bg `rgb(40,44,52)`, teal prompt `rgb(34,199,168)`, blinking cursor
+- [ ] Placeholder text when input is empty
+- [ ] Message rendering via `terminal.insert_before()`:
+  - [ ] Your messages: `"› "` bold+dim prefix, adaptive dark background
+  - [ ] Friend messages: `"• "` dim prefix, plain background
+  - [ ] Continuation lines: 2-space indent
+  - [ ] Line wrapping respecting terminal width
+- [ ] Adaptive background color (query terminal bg via crossterm, blend 12% white / 4% black)
+- [ ] Footer with keyboard hints
+- [ ] Input history (up/down arrow)
+
+### App event loop (`app.rs`)
+- [ ] `AppEvent` enum (Key, ServerMessage, Connected, Disconnected)
+- [ ] `App` struct owns `Terminal` exclusively — only task that calls `draw()`/`insert_before()`
+- [ ] `tokio::select!` loop: poll crossterm `EventStream` + network event channel
+- [ ] Enter to send message (encrypt + send + insert_before for local echo)
+- [ ] Display incoming messages (decrypt + insert_before)
+- [ ] Connection status display
+- [ ] Ctrl+D / Ctrl+C to quit (with raw mode cleanup)
+
+### Tests
+- [ ] Crypto store trait SQLite implementation tests
+- [ ] Message rendering snapshot tests (ratatui `TestBackend`)
+- [ ] Network handler tests with mock WebSocket
+- [ ] `cargo test -p client` passes
+- [ ] `cargo clippy -p client -- -D warnings` passes
+
+---
+
+## Phase 6: End-to-End Integration
+
+- [ ] Integration test: start server on random port
+- [ ] Integration test: two programmatic clients (no TUI) register
+- [ ] Integration test: Alice fetches Bob's prekey bundle, initiates session
+- [ ] Integration test: Alice sends encrypted message, Bob receives and decrypts
+- [ ] Integration test: Bob replies, Alice receives and decrypts
+- [ ] Integration test: offline delivery (send while disconnected, reconnect, receive)
+- [ ] Manual test: run server + two TUI clients in separate terminals
+- [ ] Full workspace verification:
+  - [ ] `cargo check --workspace`
+  - [ ] `cargo test --workspace`
+  - [ ] `cargo clippy --workspace -- -D warnings`
+  - [ ] `cargo fmt --all -- --check`
+
+---
+
+## Future Milestones (not in scope for M1)
+
+- [ ] Group chat / channels (Sender Keys protocol)
+- [ ] Web client (`clients/web/` — WASM crypto, React/TS frontend)
+- [ ] Mobile clients (`clients/mobile/` — uniffi bindings for Swift/Kotlin)
+- [ ] File/image sharing (encrypted upload with symmetric key in message)
+- [ ] Typing indicators
+- [ ] Read receipts
+- [ ] Session reset / safety number change UI
+- [ ] TLS (wss://) for production server

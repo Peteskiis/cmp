@@ -1,0 +1,115 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/protocol",
+    "crates/crypto",
+    "crates/server",
+    "crates/client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Shared
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+anyhow = "1"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+
+# Crypto
+x25519-dalek = { version = "2", features = ["static_secrets", "serde"] }
+ed25519-dalek = { version = "2", features = ["serde", "rand_core", "zeroize"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+
+# Server
+axum = { version = "0.8", features = ["ws"] }
+tokio-rusqlite = "0.6"
+dashmap = "6.1"
+
+# Client
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+argon2 = "0.5"
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+
+# Internal crates
+protocol = { path = "crates/protocol" }
+crypto = { path = "crates/crypto" }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Pedantic/nursery opt-outs — too noisy or not useful
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+redundant_pub_crate = "allow"
+significant_drop_tightening = "allow"
+cast_precision_loss = "allow"
+option_option = "allow"
+struct_field_names = "allow"
+future_not_send = "allow"
+option_if_let_else = "allow"
+
+# Restriction lints — deny
+expect_used = "deny"
+unwrap_used = "deny"
+clone_on_ref_ptr = "deny"
+
+# Upgraded to deny (hard error)
+identity_op = "deny"
+derive_partial_eq_without_eq = "deny"
+missing_const_for_fn = "deny"
+uninlined_format_args = "deny"
+redundant_clone = "deny"
+redundant_closure = "deny"
+redundant_closure_for_method_calls = "deny"
+redundant_static_lifetimes = "deny"
+needless_borrow = "deny"
+needless_borrowed_reference = "deny"
+needless_collect = "deny"
+needless_late_init = "deny"
+needless_option_as_deref = "deny"
+needless_question_mark = "deny"
+needless_update = "deny"
+trivially_copy_pass_by_ref = "deny"
+unnecessary_filter_map = "deny"
+unnecessary_lazy_evaluations = "deny"
+unnecessary_sort_by = "deny"
+unnecessary_to_owned = "deny"
+manual_clamp = "deny"
+manual_filter = "deny"
+manual_find = "deny"
+manual_flatten = "deny"
+manual_map = "deny"
+manual_memcpy = "deny"
+manual_non_exhaustive = "deny"
+manual_ok_or = "deny"
+manual_range_contains = "deny"
+manual_retain = "deny"
+manual_strip = "deny"
+manual_try_fold = "deny"
+manual_unwrap_or = "deny"
+
+# Complexity thresholds (configured in clippy.toml)
+cognitive_complexity = { level = "warn", priority = 1 }
+too_many_lines = { level = "warn", priority = 1 }
+too_many_arguments = { level = "warn", priority = 1 }

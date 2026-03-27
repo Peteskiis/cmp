@@ -1,0 +1,27 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+protocol.workspace = true
+crypto.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+rusqlite.workspace = true
+argon2.workspace = true
+futures.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

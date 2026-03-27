@@ -1,0 +1,20 @@
+[package]
+name = "crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+x25519-dalek.workspace = true
+ed25519-dalek.workspace = true
+aes-gcm.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
