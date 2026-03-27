@@ -235,6 +235,13 @@ pub struct RatchetKeyPair {
 }
 
 impl RatchetKeyPair {
+    pub const fn from_bytes(secret_bytes: [u8; 32], public_bytes: [u8; 32]) -> Self {
+        Self {
+            secret_bytes,
+            public_bytes,
+        }
+    }
+
     pub fn generate() -> Self {
         let secret = ZeroizingStaticSecret::random();
         let public = secret.to_public();

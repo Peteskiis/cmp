@@ -389,6 +389,14 @@ mod tests {
     }
 
     #[test]
+    fn user_id_rejects_path_traversal() {
+        assert!(UserId::new("../etc").is_err());
+        assert!(UserId::new("foo/bar").is_err());
+        assert!(UserId::new("foo\\bar").is_err());
+        assert!(UserId::new("a..b").is_err());
+    }
+
+    #[test]
     fn user_id_rejects_non_ascii() {
         assert!(UserId::new("café").is_err());
         assert!(UserId::new("用户").is_err());

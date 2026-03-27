@@ -347,3 +347,4 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [ ] Read receipts
 - [ ] Session reset / safety number change UI
 - [ ] TLS (wss://) for production server
+- [ ] Phone number auth (Signal/WhatsApp style OTP — SMS provider, phone-as-identity, server-side verification)

@@ -66,6 +66,7 @@ cargo run -p client -- --user alice --server ws://127.0.0.1:3000/ws  # Run clien
 - Client TUI uses `ratatui::Viewport::Inline` with `insert_before()` — NOT full-screen alternate screen
 - Terminal is exclusively owned by the UI task; network task communicates via `mpsc` channels
 - `UserId` is ASCII-only to prevent Unicode normalization attacks
+- `UserId` must reject `/`, `\`, and `..` — peer IDs are used in file paths for session persistence
 
 ## Server Rules
 
@@ -88,6 +89,8 @@ cargo run -p client -- --user alice --server ws://127.0.0.1:3000/ws  # Run clien
 - **Identity key files must use restricted permissions** — `0o600` on Unix. `fs::write` defaults to `0o644` which is world-readable. Use `OpenOptionsExt::mode()`.
 - **OPK decode failures must be errors, not silent `None`** — if the server provides a one-time prekey but it's malformed, returning `None` silently degrades to 3-DH X3DH. A MITM could exploit this to weaken every handshake.
 - **Only ack messages that successfully decrypted** — acking a message that failed decryption permanently removes it from the server queue. The message is irrecoverably lost instead of being re-delivered after session establishment.
+- **Parse all fallible inputs before mutating state** — decode base64, validate headers, and check sizes before calling `try_bob_x3dh` or consuming OPKs. A parsing failure after session creation leaves an orphan session that blocks future handshakes.
+- **OPK consumption must happen after AEAD authentication** — consuming an OPK before decrypt lets a forged message permanently degrade future handshakes from 4-DH to 3-DH.
 
 ## Reference Implementations
 

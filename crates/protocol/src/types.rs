@@ -29,6 +29,10 @@ impl UserId {
         if id.bytes().any(|b| b.is_ascii_control()) {
             return Err(InvalidUserId("user id contains control characters"));
         }
+        // Reject path separators and traversal to prevent filesystem attacks
+        if id.contains('/') || id.contains('\\') || id.contains("..") {
+            return Err(InvalidUserId("user id contains invalid characters"));
+        }
         Ok(Self(id))
     }
 

@@ -350,10 +350,8 @@ mod tests {
         let bob_ik = IdentityKeyPair::generate();
         let bob_spk = SignedPreKey::generate(0, &bob_ik);
 
-        let bob_ratchet = RatchetKeyPair {
-            secret_bytes: bob_spk.secret().to_bytes(),
-            public_bytes: bob_spk.public().to_bytes(),
-        };
+        let bob_ratchet =
+            RatchetKeyPair::from_bytes(bob_spk.secret().to_bytes(), bob_spk.public().to_bytes());
 
         let bundle = crate::x3dh::PeerPreKeyBundle {
             identity_key: bob_ik.verifying_key(),

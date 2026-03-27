@@ -49,10 +49,13 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
     let validated_uid = UserId::new(user_id)?;
 
     let data_dir = dirs_data_dir(user_id);
-    let crypto = CryptoManager::load_or_generate(&data_dir)?;
+    let mut crypto = CryptoManager::load_or_generate(&data_dir)?;
 
-    if let Err(e) = register_with_server(user_id, server_url, crypto.identity()).await {
-        eprintln!("Registration: {e}");
+    if crypto.needs_registration() {
+        match register_with_server(user_id, server_url, &mut crypto).await {
+            Ok(()) => {}
+            Err(e) => eprintln!("Registration failed: {e}"),
+        }
     }
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
@@ -67,10 +70,7 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
 
     let (mut terminal, _guard) = ui::init()?;
     ui::insert_status(&mut terminal, &format!("logged in as {user_id}"))?;
-    ui::insert_status(
-        &mut terminal,
-        "type /chat <username> to start a conversation",
-    )?;
+    ui::insert_status(&mut terminal, "type /help for commands")?;
 
     let mut app = App::new(crypto);
     let mut event_stream = EventStream::new();
@@ -185,6 +185,93 @@ fn handle_enter(
         return Ok(());
     }
 
+    // Slash commands
+    if text.starts_with('/') {
+        return handle_command(app, terminal, outgoing_tx, &text);
+    }
+
+    let Some(ref target) = app.target_user else {
+        ui::insert_status(terminal, "use /chat <username> first")?;
+        app.clear_input();
+        return Ok(());
+    };
+    let target_str = target.as_str();
+
+    if !app.crypto.has_session(target_str) {
+        ui::insert_status(terminal, "waiting for session establishment...")?;
+        app.clear_input();
+        return Ok(());
+    }
+
+    // Check plaintext size BEFORE encrypting to avoid ratchet desync
+    let estimated_b64_len = (text.len() + 18) / 3 * 4;
+    if estimated_b64_len > consts::MAX_CIPHERTEXT_BYTES {
+        ui::insert_status(terminal, "message too long")?;
+        app.clear_input();
+        return Ok(());
+    }
+
+    let envelope = match app.crypto.encrypt(target_str, text.as_bytes()) {
+        Ok(env) => env,
+        Err(e) => {
+            ui::insert_status(terminal, &format!("encrypt error: {e}"))?;
+            app.clear_input();
+            return Ok(());
+        }
+    };
+
+    let _ = outgoing_tx.send(ClientMessage::SendMessage {
+        recipient_id: target.clone(),
+        message_id: MessageId::new(),
+        envelope,
+    });
+    ui::insert_user_message(terminal, &text)?;
+    app.clear_input();
+    Ok(())
+}
+
+#[allow(clippy::cognitive_complexity)]
+fn handle_command(
+    app: &mut App,
+    terminal: &mut ui::Term,
+    outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
+    text: &str,
+) -> anyhow::Result<()> {
+    if text == "/contacts" || text == "/c" {
+        let peers = app.crypto.session_peers();
+        if peers.is_empty() {
+            ui::insert_status(terminal, "no contacts yet")?;
+        } else {
+            ui::insert_status(terminal, &format!("contacts ({})", peers.len()))?;
+            for peer in &peers {
+                let active = app
+                    .target_user
+                    .as_ref()
+                    .is_some_and(|t| t.as_str() == *peer);
+                let marker = if active { " \u{25c0}" } else { "" };
+                ui::insert_status(terminal, &format!("  {peer}{marker}"))?;
+            }
+        }
+        app.clear_input();
+        return Ok(());
+    }
+
+    if text == "/help" || text == "/h" {
+        ui::insert_status(terminal, "commands:")?;
+        ui::insert_status(terminal, "  /chat <user>  — start or switch conversation")?;
+        ui::insert_status(terminal, "  /contacts     — list all contacts")?;
+        ui::insert_status(terminal, "  /help         — show this help")?;
+        ui::insert_status(terminal, "  Ctrl+D        — quit")?;
+        app.clear_input();
+        return Ok(());
+    }
+
+    if text == "/chat" {
+        ui::insert_status(terminal, "usage: /chat <username>")?;
+        app.clear_input();
+        return Ok(());
+    }
+
     if let Some(target) = text.strip_prefix("/chat ") {
         let target = target.trim();
         match UserId::new(target) {
@@ -211,43 +298,7 @@ fn handle_enter(
         return Ok(());
     }
 
-    let Some(ref target) = app.target_user else {
-        ui::insert_status(terminal, "use /chat <username> first")?;
-        app.clear_input();
-        return Ok(());
-    };
-    let target_str = target.as_str();
-
-    if !app.crypto.has_session(target_str) {
-        ui::insert_status(terminal, "waiting for session establishment...")?;
-        app.clear_input();
-        return Ok(());
-    }
-
-    // Check plaintext size BEFORE encrypting to avoid ratchet desync.
-    // Estimate: (plaintext + 16-byte AEAD tag + 2 padding) * 4/3 for base64
-    let estimated_b64_len = (text.len() + 18) / 3 * 4;
-    if estimated_b64_len > consts::MAX_CIPHERTEXT_BYTES {
-        ui::insert_status(terminal, "message too long")?;
-        app.clear_input();
-        return Ok(());
-    }
-
-    let envelope = match app.crypto.encrypt(target_str, text.as_bytes()) {
-        Ok(env) => env,
-        Err(e) => {
-            ui::insert_status(terminal, &format!("encrypt error: {e}"))?;
-            app.clear_input();
-            return Ok(());
-        }
-    };
-
-    let _ = outgoing_tx.send(ClientMessage::SendMessage {
-        recipient_id: target.clone(),
-        message_id: MessageId::new(),
-        envelope,
-    });
-    ui::insert_user_message(terminal, &text)?;
+    ui::insert_status(terminal, &format!("unknown command: {text}"))?;
     app.clear_input();
     Ok(())
 }
@@ -299,11 +350,17 @@ fn handle_server_message(
             let sender = inbound.sender_id.as_str().to_owned();
             let (text, ok) = app.crypto.decrypt_to_text(&sender, &inbound.envelope);
             ui::insert_friend_message(terminal, &sender, &text)?;
-            // Only ack if decryption succeeded — failed messages should be re-delivered
             if ok {
                 let _ = outgoing_tx.send(ClientMessage::Ack {
                     message_ids: vec![inbound.message_id],
                 });
+                // Auto-set chat target so Bob can reply without /chat
+                if app.target_user.is_none()
+                    && let Ok(uid) = UserId::new(&sender)
+                {
+                    app.target_user = Some(uid);
+                    ui::insert_status(terminal, &format!("now chatting with {sender}"))?;
+                }
             }
         }
         ServerMessage::QueuedMessages { messages } => {
@@ -339,8 +396,9 @@ fn handle_server_message(
 async fn register_with_server(
     user_id: &str,
     server_url: &str,
-    identity: &crypto::keys::IdentityKeyPair,
+    crypto: &mut CryptoManager,
 ) -> anyhow::Result<()> {
+    let identity = crypto.identity();
     let (ws, _) = connect_async(server_url).await?;
     let (mut sink, mut stream) = futures::StreamExt::split(ws);
 
@@ -384,12 +442,13 @@ async fn register_with_server(
     };
 
     if matches!(serde_json::from_str(&text), Ok(ServerMessage::AuthSuccess)) {
+        // Persist SPK/OPK private keys for future X3DH as Bob
+        crypto.persist_registration_keys(&spk, &opks)?;
         return Ok(());
     }
     if let Ok(ServerMessage::AuthFailure { reason }) = serde_json::from_str(&text) {
-        if reason.contains("already exists") {
-            return Ok(());
-        }
+        // "already exists" on first launch means someone else owns this username.
+        // Don't silently succeed — the user needs to pick a different name.
         anyhow::bail!("registration rejected: {reason}");
     }
     anyhow::bail!("unexpected server response during registration");

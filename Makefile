@@ -1,4 +1,4 @@
-.PHONY: help fmt fmt-check lint lint-fix test check build-cli
+.PHONY: help fmt fmt-check lint lint-fix test check build-cli run-server
 .DEFAULT_GOAL := help
 
 help:
@@ -11,6 +11,7 @@ help:
 	@echo "  test       run all tests"
 	@echo "  check      fmt-check + lint + test"
 	@echo "  build-cli  build and install client + server to ~/.local/bin/"
+	@echo "  run-server start the server on 127.0.0.1:3000"
 
 fmt:
 	cargo fmt --all
@@ -28,6 +29,9 @@ test:
 	cargo test --workspace
 
 check: fmt-check lint test
+
+run-server:
+	cargo run -p server
 
 build-cli:
 	cargo build --release -p client -p server
