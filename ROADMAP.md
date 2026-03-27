@@ -87,63 +87,63 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 ## Phase 3: Crypto Crate (`crypto`)
 
 ### Key types (`keys.rs`)
-- [ ] `IdentityKeyPair` (Ed25519 `SigningKey` + `VerifyingKey`)
-- [ ] `SignedPreKey` (X25519 keypair + signature + key_id)
-- [ ] `OneTimePreKey` (X25519 keypair + key_id)
-- [ ] `EphemeralKey` (X25519 keypair, zeroized after use)
-- [ ] `ZeroizingStaticSecret` newtype wrapper (manual `ZeroizeOnDrop` for `StaticSecret`)
-- [ ] Ed25519 <-> X25519 conversion helpers (`to_montgomery()`, `to_scalar_bytes()`)
-- [ ] Key generation functions (all using `OsRng`)
-- [ ] Tests: key generation, conversion round-trips
+- [x] `IdentityKeyPair` (Ed25519 `SigningKey` + `VerifyingKey`)
+- [x] `SignedPreKey` (X25519 keypair + signature + key_id)
+- [x] `OneTimePreKey` (X25519 keypair + key_id)
+- [x] `EphemeralKey` (X25519 keypair, zeroized after use)
+- [x] `ZeroizingStaticSecret` newtype wrapper (manual `ZeroizeOnDrop` for `StaticSecret`)
+- [x] Ed25519 <-> X25519 conversion helpers (`to_montgomery()`, `to_scalar_bytes()`)
+- [x] Key generation functions (all using `OsRng`)
+- [x] Tests: key generation, conversion round-trips
 
 ### KDF functions (`kdf.rs`)
-- [ ] `kdf_rk(root_key, dh_output) -> (new_root_key, chain_key)` — HKDF with `info=b"CMP_RATCHET"`
-- [ ] `kdf_ck(chain_key) -> (new_chain_key, message_key)` — HMAC with 0x01 / 0x02
-- [ ] `derive_message_keys(message_key) -> (aes_key, nonce)` — HKDF with `info=b"CMP_MsgKey"`, 44 bytes output
-- [ ] Tests: known-answer tests with hardcoded inputs/outputs
+- [x] `kdf_rk(root_key, dh_output) -> (new_root_key, chain_key)` — HKDF with `info=b"CMP_RATCHET"`
+- [x] `kdf_ck(chain_key) -> (new_chain_key, message_key)` — HMAC with 0x01 / 0x02
+- [x] `derive_message_keys(message_key) -> (aes_key, nonce)` — HKDF with `info=b"CMP_MsgKey"`, 44 bytes output
+- [x] Tests: known-answer tests with hardcoded inputs/outputs
 
 ### AEAD (`aead.rs`)
-- [ ] `encrypt(message_key, plaintext, aad) -> ciphertext` — AES-256-GCM with deterministic nonce from HKDF
-- [ ] `decrypt(message_key, ciphertext, aad) -> plaintext`
-- [ ] Tests: encrypt/decrypt round-trip, tampered ciphertext fails, tampered AAD fails
+- [x] `encrypt(message_key, plaintext, aad) -> ciphertext` — AES-256-GCM with deterministic nonce from HKDF
+- [x] `decrypt(message_key, ciphertext, aad) -> plaintext`
+- [x] Tests: encrypt/decrypt round-trip, tampered ciphertext fails, tampered AAD fails
 
 ### X3DH (`x3dh.rs`)
-- [ ] `alice_initiate(ik_a, bundle_b) -> (shared_secret, x3dh_header)` — handles 3 and 4 DH cases
-- [ ] `bob_respond(ik_b, spk_b, opk_b, x3dh_header) -> shared_secret`
-- [ ] PreKey bundle signature verification (Ed25519 over SPK public key)
-- [ ] Exact byte-level IKM construction: `0xFF*32 || DH1 || DH2 || DH3 [|| DH4]`
-- [ ] HKDF with `salt=0x00*32`, `info=b"CMP_X3DH"`, output 32 bytes
-- [ ] Tests: Alice and Bob derive same shared secret (with OPK)
-- [ ] Tests: Alice and Bob derive same shared secret (without OPK)
-- [ ] Tests: invalid SPK signature is rejected
+- [x] `alice_initiate(ik_a, bundle_b) -> (shared_secret, x3dh_header)` — handles 3 and 4 DH cases
+- [x] `bob_respond(ik_b, spk_b, opk_b, x3dh_header) -> shared_secret`
+- [x] PreKey bundle signature verification (Ed25519 over SPK public key)
+- [x] Exact byte-level IKM construction: `0xFF*32 || DH1 || DH2 || DH3 [|| DH4]`
+- [x] HKDF with `salt=0x00*32`, `info=b"CMP_X3DH"`, output 32 bytes
+- [x] Tests: Alice and Bob derive same shared secret (with OPK)
+- [x] Tests: Alice and Bob derive same shared secret (without OPK)
+- [x] Tests: invalid SPK signature is rejected
 
 ### Double Ratchet (`ratchet.rs`)
-- [ ] `SessionState` struct (root_key, chains, ratchet keys, counters)
-- [ ] `SessionState` derives `Serialize`/`Deserialize` for persistence
-- [ ] `initialize_alice(shared_secret, bob_ratchet_pubkey) -> SessionState`
-- [ ] `initialize_bob(shared_secret, bob_ratchet_keypair) -> SessionState`
-- [ ] `encrypt(state, plaintext) -> (header, ciphertext)` — symmetric ratchet step
-- [ ] `decrypt(state, header, ciphertext) -> plaintext` — handles DH ratchet step if new key
-- [ ] Out-of-order message handling (skip and store message keys)
-- [ ] Skipped key limit (1000 per session)
-- [ ] Skipped key TTL (caller passes current timestamp — no `SystemTime` in crate)
-- [ ] `RatchetHeader` struct (ratchet_public_key, previous_chain_length, message_number) — used as AAD
-- [ ] Tests: multi-message exchange (Alice sends 3, Bob replies 2, Alice sends 1)
-- [ ] Tests: out-of-order delivery (deliver messages 3, 1, 2 — all decrypt)
-- [ ] Tests: skipped key limit exceeded returns error
-- [ ] Tests: session state serialize/deserialize round-trip
+- [x] `SessionState` struct (root_key, chains, ratchet keys, counters)
+- [x] `SessionState` derives `Serialize`/`Deserialize` for persistence
+- [x] `initialize_alice(shared_secret, bob_ratchet_pubkey) -> SessionState`
+- [x] `initialize_bob(shared_secret, bob_ratchet_keypair) -> SessionState`
+- [x] `encrypt(state, plaintext) -> (header, ciphertext)` — symmetric ratchet step
+- [x] `decrypt(state, header, ciphertext) -> plaintext` — handles DH ratchet step if new key
+- [x] Out-of-order message handling (skip and store message keys)
+- [x] Skipped key limit (1000 per session)
+- [ ] Skipped key TTL (caller passes current timestamp — not yet implemented)
+- [x] `RatchetHeader` struct (ratchet_public_key, previous_chain_length, message_number) — used as AAD
+- [x] Tests: multi-message exchange (Alice sends 3, Bob replies 2, Alice sends 1)
+- [x] Tests: out-of-order delivery (deliver messages 3, 1, 2 — all decrypt)
+- [x] Tests: skipped key limit exceeded returns error
+- [x] Tests: session state serialize/deserialize round-trip
 
 ### Storage traits (`store.rs`)
-- [ ] `trait SessionStore` (load_session, store_session)
-- [ ] `trait PreKeyStore` (load_prekey, remove_prekey)
-- [ ] `trait SignedPreKeyStore` (load_signed_prekey)
-- [ ] `trait IdentityKeyStore` (get_identity, get_local_registration_id)
-- [ ] All traits are **sync** (no async, no platform deps)
+- [x] `trait SessionStore` (load_session, store_session)
+- [x] `trait PreKeyStore` (load_prekey, remove_prekey)
+- [x] `trait SignedPreKeyStore` (load_signed_prekey)
+- [x] `trait IdentityKeyStore` (get_identity)
+- [x] All traits are **sync** (no async, no platform deps)
 
 ### Crate-level
 - [ ] `CryptoManager` — high-level API composing X3DH + Double Ratchet + store traits
-- [ ] `cargo test -p crypto` passes
-- [ ] `cargo clippy -p crypto -- -D warnings` passes
+- [x] `cargo test -p crypto` passes (38 tests)
+- [x] `cargo clippy -p crypto -- -D warnings` passes
 
 ---
 

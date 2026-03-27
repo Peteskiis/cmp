@@ -55,6 +55,9 @@ cargo run -p client -- --user alice --server ws://127.0.0.1:3000/ws  # Run clien
 - AES-GCM nonces are derived deterministically from message keys via HKDF — never random
 - The `crypto` crate must stay pure: no I/O, no async, no `SystemTime`, no platform deps (for WASM/FFI portability)
 - Storage traits in `crypto` are trait-only; concrete impls live in `client`
+- **Never mutate session state before AEAD authentication succeeds** — snapshot state, attempt decrypt, roll back on failure. A forged message must not corrupt the session.
+- Use `u64` arithmetic for overflow-sensitive checks (e.g., skipped key limits) — `u32` addition can wrap in release mode, bypassing guards
+- Counter increments (`send_count`, `recv_count`) must use checked arithmetic or explicit bounds checks before incrementing
 
 ## Architecture Rules
 
