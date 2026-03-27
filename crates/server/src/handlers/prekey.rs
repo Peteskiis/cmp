@@ -86,9 +86,7 @@ pub async fn handle_upload(
     };
 
     match db::prekeys::upload_prekeys(&state.db, user_id, &pairs).await {
-        Ok(()) => ServerMessage::MessageSent {
-            message_id: protocol::MessageId::new(),
-        },
+        Ok(()) => ServerMessage::Success,
         Err(e) => {
             tracing::error!("failed to store prekeys: {e}");
             error_500_generic()

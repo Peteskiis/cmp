@@ -1,6 +1,7 @@
 use tokio_rusqlite::Connection;
 
 /// Enqueue an encrypted message for delivery. Deduplicates on `message_id`.
+/// Checks per-user queue depth before inserting.
 /// Accepts owned `envelope_json` to avoid cloning the largest allocation (~512KB) on the hot path.
 pub async fn enqueue(
     conn: &Connection,
@@ -8,21 +9,46 @@ pub async fn enqueue(
     recipient_id: &str,
     sender_id: &str,
     envelope_json: String,
-) -> anyhow::Result<bool> {
+    max_queue_per_user: usize,
+) -> anyhow::Result<EnqueueResult> {
     let message_id = message_id.to_owned();
     let recipient_id = recipient_id.to_owned();
     let sender_id = sender_id.to_owned();
 
     conn.call(move |conn| {
+        // Check per-user queue depth before inserting
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM message_queue WHERE recipient_id = ?1",
+            [&recipient_id],
+            |row| row.get(0),
+        )?;
+        // i64 from SQLite, safe to compare as usize
+        // count is non-negative from COUNT(*), safe to compare directly
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        if (count as usize) >= max_queue_per_user {
+            return Ok(EnqueueResult::QueueFull);
+        }
+
         let changed = conn.execute(
             "INSERT OR IGNORE INTO message_queue (message_id, recipient_id, sender_id, envelope)
              VALUES (?1, ?2, ?3, ?4)",
             (&message_id, &recipient_id, &sender_id, &envelope_json),
         )?;
-        Ok(changed > 0)
+        if changed > 0 {
+            Ok(EnqueueResult::Inserted)
+        } else {
+            Ok(EnqueueResult::Duplicate)
+        }
     })
     .await
     .map_err(Into::into)
+}
+
+/// Result of attempting to enqueue a message.
+pub enum EnqueueResult {
+    Inserted,
+    Duplicate,
+    QueueFull,
 }
 
 /// Retrieve queued messages for a recipient, ordered by creation time.
@@ -36,7 +62,7 @@ pub async fn get_pending(
 
     conn.call(move |conn| {
         let mut stmt = conn.prepare(
-            "SELECT message_id, sender_id, envelope
+            "SELECT message_id, sender_id, envelope, created_at
              FROM message_queue
              WHERE recipient_id = ?1
              ORDER BY created_at ASC
@@ -51,6 +77,7 @@ pub async fn get_pending(
                     message_id: row.get(0)?,
                     sender_id: row.get(1)?,
                     envelope_json: row.get(2)?,
+                    created_at: row.get(3)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -110,4 +137,5 @@ pub struct QueuedRow {
     pub message_id: String,
     pub sender_id: String,
     pub envelope_json: String,
+    pub created_at: String,
 }

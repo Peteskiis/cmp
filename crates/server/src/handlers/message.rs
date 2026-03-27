@@ -1,7 +1,10 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use protocol::{EncryptedEnvelope, InboundMessage, MessageId, ServerMessage, UserId, consts};
 
 use super::{error_400, error_500_generic};
 use crate::db;
+use crate::db::queue::EnqueueResult;
 use crate::state::AppState;
 
 #[allow(clippy::cognitive_complexity)]
@@ -19,37 +22,31 @@ pub async fn handle_send(
     let msg_id_str = message_id.to_string();
     let recipient_str = recipient_id.as_str();
 
-    let envelope_json = match serde_json::to_string(&envelope) {
-        Ok(j) => j,
-        Err(e) => return error_400(&format!("invalid envelope: {e}")),
+    let Ok(envelope_json) = serde_json::to_string(&envelope) else {
+        return error_400("invalid envelope");
     };
 
-    // Enqueue directly — FK constraint on recipient_id catches non-existent users.
-    // Avoids TOCTOU race and extra DB round-trip vs a separate exists() check.
     match db::queue::enqueue(
         &state.db,
         &msg_id_str,
         recipient_str,
         sender_id,
         envelope_json,
+        consts::MAX_QUEUE_PER_USER,
     )
     .await
     {
-        Ok(_) => {}
+        Ok(EnqueueResult::Inserted | EnqueueResult::Duplicate) => {}
+        Ok(EnqueueResult::QueueFull) => {
+            return error_400("recipient's message queue is full");
+        }
         Err(e) => {
-            let msg = e.to_string();
-            return if msg.contains("FOREIGN KEY") {
-                error_400("recipient not found")
-            } else {
-                {
-                    tracing::error!("failed to queue message: {e}");
-                    error_500_generic()
-                }
-            };
+            tracing::error!("failed to queue message: {e}");
+            return error_500_generic();
         }
     }
 
-    // Push to recipient if online — try_send handles offline/full channel
+    // Push to recipient if online
     let Ok(sender_user_id) = UserId::new(sender_id) else {
         return ServerMessage::MessageSent {
             message_id: message_id.clone(),
@@ -60,7 +57,7 @@ pub async fn handle_send(
         message_id: message_id.clone(),
         sender_id: sender_user_id,
         envelope,
-        timestamp: 0,
+        timestamp: now_secs(),
     };
     state
         .connections
@@ -90,4 +87,11 @@ pub async fn handle_ack(
         tracing::warn!(recipient_id, "ack delete failed: {e}");
     }
     None
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

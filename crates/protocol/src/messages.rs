@@ -80,6 +80,9 @@ pub enum ServerMessage {
         message_id: MessageId,
     },
 
+    /// Generic success acknowledgment (e.g., prekey upload).
+    Success,
+
     /// Server alerts that one-time pre-keys are running low.
     PreKeyLow {
         remaining: u32,
@@ -304,6 +307,11 @@ mod tests {
         roundtrip_server(&ServerMessage::MessageSent {
             message_id: MessageId::new(),
         });
+    }
+
+    #[test]
+    fn server_success() {
+        roundtrip_server(&ServerMessage::Success);
     }
 
     #[test]

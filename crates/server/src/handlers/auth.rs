@@ -246,11 +246,13 @@ pub async fn deliver_queued_messages(
                     return None;
                 }
             };
+            // Parse SQLite datetime string to unix timestamp
+            let timestamp = parse_sqlite_datetime(&row.created_at);
             Some(protocol::InboundMessage {
                 message_id,
                 sender_id,
                 envelope,
-                timestamp: 0,
+                timestamp,
             })
         })
         .collect();
@@ -258,6 +260,48 @@ pub async fn deliver_queued_messages(
     if !messages.is_empty() {
         let _ = tx.try_send(ServerMessage::QueuedMessages { messages });
     }
+}
+
+/// Parse `SQLite` `datetime('now')` format (`YYYY-MM-DD HH:MM:SS`) to unix timestamp.
+/// Returns 0 on parse failure — best effort.
+fn parse_sqlite_datetime(s: &str) -> u64 {
+    // SQLite datetime format: "2024-01-15 10:30:45"
+    // Parse manually to avoid adding a datetime dependency
+    let parts: Vec<&str> = s.split(['-', ' ', ':']).collect();
+    if parts.len() != 6 {
+        return 0;
+    }
+    let Ok(year): Result<i64, _> = parts[0].parse() else {
+        return 0;
+    };
+    let Ok(month): Result<i64, _> = parts[1].parse() else {
+        return 0;
+    };
+    let Ok(day): Result<i64, _> = parts[2].parse() else {
+        return 0;
+    };
+    let Ok(hour): Result<i64, _> = parts[3].parse() else {
+        return 0;
+    };
+    let Ok(min): Result<i64, _> = parts[4].parse() else {
+        return 0;
+    };
+    let Ok(sec): Result<i64, _> = parts[5].parse() else {
+        return 0;
+    };
+
+    // Simplified days-since-epoch (no leap second precision needed for message ordering)
+    let days = (year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
+    let month_days: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let leap_adj = i64::from(is_leap && month > 2);
+    let m_idx = (month - 1).clamp(0, 11);
+    #[allow(clippy::cast_sign_loss)]
+    let total = ((days + month_days[m_idx as usize] + day - 1 + leap_adj) * 86400
+        + hour * 3600
+        + min * 60
+        + sec) as u64;
+    total
 }
 
 fn now_secs() -> u64 {

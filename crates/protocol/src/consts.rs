@@ -13,3 +13,6 @@ pub const MAX_PLAINTEXT_BYTES: usize = 256 * 1024;
 /// Maximum ciphertext field size in bytes (base64-encoded, accounts for
 /// encryption overhead + base64 expansion).
 pub const MAX_CIPHERTEXT_BYTES: usize = 512 * 1024;
+
+/// Maximum queued messages per recipient before the server rejects new sends.
+pub const MAX_QUEUE_PER_USER: usize = 10_000;
