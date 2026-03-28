@@ -17,7 +17,7 @@ struct Cli {
     user: Option<String>,
 
     /// Server WebSocket URL
-    #[arg(long, default_value = "ws://127.0.0.1:3000/ws")]
+    #[arg(long, default_value = "wss://basically-tough-mule.clusterbase.dev/ws")]
     server: String,
 }
 

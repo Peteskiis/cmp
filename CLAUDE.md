@@ -32,7 +32,7 @@ make lint-fix      # Auto-fix clippy warnings
 make test          # Run all tests
 
 cargo run -p server                # Run server
-cargo run -p client -- --user alice --server ws://127.0.0.1:3000/ws  # Run client
+cargo run -p client -- --user alice  # Run client (production server is default)
 ```
 
 ## Code Style & Conventions
