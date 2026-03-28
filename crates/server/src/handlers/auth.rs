@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use protocol::{OneTimePreKey, PreKeyBundle, ServerMessage, UserId, consts};
@@ -7,7 +5,7 @@ use rand::RngCore;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use super::{Session, auth_failure, decode_prekeys, error_400, error_500_generic};
+use super::{Session, auth_failure, decode_prekeys, error_400, error_500_generic, now_secs};
 use crate::db;
 use crate::state::AppState;
 
@@ -258,7 +256,28 @@ pub async fn deliver_queued_messages(
         .collect();
 
     if !messages.is_empty() {
-        let _ = tx.try_send(ServerMessage::QueuedMessages { messages });
+        // Group message IDs by sender for delivery receipts
+        let mut delivery_by_sender: std::collections::HashMap<String, Vec<protocol::MessageId>> =
+            std::collections::HashMap::new();
+        for msg in &messages {
+            delivery_by_sender
+                .entry(msg.sender_id.as_str().to_owned())
+                .or_default()
+                .push(msg.message_id.clone());
+        }
+
+        if tx
+            .try_send(ServerMessage::QueuedMessages { messages })
+            .is_ok()
+        {
+            // Server-generated delivery receipts for queued messages — notify original senders
+            for (sender, ids) in delivery_by_sender {
+                state.connections.send_to(
+                    &sender,
+                    ServerMessage::MessageDelivered { message_ids: ids },
+                );
+            }
+        }
     }
 }
 
@@ -304,11 +323,4 @@ fn parse_sqlite_datetime(s: &str) -> u64 {
         + min * 60
         + sec) as u64;
     total
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

@@ -215,10 +215,10 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [x] Silent error paths replaced with `warn!` logging
 
 ### Tests
-- [ ] Integration test: full auth flow (register -> challenge -> response -> authenticated)
-- [ ] Integration test: prekey upload and fetch (including OPK exhaustion)
+- [x] Integration test: full auth flow (register -> challenge -> response -> authenticated)
+- [x] Integration test: prekey upload and fetch (including OPK exhaustion)
 - [ ] Integration test: prekey fetch race condition (concurrent requests get different OPKs)
-- [ ] Integration test: store-and-forward (send while offline, connect, receive, ack, verify deleted)
+- [x] Integration test: store-and-forward (send while offline, connect, receive, ack, verify deleted)
 - [ ] Integration test: message deduplication (same message_id sent twice)
 - [x] `cargo clippy -p server -- -D warnings` passes
 
@@ -229,7 +229,7 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [ ] Total prekey cap per user
 - [ ] WebSocket ping/pong keepalive
 - [ ] Prekey bundle fetch rate limiting
-- [ ] User existence oracle (404 vs generic error)
+- [x] User existence oracle — all 404s use generic "not found"
 
 ---
 
@@ -264,6 +264,11 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [x] `decrypt_to_text` returns `(text, ok)` for conditional ack
 - [x] `b64_decode_fixed::<N>()` helper with parameterized error variant
 - [x] Concurrent session inits via `HashSet<String>` (not single pending)
+- [x] Session persistence to disk (`~/.cmp/<user_id>/sessions/<peer_id>.json`)
+- [x] SPK/OPK private key persistence (Bob can decrypt first messages after restart)
+- [x] Prekey headers persistence (`prekey_headers.json`)
+- [x] `needs_registration()` guard (checks SPK presence, not first-launch)
+- [x] Bob-side X3DH tests (5 tests: happy path, forged PreKey, existing session, missing OPK, persistence)
 
 ### Inline TUI (`ui.rs` + `app.rs`)
 - [x] `Viewport::Inline(INPUT_HEIGHT)` terminal setup (not full-screen)
@@ -289,12 +294,18 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [x] Connection status display
 - [x] Ctrl+D / Ctrl+C to quit (with raw mode cleanup)
 - [x] `/chat <username>` command with UserId validation
+- [x] `/quit` and `/q` command
+- [x] `/contacts` and `/c` command (shows session peers with active marker)
+- [x] `/help` and `/h` command
+- [x] Typing indicators: debounced send (3s), peer display with auto-expire (5s)
+- [x] Delivery status display: ✓ sent (`MessageSent`), ✓✓ delivered (`MessageDelivered`)
+- [x] E2EE read receipts: encrypt message IDs via Double Ratchet, send on read, decrypt+display 👁
 
 ### Tests
 - [x] `wrap_message` unit tests (7 tests: empty, short, long, overflow, zero width)
 - [ ] Crypto store trait SQLite implementation tests
 - [ ] Network handler tests with mock WebSocket
-- [x] `cargo test -p client` passes (7 tests)
+- [x] `cargo test -p client` passes (12 tests)
 - [x] `cargo clippy -p client -- -D warnings` passes
 
 ### Hardening (from code reviews)
@@ -309,8 +320,6 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 
 ### Deferred (not M1 blockers)
 - [ ] SQLCipher-encrypted local database
-- [ ] Session persistence to disk (currently in-memory only)
-- [ ] SPK/OPK private key persistence (Bob can't decrypt if keys lost between restarts)
 - [ ] Message history persistence
 - [ ] Adaptive terminal background color detection
 
@@ -328,10 +337,13 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [x] Integration test: send to nonexistent user fails
 - [x] Integration test: unauthenticated send rejected
 - [x] Integration test: auth with wrong key rejected
+- [x] Integration test: typing indicator relay
+- [x] Integration test: server-generated delivery receipt on push
+- [x] Integration test: read receipt relay
 - [ ] Manual test: run server + two TUI clients in separate terminals
 - [x] Full workspace verification:
   - [x] `cargo check --workspace`
-  - [x] `cargo test --workspace` (89 tests)
+  - [x] `cargo test --workspace` (103 tests)
   - [x] `cargo clippy --workspace -- -D warnings`
   - [x] `cargo fmt --all -- --check`
 
@@ -343,8 +355,9 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [ ] Web client (`clients/web/` — WASM crypto, React/TS frontend)
 - [ ] Mobile clients (`clients/mobile/` — uniffi bindings for Swift/Kotlin)
 - [ ] File/image sharing (encrypted upload with symmetric key in message)
-- [ ] Typing indicators
-- [ ] Read receipts
+- [x] Typing indicators (debounced, ephemeral relay, no queueing)
+- [x] Delivery receipts (server-generated on successful push)
+- [x] Read receipts (E2EE encrypted inside envelope, server can't see who read what)
 - [ ] Session reset / safety number change UI
 - [ ] TLS (wss://) for production server
 - [ ] Phone number auth (Signal/WhatsApp style OTP — SMS provider, phone-as-identity, server-side verification)

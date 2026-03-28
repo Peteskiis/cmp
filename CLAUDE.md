@@ -81,6 +81,7 @@ cargo run -p client -- --user alice --server ws://127.0.0.1:3000/ws  # Run clien
 - **Auth guards must cover all auth-related messages** — if Register blocks re-auth, so must AuthChallenge and AuthResponse. Apply guards at the router level, not scattered across handlers.
 - **Validate all cryptographic key lengths at the server boundary** — Ed25519 keys (32 bytes), X25519 keys (32 bytes), signatures (64 bytes). Invalid lengths brick bundles for other users.
 - **Never send internal error details to clients** — log with `tracing::error!`, return generic "internal server error" to the wire. Rust/SQLite error strings leak schema details.
+- **All relay handlers must enforce the same size limits as send handlers** — any server endpoint that forwards user-supplied data (read receipts, typing, future features) must validate `protocol::consts` limits. A missing check on a relay path lets attackers bypass size controls.
 
 ## Client Crypto Rules
 
@@ -91,6 +92,7 @@ cargo run -p client -- --user alice --server ws://127.0.0.1:3000/ws  # Run clien
 - **Only ack messages that successfully decrypted** — acking a message that failed decryption permanently removes it from the server queue. The message is irrecoverably lost instead of being re-delivered after session establishment.
 - **Parse all fallible inputs before mutating state** — decode base64, validate headers, and check sizes before calling `try_bob_x3dh` or consuming OPKs. A parsing failure after session creation leaves an orphan session that blocks future handshakes.
 - **OPK consumption must happen after AEAD authentication** — consuming an OPK before decrypt lets a forged message permanently degrade future handshakes from 4-DH to 3-DH.
+- **Status transitions must be monotonic** — use `entry().or_insert()` or explicit ordering guards, never unconditional `insert()`. Server messages can arrive out of order (e.g., `MessageDelivered` before `MessageSent`); an unconditional write regresses the status.
 
 ## Reference Implementations
 

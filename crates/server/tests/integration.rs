@@ -229,11 +229,22 @@ async fn send_and_receive_message() {
     )
     .await;
 
-    // Alice gets MessageSent confirmation
-    let resp = recv(&mut ar2).await;
+    // Alice gets MessageSent + MessageDelivered (Bob is online, order may vary)
+    let r1 = recv(&mut ar2).await;
+    let r2 = recv(&mut ar2).await;
     assert!(
-        matches!(resp, ServerMessage::MessageSent { .. }),
-        "expected MessageSent: {resp:?}"
+        matches!(
+            &r1,
+            ServerMessage::MessageSent { .. } | ServerMessage::MessageDelivered { .. }
+        ),
+        "unexpected: {r1:?}"
+    );
+    assert!(
+        matches!(
+            &r2,
+            ServerMessage::MessageSent { .. } | ServerMessage::MessageDelivered { .. }
+        ),
+        "unexpected: {r2:?}"
     );
 
     // Bob receives the message
@@ -474,4 +485,118 @@ async fn unauthenticated_send_rejected() {
         matches!(resp, ServerMessage::AuthFailure { .. }),
         "expected AuthFailure: {resp:?}"
     );
+}
+
+#[tokio::test]
+async fn typing_indicator_relay() {
+    let (url, _handle) = start_test_server().await;
+    let alice_id = make_identity();
+    let bob_id = make_identity();
+
+    let (mut as1, mut ar1) = connect(&url).await;
+    register(&mut as1, &mut ar1, "alice", &alice_id).await;
+
+    let (mut bs1, mut br1) = connect(&url).await;
+    register(&mut bs1, &mut br1, "bob", &bob_id).await;
+
+    // Alice types to Bob
+    send(
+        &mut as1,
+        &ClientMessage::Typing {
+            recipient_id: UserId::new("bob").unwrap(),
+        },
+    )
+    .await;
+
+    let resp = recv(&mut br1).await;
+    let ServerMessage::PeerTyping { sender_id } = resp else {
+        panic!("expected PeerTyping: {resp:?}");
+    };
+    assert_eq!(sender_id.as_str(), "alice");
+}
+
+#[tokio::test]
+async fn delivery_receipt_on_push() {
+    let (url, _handle) = start_test_server().await;
+    let alice_id = make_identity();
+    let bob_id = make_identity();
+
+    let (mut as1, mut ar1) = connect(&url).await;
+    register(&mut as1, &mut ar1, "alice", &alice_id).await;
+    drop((as1, ar1));
+
+    let (mut bs1, mut br1) = connect(&url).await;
+    register(&mut bs1, &mut br1, "bob", &bob_id).await;
+
+    // Alice reconnects and sends to online Bob
+    let (mut as2, mut ar2) = connect(&url).await;
+    auth_challenge_response(&mut as2, &mut ar2, "alice", &alice_id).await;
+
+    let msg_id = MessageId::new();
+    send(
+        &mut as2,
+        &ClientMessage::SendMessage {
+            recipient_id: UserId::new("bob").unwrap(),
+            message_id: msg_id.clone(),
+            envelope: dummy_envelope("hello"),
+        },
+    )
+    .await;
+
+    // Alice should get MessageSent AND MessageDelivered (since Bob is online)
+    let r1 = recv(&mut ar2).await;
+    let r2 = recv(&mut ar2).await;
+
+    let mut got_sent = false;
+    let mut got_delivered = false;
+    for resp in [&r1, &r2] {
+        match resp {
+            ServerMessage::MessageSent { message_id: mid } => {
+                assert_eq!(mid, &msg_id, "MessageSent ID mismatch");
+                got_sent = true;
+            }
+            ServerMessage::MessageDelivered { message_ids } => {
+                assert!(
+                    message_ids.contains(&msg_id),
+                    "MessageDelivered missing our ID"
+                );
+                got_delivered = true;
+            }
+            _ => panic!("unexpected response: {resp:?}"),
+        }
+    }
+    assert!(got_sent, "expected MessageSent in {r1:?} or {r2:?}");
+    assert!(
+        got_delivered,
+        "expected MessageDelivered in {r1:?} or {r2:?}"
+    );
+}
+
+#[tokio::test]
+async fn read_receipt_relay() {
+    let (url, _handle) = start_test_server().await;
+    let alice_id = make_identity();
+    let bob_id = make_identity();
+
+    let (mut as1, mut ar1) = connect(&url).await;
+    register(&mut as1, &mut ar1, "alice", &alice_id).await;
+
+    let (mut bs1, mut br1) = connect(&url).await;
+    register(&mut bs1, &mut br1, "bob", &bob_id).await;
+
+    // Bob sends a read receipt to Alice (encrypted envelope as opaque blob)
+    send(
+        &mut bs1,
+        &ClientMessage::SendReadReceipt {
+            recipient_id: UserId::new("alice").unwrap(),
+            envelope: dummy_envelope("read-receipt-data"),
+        },
+    )
+    .await;
+
+    let resp = recv(&mut ar1).await;
+    let ServerMessage::IncomingReadReceipt { sender_id, .. } = resp else {
+        panic!("expected IncomingReadReceipt: {resp:?}");
+    };
+    assert_eq!(sender_id.as_str(), "bob");
 }

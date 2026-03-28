@@ -43,6 +43,17 @@ pub enum ClientMessage {
     Ack {
         message_ids: Vec<MessageId>,
     },
+
+    /// Ephemeral typing indicator — relayed to online recipient only, never queued.
+    Typing {
+        recipient_id: UserId,
+    },
+
+    /// E2EE encrypted read receipt — relayed to online recipient only, never queued.
+    SendReadReceipt {
+        recipient_id: UserId,
+        envelope: EncryptedEnvelope,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +102,22 @@ pub enum ServerMessage {
     Error {
         code: u32,
         message: String,
+    },
+
+    /// A peer is currently typing. Ephemeral — never queued.
+    PeerTyping {
+        sender_id: UserId,
+    },
+
+    /// Server-generated: message was pushed to recipient's device.
+    MessageDelivered {
+        message_ids: Vec<MessageId>,
+    },
+
+    /// E2EE encrypted read receipt from a peer.
+    IncomingReadReceipt {
+        sender_id: UserId,
+        envelope: EncryptedEnvelope,
     },
 }
 
@@ -414,5 +441,44 @@ mod tests {
         let json = r#"{"type":"FooBar"}"#;
         assert!(serde_json::from_str::<ServerMessage>(json).is_err());
         assert!(serde_json::from_str::<ClientMessage>(json).is_err());
+    }
+
+    // ── Typing + receipt round-trips ──
+
+    #[test]
+    fn client_typing() {
+        roundtrip_client(&ClientMessage::Typing {
+            recipient_id: user("bob"),
+        });
+    }
+
+    #[test]
+    fn client_send_read_receipt() {
+        roundtrip_client(&ClientMessage::SendReadReceipt {
+            recipient_id: user("bob"),
+            envelope: sample_envelope(),
+        });
+    }
+
+    #[test]
+    fn server_peer_typing() {
+        roundtrip_server(&ServerMessage::PeerTyping {
+            sender_id: user("alice"),
+        });
+    }
+
+    #[test]
+    fn server_message_delivered() {
+        roundtrip_server(&ServerMessage::MessageDelivered {
+            message_ids: vec![MessageId::new(), MessageId::new()],
+        });
+    }
+
+    #[test]
+    fn server_incoming_read_receipt() {
+        roundtrip_server(&ServerMessage::IncomingReadReceipt {
+            sender_id: user("alice"),
+            envelope: sample_envelope(),
+        });
     }
 }

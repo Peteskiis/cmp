@@ -1,8 +1,6 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use protocol::{EncryptedEnvelope, InboundMessage, MessageId, ServerMessage, UserId, consts};
 
-use super::{error_400, error_500_generic};
+use super::{error_400, error_500_generic, now_secs};
 use crate::db;
 use crate::db::queue::EnqueueResult;
 use crate::state::AppState;
@@ -62,9 +60,20 @@ pub async fn handle_send(
         envelope,
         timestamp: now_secs(),
     };
-    state
+    let pushed = state
         .connections
         .send_to(recipient_str, ServerMessage::IncomingMessage(inbound));
+
+    // Server-generated delivery receipt: if the message was pushed to the
+    // recipient's device, notify the sender immediately.
+    if pushed {
+        state.connections.send_to(
+            sender_id,
+            ServerMessage::MessageDelivered {
+                message_ids: vec![message_id.clone()],
+            },
+        );
+    }
 
     ServerMessage::MessageSent { message_id }
 }
@@ -92,9 +101,39 @@ pub async fn handle_ack(
     None
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// Relay a typing indicator — online only, never queued.
+// TODO: add per-connection rate limiting to prevent flooding
+pub fn handle_typing(state: &AppState, from: &str, to: &UserId) {
+    let Ok(from_uid) = UserId::new(from) else {
+        return;
+    };
+    state.connections.send_to(
+        to.as_str(),
+        ServerMessage::PeerTyping {
+            sender_id: from_uid,
+        },
+    );
+}
+
+/// Relay an E2EE read receipt — online only, never queued.
+pub fn handle_read_receipt(
+    state: &AppState,
+    from: &str,
+    to: &UserId,
+    envelope: &protocol::EncryptedEnvelope,
+) -> Option<ServerMessage> {
+    if envelope.ciphertext.len() > consts::MAX_CIPHERTEXT_BYTES {
+        return Some(error_400("ciphertext exceeds maximum size"));
+    }
+    let Ok(from_uid) = UserId::new(from) else {
+        return None;
+    };
+    state.connections.send_to(
+        to.as_str(),
+        ServerMessage::IncomingReadReceipt {
+            sender_id: from_uid,
+            envelope: envelope.clone(),
+        },
+    );
+    None
 }

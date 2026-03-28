@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers};
 use futures::StreamExt;
@@ -25,10 +28,26 @@ struct App {
     target_user: Option<UserId>,
     running: bool,
     crypto: CryptoManager,
+    /// Typing indicator debounce.
+    last_typing_sent: Option<Instant>,
+    /// Peer typing state with expiry timestamp.
+    peer_typing: Option<(String, Instant)>,
+    /// Track delivery/read status for sent messages.
+    sent_status: HashMap<MessageId, MessageStatus>,
+    /// Messages displayed but not read-receipted (chat target didn't match sender).
+    unread_messages: HashMap<String, Vec<MessageId>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MessageStatus {
+    Sent,
+    Delivered,
+    #[allow(dead_code)] // Entries are evicted on Read, but variant documents the lifecycle
+    Read,
 }
 
 impl App {
-    const fn new(crypto: CryptoManager) -> Self {
+    fn new(crypto: CryptoManager) -> Self {
         Self {
             input: String::new(),
             cursor_pos: 0,
@@ -36,6 +55,10 @@ impl App {
             target_user: None,
             running: true,
             crypto,
+            last_typing_sent: None,
+            peer_typing: None,
+            sent_status: HashMap::new(),
+            unread_messages: HashMap::new(),
         }
     }
 
@@ -45,6 +68,7 @@ impl App {
     }
 }
 
+#[allow(clippy::cognitive_complexity)]
 pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
     let validated_uid = UserId::new(user_id)?;
 
@@ -82,7 +106,22 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
         let visible_input = visible_slice(&app.input, app.input_scroll, max_visible);
         let visible_cursor = app.cursor_pos.saturating_sub(app.input_scroll);
 
-        ui::draw_input(&mut terminal, &visible_input, visible_cursor)?;
+        // Show typing indicator if peer is typing and hasn't timed out
+        let typing_label = app
+            .peer_typing
+            .as_ref()
+            .filter(|(_, ts)| ts.elapsed() < Duration::from_secs(5))
+            .map(|(name, _)| name.as_str());
+        ui::draw_input(&mut terminal, &visible_input, visible_cursor, typing_label)?;
+
+        // Only tick when someone is typing — avoids idle redraws
+        let typing_tick = async {
+            if app.peer_typing.is_some() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
 
         tokio::select! {
             Some(Ok(event)) = event_stream.next() => {
@@ -90,6 +129,13 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
             }
             Some(event) = event_rx.recv() => {
                 handle_app_event(&mut app, &mut terminal, &outgoing_tx, event)?;
+            }
+            () = typing_tick => {
+                if let Some((_, ts)) = &app.peer_typing
+                    && ts.elapsed() > Duration::from_secs(5)
+                {
+                    app.peer_typing = None;
+                }
             }
         }
     }
@@ -169,6 +215,22 @@ fn handle_key_event(
                 .map_or(app.input.len(), |(i, _)| i);
             app.input.insert(byte_pos, c);
             app.cursor_pos += 1;
+
+            // Send typing indicator (debounced, only if session exists)
+            if let Some(ref target) = app.target_user
+                && app.crypto.has_session(target.as_str())
+            {
+                let now = Instant::now();
+                let should_send = app
+                    .last_typing_sent
+                    .is_none_or(|t| now.duration_since(t) > Duration::from_secs(3));
+                if should_send {
+                    let _ = outgoing_tx.send(ClientMessage::Typing {
+                        recipient_id: target.clone(),
+                    });
+                    app.last_typing_sent = Some(now);
+                }
+            }
         }
         _ => {}
     }
@@ -220,9 +282,15 @@ fn handle_enter(
         }
     };
 
+    let msg_id = MessageId::new();
+    // Cap sent_status to prevent unbounded growth from unreceipted messages
+    if app.sent_status.len() >= 10_000 {
+        app.sent_status.clear();
+    }
+    app.sent_status.insert(msg_id.clone(), MessageStatus::Sent);
     let _ = outgoing_tx.send(ClientMessage::SendMessage {
         recipient_id: target.clone(),
-        message_id: MessageId::new(),
+        message_id: msg_id,
         envelope,
     });
     ui::insert_user_message(terminal, &text)?;
@@ -256,12 +324,21 @@ fn handle_command(
         return Ok(());
     }
 
+    if text == "/quit" || text == "/q" {
+        app.running = false;
+        app.clear_input();
+        return Ok(());
+    }
+
     if text == "/help" || text == "/h" {
         ui::insert_status(terminal, "commands:")?;
-        ui::insert_status(terminal, "  /chat <user>  — start or switch conversation")?;
-        ui::insert_status(terminal, "  /contacts     — list all contacts")?;
-        ui::insert_status(terminal, "  /help         — show this help")?;
-        ui::insert_status(terminal, "  Ctrl+D        — quit")?;
+        ui::insert_status(
+            terminal,
+            "  /chat <user>  \u{2014} start or switch conversation",
+        )?;
+        ui::insert_status(terminal, "  /contacts     \u{2014} list all contacts")?;
+        ui::insert_status(terminal, "  /quit         \u{2014} exit")?;
+        ui::insert_status(terminal, "  /help         \u{2014} show this help")?;
         app.clear_input();
         return Ok(());
     }
@@ -288,7 +365,21 @@ fn handle_command(
                     });
                     ui::insert_status(terminal, &format!("fetching keys for {target}..."))?;
                 }
-                app.target_user = Some(uid);
+                app.target_user = Some(uid.clone());
+                app.peer_typing = None;
+                app.last_typing_sent = None;
+                // Flush pending read receipts — only remove from map if encrypt succeeds
+                if let Some(unread) = app.unread_messages.get(target)
+                    && !unread.is_empty()
+                    && app.crypto.has_session(target)
+                    && let Ok(receipt_env) = encrypt_read_receipt(&mut app.crypto, target, unread)
+                {
+                    let _ = outgoing_tx.send(ClientMessage::SendReadReceipt {
+                        recipient_id: uid,
+                        envelope: receipt_env,
+                    });
+                    app.unread_messages.remove(target);
+                }
             }
             Err(e) => {
                 ui::insert_status(terminal, &format!("invalid username: {e}"))?;
@@ -322,7 +413,7 @@ fn handle_app_event(
     Ok(())
 }
 
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 fn handle_server_message(
     app: &mut App,
     terminal: &mut ui::Term,
@@ -351,6 +442,7 @@ fn handle_server_message(
             let (text, ok) = app.crypto.decrypt_to_text(&sender, &inbound.envelope);
             ui::insert_friend_message(terminal, &sender, &text)?;
             if ok {
+                let msg_id = inbound.message_id.clone();
                 let _ = outgoing_tx.send(ClientMessage::Ack {
                     message_ids: vec![inbound.message_id],
                 });
@@ -361,6 +453,27 @@ fn handle_server_message(
                     app.target_user = Some(uid);
                     ui::insert_status(terminal, &format!("now chatting with {sender}"))?;
                 }
+                // Read receipt: if chat target matches sender, mark as read immediately
+                if app
+                    .target_user
+                    .as_ref()
+                    .is_some_and(|t| t.as_str() == sender)
+                    && app.crypto.has_session(&sender)
+                {
+                    if let Ok(receipt_env) =
+                        encrypt_read_receipt(&mut app.crypto, &sender, &[msg_id])
+                    {
+                        let _ = outgoing_tx.send(ClientMessage::SendReadReceipt {
+                            recipient_id: inbound.sender_id,
+                            envelope: receipt_env,
+                        });
+                    }
+                } else {
+                    let entry = app.unread_messages.entry(sender).or_default();
+                    if entry.len() < consts::MAX_RECEIPT_BATCH {
+                        entry.push(msg_id);
+                    }
+                }
             }
         }
         ServerMessage::QueuedMessages { messages } => {
@@ -370,13 +483,75 @@ fn handle_server_message(
                 let (text, ok) = app.crypto.decrypt_to_text(&sender, &inbound.envelope);
                 ui::insert_friend_message(terminal, &sender, &text)?;
                 if ok {
-                    ack_ids.push(inbound.message_id);
+                    ack_ids.push(inbound.message_id.clone());
+                    let entry = app.unread_messages.entry(sender).or_default();
+                    if entry.len() < consts::MAX_RECEIPT_BATCH {
+                        entry.push(inbound.message_id);
+                    }
                 }
             }
             if !ack_ids.is_empty() {
                 let _ = outgoing_tx.send(ClientMessage::Ack {
                     message_ids: ack_ids,
                 });
+            }
+            // Flush read receipts for messages from the current chat target
+            if let Some(ref target) = app.target_user {
+                let target_str = target.as_str();
+                if let Some(unread) = app.unread_messages.get(target_str)
+                    && !unread.is_empty()
+                    && app.crypto.has_session(target_str)
+                    && let Ok(receipt_env) =
+                        encrypt_read_receipt(&mut app.crypto, target_str, unread)
+                {
+                    let _ = outgoing_tx.send(ClientMessage::SendReadReceipt {
+                        recipient_id: target.clone(),
+                        envelope: receipt_env,
+                    });
+                    app.unread_messages.remove(target_str);
+                }
+            }
+        }
+        ServerMessage::PeerTyping { sender_id } => {
+            app.peer_typing = Some((sender_id.as_str().to_owned(), Instant::now()));
+        }
+        ServerMessage::MessageSent { message_id } => {
+            app.sent_status
+                .entry(message_id)
+                .or_insert(MessageStatus::Sent);
+            ui::insert_status(terminal, "  \u{2713} sent")?;
+        }
+        ServerMessage::MessageDelivered { message_ids } => {
+            for id in &message_ids {
+                if let Some(status) = app.sent_status.get_mut(id)
+                    && *status < MessageStatus::Delivered
+                {
+                    *status = MessageStatus::Delivered;
+                }
+            }
+            ui::insert_status(terminal, "  \u{2713}\u{2713} delivered")?;
+        }
+        ServerMessage::IncomingReadReceipt {
+            sender_id,
+            envelope,
+        } => {
+            // Decrypt the E2EE read receipt
+            let sender = sender_id.as_str();
+            if let Ok(plaintext) = app.crypto.decrypt(sender, &envelope)
+                && let Ok(read_ids) = serde_json::from_slice::<Vec<String>>(&plaintext)
+            {
+                let mut any_read = false;
+                for id_str in &read_ids {
+                    if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
+                        let mid = MessageId::from(uuid);
+                        // Evict on Read — entry is dead weight after this
+                        app.sent_status.remove(&mid);
+                        any_read = true;
+                    }
+                }
+                if any_read {
+                    ui::insert_status(terminal, "  \u{1f441} read")?;
+                }
             }
         }
         ServerMessage::PreKeyLow { remaining } => {
@@ -391,6 +566,29 @@ fn handle_server_message(
         _ => {}
     }
     Ok(())
+}
+
+/// Encrypt a read receipt (list of message ID strings) using the E2EE session.
+fn encrypt_read_receipt(
+    crypto: &mut CryptoManager,
+    peer_id: &str,
+    message_ids: &[MessageId],
+) -> Result<protocol::EncryptedEnvelope, crate::crypto_mgr::CryptoError> {
+    // Cap batch to prevent oversized envelopes
+    let capped = if message_ids.len() > consts::MAX_RECEIPT_BATCH {
+        &message_ids[..consts::MAX_RECEIPT_BATCH]
+    } else {
+        message_ids
+    };
+    let id_strings: Vec<String> = capped.iter().map(ToString::to_string).collect();
+    let plaintext = serde_json::to_vec(&id_strings)
+        .map_err(|_| crate::crypto_mgr::CryptoError::RatchetFailed)?;
+    // Check plaintext size before encrypting to avoid ratchet desync
+    let estimated_ct_len = (plaintext.len() + 18) / 3 * 4;
+    if estimated_ct_len > consts::MAX_CIPHERTEXT_BYTES {
+        return Err(crate::crypto_mgr::CryptoError::RatchetFailed);
+    }
+    crypto.encrypt(peer_id, &plaintext)
 }
 
 async fn register_with_server(

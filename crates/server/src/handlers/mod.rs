@@ -32,6 +32,16 @@ impl Session {
     }
 }
 
+// ── Shared helpers ──
+
+pub fn now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 // ── Shared error helpers ──
 
 pub fn auth_failure(reason: &str) -> ServerMessage {
@@ -138,6 +148,18 @@ pub async fn handle_message(
         ClientMessage::Ack { message_ids } => {
             let user_id = session.authed_user.as_ref()?;
             message::handle_ack(state, user_id, message_ids).await
+        }
+        ClientMessage::Typing { recipient_id } => {
+            let sender_id = session.authed_user.as_ref()?;
+            message::handle_typing(state, sender_id, &recipient_id);
+            None
+        }
+        ClientMessage::SendReadReceipt {
+            recipient_id,
+            envelope,
+        } => {
+            let sender_id = session.authed_user.as_ref()?;
+            message::handle_read_receipt(state, sender_id, &recipient_id, &envelope)
         }
         _ => {
             warn!("unhandled message type");

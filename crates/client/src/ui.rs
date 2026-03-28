@@ -51,7 +51,12 @@ pub fn init() -> anyhow::Result<(Term, RawModeGuard)> {
 }
 
 /// Draw the input widget in the inline viewport.
-pub fn draw_input(terminal: &mut Term, input: &str, cursor_pos: usize) -> anyhow::Result<()> {
+pub fn draw_input(
+    terminal: &mut Term,
+    input: &str,
+    cursor_pos: usize,
+    typing_indicator: Option<&str>,
+) -> anyhow::Result<()> {
     terminal.draw(|frame| {
         let area = frame.area();
         let chunks = Layout::vertical([
@@ -63,7 +68,20 @@ pub fn draw_input(terminal: &mut Term, input: &str, cursor_pos: usize) -> anyhow
         .split(area);
 
         let bg_style = Style::default().bg(BG_DARK);
-        for &chunk in &[chunks[0], chunks[1], chunks[2]] {
+
+        // Top line: typing indicator or empty padding
+        if let Some(who) = typing_indicator {
+            let typing_line = Line::from(Span::styled(
+                format!("  {who} is typing..."),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+            frame.render_widget(Paragraph::new(typing_line).style(bg_style), chunks[0]);
+        } else {
+            frame.render_widget(Paragraph::new("").style(bg_style), chunks[0]);
+        }
+        for &chunk in &[chunks[1], chunks[2]] {
             frame.render_widget(Paragraph::new("").style(bg_style), chunk);
         }
 
