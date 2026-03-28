@@ -70,7 +70,18 @@ impl CryptoManager {
     /// Load or generate identity, SPK, OPKs, and sessions from `data_dir`.
     pub fn load_or_generate(data_dir: &Path) -> anyhow::Result<Self> {
         fs::create_dir_all(data_dir)?;
-        fs::create_dir_all(data_dir.join("sessions"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700))?;
+        }
+        let sessions_dir = data_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o700))?;
+        }
 
         let key_path = data_dir.join("identity.key");
         let identity = if key_path.exists() {

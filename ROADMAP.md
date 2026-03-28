@@ -320,7 +320,7 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 
 ### Deferred (not M1 blockers)
 - [ ] SQLCipher-encrypted local database
-- [ ] Message history persistence
+- [x] Message history persistence (SQLite, `/chat` reloads last 100 messages)
 - [ ] Adaptive terminal background color detection
 
 ---
@@ -343,7 +343,7 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [ ] Manual test: run server + two TUI clients in separate terminals
 - [x] Full workspace verification:
   - [x] `cargo check --workspace`
-  - [x] `cargo test --workspace` (103 tests)
+  - [x] `cargo test --workspace` (128 tests)
   - [x] `cargo clippy --workspace -- -D warnings`
   - [x] `cargo fmt --all -- --check`
 
