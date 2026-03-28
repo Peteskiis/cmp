@@ -1,6 +1,9 @@
 use std::io::stdout;
 
 use crossterm::cursor::SetCursorStyle;
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::Terminal;
@@ -10,7 +13,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
-const INPUT_HEIGHT: u16 = 4;
+const INPUT_HEIGHT: u16 = 40;
+pub(crate) const PREFIX_WIDTH: usize = 3; // " › " or "   "
 const BG_DARK: Color = Color::Rgb(40, 44, 52);
 const PROMPT_COLOR: Color = Color::Rgb(34, 199, 168);
 const PLACEHOLDER_COLOR: Color = Color::Rgb(90, 90, 90);
@@ -20,6 +24,7 @@ pub struct RawModeGuard;
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), SetCursorStyle::DefaultUserShape);
     }
@@ -31,12 +36,19 @@ pub type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 pub fn init() -> anyhow::Result<(Term, RawModeGuard)> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), SetCursorStyle::DefaultUserShape);
         original_hook(info);
     }));
 
     enable_raw_mode()?;
+    // Enable Kitty keyboard protocol so Shift+Enter is distinguishable from Enter.
+    // Fails silently on terminals that don't support it — Ctrl+J works as fallback.
+    let _ = execute!(
+        stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     let guard = RawModeGuard;
 
     let backend = CrosstermBackend::new(stdout());
@@ -50,26 +62,253 @@ pub fn init() -> anyhow::Result<(Term, RawModeGuard)> {
     Ok((terminal, guard))
 }
 
-/// Draw the input widget in the inline viewport.
+// ── Input wrapping helpers ──
+
+/// Wrap input text for the input widget using character-level wrapping.
+/// Returns `(visual_lines, line_start_char_indices)`.
+pub fn wrap_input(input: &str, max_cols: usize) -> (Vec<String>, Vec<usize>) {
+    if max_cols == 0 {
+        return (vec![input.to_owned()], vec![0]);
+    }
+
+    let mut lines = Vec::new();
+    let mut starts = Vec::new();
+    let mut current = String::new();
+    let mut line_start: usize = 0;
+    let mut char_idx: usize = 0;
+
+    for ch in input.chars() {
+        if ch == '\n' {
+            lines.push(std::mem::take(&mut current));
+            starts.push(line_start);
+            char_idx += 1;
+            line_start = char_idx;
+        } else {
+            current.push(ch);
+            char_idx += 1;
+            if current.chars().count() >= max_cols {
+                lines.push(std::mem::take(&mut current));
+                starts.push(line_start);
+                line_start = char_idx;
+            }
+        }
+    }
+    lines.push(current);
+    starts.push(line_start);
+
+    (lines, starts)
+}
+
+/// Map a cursor char index to visual `(row, col)`.
+pub fn cursor_visual_pos(cursor_pos: usize, line_starts: &[usize]) -> (usize, usize) {
+    for (i, &start) in line_starts.iter().enumerate().rev() {
+        if cursor_pos >= start {
+            return (i, cursor_pos - start);
+        }
+    }
+    (0, cursor_pos)
+}
+
+/// Map visual `(row, col)` back to a cursor char index.
+pub fn visual_to_cursor(row: usize, col: usize, line_starts: &[usize], lines: &[String]) -> usize {
+    if row >= lines.len() {
+        let last = lines.len() - 1;
+        return line_starts[last] + lines[last].chars().count();
+    }
+    let line_len = lines[row].chars().count();
+    line_starts[row] + col.min(line_len)
+}
+
+/// Maximum number of input lines visible (viewport minus typing and footer).
+/// Viewport rows minus typing + bottom padding + footer.
+pub const fn max_visible_input_lines() -> usize {
+    (INPUT_HEIGHT as usize).saturating_sub(3)
+}
+
+/// Render a `ChatEntry` into display lines with optional background style.
+/// Single source of truth for message rendering — used by both viewport and scrollback.
+fn chat_entry_to_lines(
+    entry: &crate::app::ChatEntry,
+    width: u16,
+) -> Vec<(Line<'static>, Option<Style>)> {
+    let mut rows = Vec::new();
+    match entry {
+        crate::app::ChatEntry::Sent(text) => {
+            let wrapped = wrap_message(text, width, 2);
+            let sent_bg = Some(Style::default().bg(Color::Rgb(50, 54, 62)));
+            rows.push((Line::from(""), None));
+            for (i, lt) in wrapped.iter().enumerate() {
+                let pfx = if i == 0 {
+                    "\u{203a} ".to_owned()
+                } else {
+                    "  ".to_owned()
+                };
+                rows.push((
+                    Line::from(vec![
+                        Span::styled(
+                            pfx,
+                            Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
+                        ),
+                        Span::raw(lt.clone()),
+                    ]),
+                    sent_bg,
+                ));
+            }
+            rows.push((Line::from(""), None));
+        }
+        crate::app::ChatEntry::Received { sender, text } => {
+            let pw = 4 + sender.len();
+            let wrapped = wrap_message(text, width, pw);
+            rows.push((Line::from(""), None));
+            for (i, lt) in wrapped.iter().enumerate() {
+                let pfx = if i == 0 {
+                    format!("\u{2022} {sender}: ")
+                } else {
+                    " ".repeat(pw)
+                };
+                rows.push((
+                    Line::from(vec![
+                        Span::styled(pfx, Style::default().add_modifier(Modifier::DIM)),
+                        Span::raw(lt.clone()),
+                    ]),
+                    None,
+                ));
+            }
+            rows.push((Line::from(""), None));
+        }
+        crate::app::ChatEntry::Status(text) => {
+            rows.push((
+                Line::from(Span::styled(
+                    format!("  {text}"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                None,
+            ));
+        }
+    }
+    rows
+}
+
+/// Flush chat entries that exceed the visible area to terminal scrollback.
+#[allow(clippy::cast_possible_truncation)]
+pub fn flush_chat_to_scrollback(
+    terminal: &mut Term,
+    history: &mut Vec<crate::app::ChatEntry>,
+    max_chat_rows: usize,
+) -> anyhow::Result<()> {
+    if max_chat_rows == 0 || history.is_empty() {
+        return Ok(());
+    }
+
+    let width = terminal.size()?.width;
+
+    // Count display rows from the end (most recent), find where to cut
+    let mut rows_from_end: usize = 0;
+    let mut keep_from = 0;
+    for (i, entry) in history.iter().enumerate().rev() {
+        let entry_rows = chat_entry_to_lines(entry, width).len();
+        if rows_from_end + entry_rows > max_chat_rows {
+            keep_from = i + 1;
+            break;
+        }
+        rows_from_end += entry_rows;
+    }
+
+    if keep_from == 0 {
+        return Ok(());
+    }
+
+    // Flush oldest entries to scrollback via insert_before
+    let to_flush: Vec<crate::app::ChatEntry> = history.drain(..keep_from).collect();
+    for entry in &to_flush {
+        let lines = chat_entry_to_lines(entry, width);
+        #[allow(clippy::cast_possible_truncation)]
+        let height = lines.len() as u16;
+        if height == 0 {
+            continue;
+        }
+        terminal.insert_before(height, |buf| {
+            for (i, (line, bg)) in lines.iter().enumerate() {
+                let y = buf.area.y + i as u16;
+                let rect = Rect::new(buf.area.x, y, buf.area.width, 1);
+                if let Some(style) = bg {
+                    Paragraph::new(line.clone()).style(*style).render(rect, buf);
+                } else {
+                    line.clone().render(rect, buf);
+                }
+            }
+        })?;
+    }
+
+    Ok(())
+}
+
+// ── Drawing ──
+
+/// Draw chat history + input, top-aligned in the viewport.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
 pub fn draw_input(
     terminal: &mut Term,
-    input: &str,
-    cursor_pos: usize,
+    history: &[crate::app::ChatEntry],
+    input_lines: &[String],
+    cursor_row: usize,
+    cursor_col: usize,
+    scroll: usize,
     typing_indicator: Option<&str>,
 ) -> anyhow::Result<()> {
     terminal.draw(|frame| {
         let area = frame.area();
+        let bg_style = Style::default().bg(BG_DARK);
+
+        let mut chat_rows: Vec<(Line<'_>, Option<Style>)> = Vec::new();
+        for entry in history {
+            chat_rows.extend(chat_entry_to_lines(entry, area.width));
+        }
+
+        // Input gets priority — as it grows, chat shrinks (scrolls up)
+        // +3 = typing + bottom padding + footer
+        let input_height = (input_lines.len() as u16)
+            .max(1)
+            .min(area.height.saturating_sub(5));
+        let chat_height =
+            (chat_rows.len() as u16).min(area.height.saturating_sub(input_height + 3));
+
         let chunks = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(chat_height),
+            Constraint::Length(1),            // typing
+            Constraint::Length(input_height), // input
+            Constraint::Length(1),            // bottom padding
+            Constraint::Length(1),            // footer
+            Constraint::Min(0),               // empty
         ])
         .split(area);
 
-        let bg_style = Style::default().bg(BG_DARK);
+        // Chat history
+        let chat_area = chunks[0];
+        // Show most recent messages (scroll to bottom)
+        let chat_skip = chat_rows.len().saturating_sub(chat_area.height as usize);
+        for (i, (line, bg)) in chat_rows
+            .iter()
+            .skip(chat_skip)
+            .take(chat_area.height as usize)
+            .enumerate()
+        {
+            let y = chat_area.y + i as u16;
+            let rect = Rect::new(chat_area.x, y, chat_area.width, 1);
+            if let Some(style) = bg {
+                Paragraph::new(line.clone())
+                    .style(*style)
+                    .render(rect, frame.buffer_mut());
+            } else {
+                line.clone().render(rect, frame.buffer_mut());
+            }
+        }
 
-        // Top line: typing indicator or empty padding
+        // Typing indicator
         if let Some(who) = typing_indicator {
             let typing_line = Line::from(Span::styled(
                 format!("  {who} is typing..."),
@@ -77,45 +316,74 @@ pub fn draw_input(
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
             ));
-            frame.render_widget(Paragraph::new(typing_line).style(bg_style), chunks[0]);
+            frame.render_widget(Paragraph::new(typing_line).style(bg_style), chunks[1]);
         } else {
-            frame.render_widget(Paragraph::new("").style(bg_style), chunks[0]);
-        }
-        for &chunk in &[chunks[1], chunks[2]] {
-            frame.render_widget(Paragraph::new("").style(bg_style), chunk);
+            frame.render_widget(Paragraph::new("").style(bg_style), chunks[1]);
         }
 
-        let prompt = Span::styled(
-            " \u{203a} ",
-            Style::default()
-                .fg(PROMPT_COLOR)
-                .add_modifier(Modifier::BOLD),
-        );
-        let input_line = if input.is_empty() {
-            Line::from(vec![
-                prompt,
-                Span::styled("Type a message...", Style::default().fg(PLACEHOLDER_COLOR)),
-            ])
-        } else {
-            Line::from(vec![prompt, Span::raw(input)])
-        };
-        frame.render_widget(Paragraph::new(input_line).style(bg_style), chunks[1]);
+        // Input lines
+        let input_area = chunks[2];
+        let visible_count = input_area.height as usize;
 
+        for row in 0..input_area.height {
+            let y = input_area.y + row;
+            let rect = Rect::new(input_area.x, y, input_area.width, 1);
+            frame.render_widget(Paragraph::new("").style(bg_style), rect);
+        }
+
+        for (i, line_text) in input_lines
+            .iter()
+            .skip(scroll)
+            .take(visible_count)
+            .enumerate()
+        {
+            let line_idx = scroll + i;
+            let prefix = if i == 0 {
+                Span::styled(
+                    " \u{203a} ",
+                    Style::default()
+                        .fg(PROMPT_COLOR)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled("   ", bg_style)
+            };
+
+            let content = if line_idx == 0 && line_text.is_empty() && input_lines.len() == 1 {
+                Line::from(vec![
+                    prefix,
+                    Span::styled("Type a message...", Style::default().fg(PLACEHOLDER_COLOR)),
+                ])
+            } else {
+                Line::from(vec![prefix, Span::raw(line_text.as_str())])
+            };
+
+            let y = input_area.y + i as u16;
+            let rect = Rect::new(input_area.x, y, input_area.width, 1);
+            frame.render_widget(Paragraph::new(content).style(bg_style), rect);
+        }
+
+        // Bottom padding
+        frame.render_widget(Paragraph::new("").style(bg_style), chunks[3]);
+
+        // Footer
         let footer = Line::from(vec![
             Span::styled("  Enter", Style::default().fg(Color::DarkGray)),
             Span::styled(" send  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Shift+Enter", Style::default().fg(Color::DarkGray)),
+            Span::styled(" newline  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Ctrl+D", Style::default().fg(Color::DarkGray)),
             Span::styled(" quit", Style::default().fg(Color::DarkGray)),
         ]);
-        frame.render_widget(Paragraph::new(footer), chunks[3]);
+        frame.render_widget(Paragraph::new(footer), chunks[4]);
 
-        // cursor_pos is already adjusted for scroll by the caller
-        // +3 for " › " prefix; terminal width naturally clips
-        #[allow(clippy::cast_possible_truncation)] // cursor_pos bounded by visible input width
-        let cursor_x = chunks[1].x + 3 + cursor_pos as u16;
+        // Cursor
+        let cursor_visible_row = cursor_row.saturating_sub(scroll);
+        let cursor_x = input_area.x + PREFIX_WIDTH as u16 + cursor_col as u16;
+        let cursor_y = input_area.y + cursor_visible_row as u16;
         frame.set_cursor_position((
-            cursor_x.min(chunks[1].right().saturating_sub(1)),
-            chunks[1].y,
+            cursor_x.min(input_area.right().saturating_sub(1)),
+            cursor_y.min(input_area.bottom().saturating_sub(1)),
         ));
     })?;
 
@@ -123,88 +391,7 @@ pub fn draw_input(
     Ok(())
 }
 
-/// Insert a user message above the viewport.
-pub fn insert_user_message(terminal: &mut Term, text: &str) -> anyhow::Result<()> {
-    // "› " prefix = 2 chars
-    let lines = wrap_message(text, terminal.size()?.width, 2);
-    // height = message lines + 2 blank lines (above/below)
-    #[allow(clippy::cast_possible_truncation)] // line count bounded by terminal height
-    let height = (lines.len() + 2) as u16;
-
-    terminal.insert_before(height, |buf| {
-        Line::from("").render(Rect::new(buf.area.x, buf.area.y, buf.area.width, 1), buf);
-
-        for (i, line_text) in lines.iter().enumerate() {
-            let prefix = if i == 0 { "\u{203a} " } else { "  " };
-            let line = Line::from(vec![
-                Span::styled(
-                    prefix,
-                    Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
-                ),
-                Span::raw(line_text.as_str()),
-            ]);
-            #[allow(clippy::cast_possible_truncation)] // i bounded by terminal height
-            let y = buf.area.y + 1 + i as u16;
-            let area = Rect::new(buf.area.x, y, buf.area.width, 1);
-            let bg = Style::default().bg(Color::Rgb(50, 54, 62));
-            Paragraph::new(line).style(bg).render(area, buf);
-        }
-
-        #[allow(clippy::cast_possible_truncation)] // lines.len() bounded by terminal height
-        let last_y = buf.area.y + 1 + lines.len() as u16;
-        Line::from("").render(Rect::new(buf.area.x, last_y, buf.area.width, 1), buf);
-    })?;
-
-    Ok(())
-}
-
-/// Insert a friend's message above the viewport.
-pub fn insert_friend_message(terminal: &mut Term, sender: &str, text: &str) -> anyhow::Result<()> {
-    // "• {sender}: " prefix = 4 + sender.len()
-    let lines = wrap_message(text, terminal.size()?.width, 4 + sender.len());
-    #[allow(clippy::cast_possible_truncation)] // line count bounded by terminal height
-    let height = (lines.len() + 2) as u16;
-
-    terminal.insert_before(height, |buf| {
-        Line::from("").render(Rect::new(buf.area.x, buf.area.y, buf.area.width, 1), buf);
-
-        for (i, line_text) in lines.iter().enumerate() {
-            let prefix = if i == 0 {
-                format!("\u{2022} {sender}: ")
-            } else {
-                "  ".to_owned()
-            };
-            let line = Line::from(vec![
-                Span::styled(prefix, Style::default().add_modifier(Modifier::DIM)),
-                Span::raw(line_text.as_str()),
-            ]);
-            #[allow(clippy::cast_possible_truncation)] // i bounded by terminal height
-            let y = buf.area.y + 1 + i as u16;
-            let area = Rect::new(buf.area.x, y, buf.area.width, 1);
-            line.render(area, buf);
-        }
-
-        #[allow(clippy::cast_possible_truncation)] // lines.len() bounded by terminal height
-        let last_y = buf.area.y + 1 + lines.len() as u16;
-        Line::from("").render(Rect::new(buf.area.x, last_y, buf.area.width, 1), buf);
-    })?;
-
-    Ok(())
-}
-
-/// Insert a status message.
-pub fn insert_status(terminal: &mut Term, text: &str) -> anyhow::Result<()> {
-    terminal.insert_before(1, |buf| {
-        let line = Line::from(Span::styled(
-            format!("  {text}"),
-            Style::default().fg(Color::DarkGray),
-        ));
-        line.render(Rect::new(buf.area.x, buf.area.y, buf.area.width, 1), buf);
-    })?;
-    Ok(())
-}
-
-/// Simple word wrap respecting terminal width.
+/// Word wrap respecting terminal width and explicit newlines.
 /// `prefix_width` is the number of characters used by the first-line prefix.
 fn wrap_message(text: &str, width: u16, prefix_width: usize) -> Vec<String> {
     let max_width = (width as usize).saturating_sub(prefix_width);
@@ -213,21 +400,21 @@ fn wrap_message(text: &str, width: u16, prefix_width: usize) -> Vec<String> {
     }
 
     let mut lines = Vec::new();
-    let mut current = String::new();
-
-    for word in text.split_whitespace() {
-        if current.is_empty() {
-            word.clone_into(&mut current);
-        } else if current.len() + 1 + word.len() <= max_width {
-            current.push(' ');
-            current.push_str(word);
-        } else {
-            lines.push(current);
-            current = String::new();
-            word.clone_into(&mut current);
+    for paragraph in text.split('\n') {
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            if current.is_empty() {
+                word.clone_into(&mut current);
+            } else if current.len() + 1 + word.len() <= max_width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(current);
+                current = String::new();
+                word.clone_into(&mut current);
+            }
         }
-    }
-    if !current.is_empty() {
+        // Always push one line per paragraph (empty for blank lines)
         lines.push(current);
     }
     if lines.is_empty() {
@@ -239,6 +426,8 @@ fn wrap_message(text: &str, width: u16, prefix_width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── wrap_message tests ──
 
     #[test]
     fn wrap_empty_string() {
@@ -286,5 +475,115 @@ mod tests {
         // width=4 means max_width=0 after subtracting prefix
         let result = wrap_message("hello", 4, 4);
         assert_eq!(result, vec!["hello"]);
+    }
+
+    #[test]
+    fn wrap_message_respects_newlines() {
+        let result = wrap_message("line1\nline2\nline3", 80, 4);
+        assert_eq!(result, vec!["line1", "line2", "line3"]);
+    }
+
+    #[test]
+    fn wrap_message_blank_line_preserved() {
+        let result = wrap_message("above\n\nbelow", 80, 4);
+        assert_eq!(result, vec!["above", "", "below"]);
+    }
+
+    // ── wrap_input tests ──
+
+    #[test]
+    fn wrap_input_single_line() {
+        let (lines, starts) = wrap_input("hello", 20);
+        assert_eq!(lines, vec!["hello"]);
+        assert_eq!(starts, vec![0]);
+    }
+
+    #[test]
+    fn wrap_input_character_wrap() {
+        let (lines, starts) = wrap_input("abcdefghij", 7);
+        assert_eq!(lines, vec!["abcdefg", "hij"]);
+        assert_eq!(starts, vec![0, 7]);
+    }
+
+    #[test]
+    fn wrap_input_explicit_newline() {
+        let (lines, starts) = wrap_input("hello\nworld", 20);
+        assert_eq!(lines, vec!["hello", "world"]);
+        assert_eq!(starts, vec![0, 6]);
+    }
+
+    #[test]
+    fn wrap_input_empty() {
+        let (lines, starts) = wrap_input("", 20);
+        assert_eq!(lines, vec![""]);
+        assert_eq!(starts, vec![0]);
+    }
+
+    #[test]
+    fn wrap_input_newline_at_end() {
+        let (lines, starts) = wrap_input("hello\n", 20);
+        assert_eq!(lines, vec!["hello", ""]);
+        assert_eq!(starts, vec![0, 6]);
+    }
+
+    #[test]
+    fn wrap_input_zero_width() {
+        let (lines, starts) = wrap_input("hello", 0);
+        assert_eq!(lines, vec!["hello"]);
+        assert_eq!(starts, vec![0]);
+    }
+
+    // ── cursor_visual_pos tests ──
+
+    #[test]
+    fn cursor_pos_start() {
+        assert_eq!(cursor_visual_pos(0, &[0]), (0, 0));
+    }
+
+    #[test]
+    fn cursor_pos_mid_first_line() {
+        assert_eq!(cursor_visual_pos(3, &[0, 7]), (0, 3));
+    }
+
+    #[test]
+    fn cursor_pos_second_line() {
+        assert_eq!(cursor_visual_pos(8, &[0, 7]), (1, 1));
+    }
+
+    #[test]
+    fn cursor_pos_at_wrap_boundary() {
+        // Cursor at position 7, line starts at [0, 7]
+        assert_eq!(cursor_visual_pos(7, &[0, 7]), (1, 0));
+    }
+
+    // ── visual_to_cursor tests ──
+
+    #[test]
+    fn visual_to_cursor_start() {
+        assert_eq!(visual_to_cursor(0, 0, &[0], &["hello".into()]), 0);
+    }
+
+    #[test]
+    fn visual_to_cursor_mid() {
+        assert_eq!(visual_to_cursor(0, 3, &[0], &["hello".into()]), 3);
+    }
+
+    #[test]
+    fn visual_to_cursor_second_line() {
+        assert_eq!(
+            visual_to_cursor(1, 2, &[0, 7], &["abcdefg".into(), "hij".into()]),
+            9
+        );
+    }
+
+    #[test]
+    fn visual_to_cursor_clamps_to_line_end() {
+        // Col 10 on a 5-char line → clamp to col 5 (end of line)
+        assert_eq!(visual_to_cursor(0, 10, &[0], &["hello".into()]), 5);
+    }
+
+    #[test]
+    fn visual_to_cursor_past_last_line() {
+        assert_eq!(visual_to_cursor(5, 0, &[0], &["hello".into()]), 5);
     }
 }

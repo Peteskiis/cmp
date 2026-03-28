@@ -100,6 +100,13 @@ cargo run -p client -- --user alice --server ws://127.0.0.1:3000/ws  # Run clien
 - Codex TUI message styling: `~/Developer/research/codex/codex-rs/tui/src/history_cell.rs`
 - Codex adaptive background: `~/Developer/research/codex/codex-rs/tui/src/style.rs`
 
+## TUI Rules
+
+- **`Viewport::Inline(N)` height is immutable** — `resize()` ignores the height for inline viewports. Use a large N (40) and top-align content: chat messages fill from top, input sits below, `Min(0)` fills unused space at the bottom. The dark input area expands downward as lines are added.
+- **Render chat messages inside the viewport, not via `insert_before`** — store messages in `chat_history: Vec<ChatEntry>` and render them in `draw_input`. When messages exceed the visible chat area, flush old entries to terminal scrollback via `flush_chat_to_scrollback` (which uses `insert_before`). This keeps recent messages near the input while old ones persist in scrollback.
+- **Use `chat_entry_to_lines` as the single source of truth** for message rendering — both viewport rendering and scrollback flushing use this function. Never duplicate message styling logic.
+- **Always use immediate local echo for sent messages** — never defer display until server confirmation. Deferred display causes messages to vanish on errors and feels laggy.
+
 ## Things Claude Should NOT Do
 
 - Don't use `unwrap()` or `expect()` — they are clippy-denied (except in `#[cfg(test)]` with `#[allow]`)
