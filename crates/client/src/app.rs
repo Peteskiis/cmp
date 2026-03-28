@@ -115,12 +115,14 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
         }
     };
 
+    // Print startup banner before raw mode (lands in terminal scrollback)
+    print_banner(user_id, server_url);
+
     let (mut terminal, _guard) = ui::init()?;
     let mut app = App::new(crypto, db);
     if app.db.is_none() {
         app.status("warning: message history unavailable");
     }
-    app.status(&format!("logged in as {user_id}"));
     app.status("type /help for commands");
     let mut event_stream = EventStream::new();
 
@@ -183,6 +185,53 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn print_banner(user_id: &str, server_url: &str) {
+    // Truncate server URL for display
+    let server_display = if server_url.len() > 40 {
+        format!("{}...", &server_url[..37])
+    } else {
+        server_url.to_owned()
+    };
+
+    let title = ">_ Cluster Message Protocol (v0.1.0)";
+    let user_line = format!("user:   {user_id}");
+    let server_line = format!("server: {server_display}");
+
+    let content_width = [title.len(), user_line.len(), server_line.len()]
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+        + 2; // padding
+
+    let pad = |s: &str| format!(" {s}{}", " ".repeat(content_width - s.len() - 1));
+
+    println!(
+        "\x1b[2m\u{256d}{}\u{256e}\x1b[0m",
+        "\u{2500}".repeat(content_width)
+    );
+    println!(
+        "\x1b[2m\u{2502}\x1b[0m\x1b[1m{}\x1b[0m\x1b[2m\u{2502}\x1b[0m",
+        pad(title)
+    );
+    println!(
+        "\x1b[2m\u{2502}{}\u{2502}\x1b[0m",
+        " ".repeat(content_width)
+    );
+    println!(
+        "\x1b[2m\u{2502}\x1b[0m{}\x1b[2m\u{2502}\x1b[0m",
+        pad(&user_line)
+    );
+    println!(
+        "\x1b[2m\u{2502}\x1b[0m{}\x1b[2m\u{2502}\x1b[0m",
+        pad(&server_line)
+    );
+    println!(
+        "\x1b[2m\u{2570}{}\u{256f}\x1b[0m",
+        "\u{2500}".repeat(content_width)
+    );
+    println!();
 }
 
 fn dirs_data_dir(user_id: &str) -> std::path::PathBuf {

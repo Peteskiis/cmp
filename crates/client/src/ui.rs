@@ -25,7 +25,16 @@ pub struct RawModeGuard;
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+        // Erase the viewport's dark background and emit a trailing newline
+        // so zsh doesn't show a `%` PROMPT_EOL_MARK
+        let _ = execute!(
+            stdout(),
+            crossterm::style::ResetColor,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown),
+        );
         let _ = disable_raw_mode();
+        println!();
         let _ = execute!(stdout(), SetCursorStyle::DefaultUserShape);
     }
 }
