@@ -41,10 +41,11 @@ struct App {
     pending_msg_ids: Vec<MessageId>,
     unread_messages: HashMap<String, Vec<MessageId>>,
     chat_history: Vec<ChatEntry>,
+    db: Option<rusqlite::Connection>,
 }
 
 impl App {
-    fn new(crypto: CryptoManager) -> Self {
+    fn new(crypto: CryptoManager, db: Option<rusqlite::Connection>) -> Self {
         Self {
             input: String::new(),
             cursor_pos: 0,
@@ -57,6 +58,7 @@ impl App {
             pending_msg_ids: Vec::new(),
             unread_messages: HashMap::new(),
             chat_history: Vec::new(),
+            db,
         }
     }
 
@@ -105,8 +107,19 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
         net::run(net_url, net_uid, &net_identity, event_tx, outgoing_rx).await;
     });
 
+    let db = match crate::db::open(&data_dir.join("client.db")) {
+        Ok(conn) => Some(conn),
+        Err(e) => {
+            tracing::warn!("failed to open message database: {e}");
+            None
+        }
+    };
+
     let (mut terminal, _guard) = ui::init()?;
-    let mut app = App::new(crypto);
+    let mut app = App::new(crypto, db);
+    if app.db.is_none() {
+        app.status("warning: message history unavailable");
+    }
     app.status(&format!("logged in as {user_id}"));
     app.status("type /help for commands");
     let mut event_stream = EventStream::new();
@@ -321,9 +334,20 @@ fn handle_enter(
     app.pending_msg_ids.push(msg_id.clone());
     let _ = outgoing_tx.send(ClientMessage::SendMessage {
         recipient_id: target.clone(),
-        message_id: msg_id,
+        message_id: msg_id.clone(),
         envelope,
     });
+    if let Some(ref conn) = app.db
+        && let Err(e) = crate::db::insert_message(
+            conn,
+            target_str,
+            crate::db::MessageDirection::Sent,
+            &msg_id.to_string(),
+            &text,
+        )
+    {
+        tracing::warn!("failed to persist sent message: {e}");
+    }
     app.chat_history.push(ChatEntry::Sent(text));
     app.clear_input();
     Ok(())
@@ -385,6 +409,20 @@ fn handle_command(
         let target = target.trim();
         match UserId::new(target) {
             Ok(uid) => {
+                // Clear viewport and load persisted history for this peer
+                app.chat_history.clear();
+                if let Some(ref conn) = app.db {
+                    match crate::db::load_recent_messages(conn, target) {
+                        Ok(messages) => {
+                            app.chat_history
+                                .extend(messages.into_iter().map(ChatEntry::from));
+                        }
+                        Err(e) => {
+                            tracing::warn!("failed to load message history: {e}");
+                        }
+                    }
+                }
+
                 if app.crypto.has_session(target) {
                     app.status(&format!("chatting with {target} (E2EE active \u{1f512})"));
                 } else {
@@ -548,6 +586,18 @@ fn handle_server_message(
 fn process_inbound(app: &mut App, inbound: &protocol::InboundMessage) -> (String, MessageId, bool) {
     let sender = inbound.sender_id.as_str().to_owned();
     let (text, ok) = app.crypto.decrypt_to_text(&sender, &inbound.envelope);
+    if ok
+        && let Some(ref conn) = app.db
+        && let Err(e) = crate::db::insert_message(
+            conn,
+            &sender,
+            crate::db::MessageDirection::Received,
+            &inbound.message_id.to_string(),
+            &text,
+        )
+    {
+        tracing::warn!("failed to persist received message: {e}");
+    }
     app.chat_history.push(ChatEntry::Received {
         sender: sender.clone(),
         text,
