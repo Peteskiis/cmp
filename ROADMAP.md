@@ -330,8 +330,8 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [x] Integration test: start server on random port
 - [x] Integration test: two programmatic clients (no TUI) register
 - [x] Integration test: Alice fetches Bob's prekey bundle
-- [ ] Integration test: Alice sends encrypted message, Bob receives and decrypts (blocked by SPK persistence)
-- [ ] Integration test: Bob replies, Alice receives and decrypts
+- [x] Integration test: Alice sends encrypted message, Bob receives and decrypts
+- [x] Integration test: Bob replies, Alice receives and decrypts
 - [x] Integration test: offline delivery (send while offline, connect, receive, ack)
 - [x] Integration test: ack removes from queue (no re-delivery)
 - [x] Integration test: send to nonexistent user fails
@@ -340,10 +340,10 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [x] Integration test: typing indicator relay
 - [x] Integration test: server-generated delivery receipt on push
 - [x] Integration test: read receipt relay
-- [ ] Manual test: run server + two TUI clients in separate terminals
+- [x] Manual test: run server + two TUI clients in separate terminals
 - [x] Full workspace verification:
   - [x] `cargo check --workspace`
-  - [x] `cargo test --workspace` (128 tests)
+  - [x] `cargo test --workspace` (129 tests)
   - [x] `cargo clippy --workspace -- -D warnings`
   - [x] `cargo fmt --all -- --check`
 
@@ -359,5 +359,5 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [x] Delivery receipts (server-generated on successful push)
 - [x] Read receipts (E2EE encrypted inside envelope, server can't see who read what)
 - [ ] Session reset / safety number change UI
-- [ ] TLS (wss://) for production server
+- [x] TLS (wss://) for production server (rustls + ring)
 - [ ] Phone number auth (Signal/WhatsApp style OTP — SMS provider, phone-as-identity, server-side verification)
