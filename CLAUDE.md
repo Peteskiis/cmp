@@ -94,6 +94,7 @@ cargo run -p client -- --user alice  # Run client (production server is default)
 - **Only ack messages that successfully decrypted** — acking a message that failed decryption permanently removes it from the server queue. The message is irrecoverably lost instead of being re-delivered after session establishment.
 - **Parse all fallible inputs before mutating state** — decode base64, validate headers, and check sizes before calling `try_bob_x3dh` or consuming OPKs. A parsing failure after session creation leaves an orphan session that blocks future handshakes.
 - **OPK consumption must happen after AEAD authentication** — consuming an OPK before decrypt lets a forged message permanently degrade future handshakes from 4-DH to 3-DH.
+- **Never store peer identity keys before AEAD authentication** — the identity key in a PreKey header is unauthenticated until decrypt succeeds. Storing it early lets a malicious server poison the trust store, overwrite legitimate keys, and silently clear verification state. TOFU means trusting the *first authenticated* key, not every unauthenticated header.
 - **Status transitions must be monotonic** — use `entry().or_insert()` or explicit ordering guards, never unconditional `insert()`. Server messages can arrive out of order (e.g., `MessageDelivered` before `MessageSent`); an unconditional write regresses the status.
 
 ## Reference Implementations

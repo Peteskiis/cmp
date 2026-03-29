@@ -443,6 +443,43 @@ impl CryptoManager {
         peers
     }
 
+    /// Base64-encoded local identity public key (Ed25519 verifying key).
+    pub fn local_identity_key_b64(&self) -> String {
+        B64.encode(self.identity.verifying_key().as_bytes())
+    }
+
+    /// Encrypt a read receipt (list of message ID strings) using the E2EE session.
+    pub fn encrypt_read_receipt(
+        &mut self,
+        peer_id: &str,
+        message_ids: &[protocol::MessageId],
+    ) -> Result<EncryptedEnvelope, CryptoError> {
+        let capped = if message_ids.len() > protocol::consts::MAX_RECEIPT_BATCH {
+            &message_ids[..protocol::consts::MAX_RECEIPT_BATCH]
+        } else {
+            message_ids
+        };
+        let id_strings: Vec<String> = capped.iter().map(ToString::to_string).collect();
+        let plaintext = serde_json::to_vec(&id_strings).map_err(|_| CryptoError::RatchetFailed)?;
+        let estimated_ct_len = (plaintext.len() + 18) / 3 * 4;
+        if estimated_ct_len > protocol::consts::MAX_CIPHERTEXT_BYTES {
+            return Err(CryptoError::RatchetFailed);
+        }
+        self.encrypt(peer_id, &plaintext)
+    }
+
+    /// Extract the sender's identity key from a `PreKey` envelope header.
+    /// Returns `None` for `Ratchet` headers (non-initial messages).
+    pub const fn extract_sender_identity_key(envelope: &EncryptedEnvelope) -> Option<&str> {
+        match &envelope.header {
+            MessageHeader::PreKey {
+                sender_identity_key,
+                ..
+            } => Some(sender_identity_key.as_str()),
+            _ => None,
+        }
+    }
+
     #[allow(clippy::cognitive_complexity)] // Simple serialize+write, clippy overestimates
     fn save_session(&self, peer_id: &str) {
         if let Some(session) = self.sessions.get(peer_id) {

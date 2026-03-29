@@ -26,6 +26,7 @@ pub(crate) enum ChatEntry {
     Sent(String),
     Received { sender: String, text: String },
     Status(String),
+    Warning(String),
 }
 
 struct App {
@@ -489,8 +490,14 @@ fn handle_command(
                     .target_user
                     .as_ref()
                     .is_some_and(|t| t.as_str() == peer.as_str());
-                let marker = if active { " \u{25c0}" } else { "" };
-                app.status(&format!("  {peer}{marker}"));
+                let verified = app
+                    .db
+                    .as_ref()
+                    .and_then(|c| crate::db::get_verification(c, peer))
+                    .is_some();
+                let badge = if verified { " \u{2705}" } else { "" };
+                let arrow = if active { " \u{25c0}" } else { "" };
+                app.status(&format!("  {peer}{badge}{arrow}"));
             }
         }
         app.clear_input();
@@ -513,6 +520,18 @@ fn handle_command(
         }
         app.target_user = Some(app.user_id.clone());
         app.status("note to self \u{1f4dd}");
+        app.clear_input();
+        return Ok(());
+    }
+
+    let verify_cmd = match text {
+        "/v" | "/verify" => Some("/verify"),
+        "/v confirm" | "/verify confirm" => Some("/verify confirm"),
+        "/v clear" | "/verify clear" => Some("/verify clear"),
+        _ => None,
+    };
+    if let Some(cmd) = verify_cmd {
+        handle_verify(app, cmd);
         app.clear_input();
         return Ok(());
     }
@@ -617,6 +636,11 @@ fn handle_server_message(
             if app.crypto.is_pending(&peer) {
                 match app.crypto.init_session_from_bundle(&peer, &bundle) {
                     Ok(()) => {
+                        // TOFU: store the peer's identity key from the SPK-verified
+                        // bundle. Unlike the receiver path (process_inbound), the
+                        // initiator has no AEAD proof yet — safety numbers let the
+                        // user verify OOB. This matches Signal's initiator behavior.
+                        track_peer_identity(app, &peer, &bundle.identity_key);
                         app.status(&format!("E2EE session established with {peer} \u{1f512}"));
                     }
                     Err(e) => {
@@ -644,9 +668,7 @@ fn handle_server_message(
                     .is_some_and(|t| t.as_str() == sender)
                     && app.crypto.has_session(&sender)
                 {
-                    if let Ok(receipt_env) =
-                        encrypt_read_receipt(&mut app.crypto, &sender, &[msg_id])
-                    {
+                    if let Ok(receipt_env) = app.crypto.encrypt_read_receipt(&sender, &[msg_id]) {
                         let _ = outgoing_tx.send(ClientMessage::SendReadReceipt {
                             recipient_id: sender_id,
                             envelope: receipt_env,
@@ -716,6 +738,11 @@ fn handle_server_message(
 fn process_inbound(app: &mut App, inbound: &protocol::InboundMessage) -> (String, MessageId, bool) {
     let sender = inbound.sender_id.as_str().to_owned();
     let (text, ok) = app.crypto.decrypt_to_text(&sender, &inbound.envelope);
+    // Only store identity key after AEAD authentication succeeds — a forged PreKey
+    // header must not overwrite a legitimate key or clear verification state.
+    if ok && let Some(ik) = CryptoManager::extract_sender_identity_key(&inbound.envelope) {
+        track_peer_identity(app, &sender, ik);
+    }
     if ok
         && let Some(ref conn) = app.db
         && let Err(e) = crate::db::insert_message(
@@ -745,7 +772,7 @@ fn flush_read_receipts(
     if let Some(unread) = app.unread_messages.get(target_str)
         && !unread.is_empty()
         && app.crypto.has_session(target_str)
-        && let Ok(receipt_env) = encrypt_read_receipt(&mut app.crypto, target_str, unread)
+        && let Ok(receipt_env) = app.crypto.encrypt_read_receipt(target_str, unread)
     {
         let _ = outgoing_tx.send(ClientMessage::SendReadReceipt {
             recipient_id: target.clone(),
@@ -763,25 +790,24 @@ fn accumulate_unread(app: &mut App, sender: String, msg_id: MessageId) {
     }
 }
 
-/// Encrypt a read receipt (list of message ID strings) using the E2EE session.
-fn encrypt_read_receipt(
-    crypto: &mut CryptoManager,
-    peer_id: &str,
-    message_ids: &[MessageId],
-) -> Result<protocol::EncryptedEnvelope, crate::crypto_mgr::CryptoError> {
-    // Cap batch to prevent oversized envelopes
-    let capped = if message_ids.len() > consts::MAX_RECEIPT_BATCH {
-        &message_ids[..consts::MAX_RECEIPT_BATCH]
-    } else {
-        message_ids
+fn handle_verify(app: &mut App, text: &str) {
+    let Some(ref target) = app.target_user else {
+        app.status("use /chat <username> first");
+        return;
     };
-    let id_strings: Vec<String> = capped.iter().map(ToString::to_string).collect();
-    let plaintext = serde_json::to_vec(&id_strings)
-        .map_err(|_| crate::crypto_mgr::CryptoError::RatchetFailed)?;
-    // Check plaintext size before encrypting to avoid ratchet desync
-    let estimated_ct_len = (plaintext.len() + 18) / 3 * 4;
-    if estimated_ct_len > consts::MAX_CIPHERTEXT_BYTES {
-        return Err(crate::crypto_mgr::CryptoError::RatchetFailed);
+    let key = app.crypto.local_identity_key_b64();
+    let uid = app.user_id.as_str();
+    let entries =
+        crate::verification::handle_command(uid, &key, target.as_str(), text, app.db.as_ref());
+    app.chat_history.extend(entries);
+}
+
+/// Store a peer's identity key (from a `PreKey` header) and warn if it changed.
+fn track_peer_identity(app: &mut App, peer_id: &str, identity_key_b64: &str) {
+    if let Some(ref conn) = app.db
+        && let Some(warning) =
+            crate::verification::check_peer_identity(conn, peer_id, identity_key_b64)
+    {
+        app.chat_history.push(ChatEntry::Warning(warning));
     }
-    crypto.encrypt(peer_id, &plaintext)
 }

@@ -4,6 +4,7 @@ mod crypto_mgr;
 mod db;
 mod net;
 mod ui;
+mod verification;
 
 use std::path::PathBuf;
 

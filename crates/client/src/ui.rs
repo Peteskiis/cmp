@@ -194,6 +194,15 @@ fn chat_entry_to_lines(
                 None,
             ));
         }
+        crate::app::ChatEntry::Warning(text) => {
+            rows.push((
+                Line::from(Span::styled(
+                    format!("  \u{26a0} {text}"),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                None,
+            ));
+        }
     }
     rows
 }

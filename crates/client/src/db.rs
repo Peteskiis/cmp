@@ -2,7 +2,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, params};
 
-const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 2;
 const HISTORY_LOAD_LIMIT: i64 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +66,26 @@ pub(crate) fn open(path: &Path) -> anyhow::Result<Connection> {
                 ON messages(peer_id, id);
             ",
         )?;
+        tx.pragma_update(None, "user_version", 1)?;
+        tx.commit()?;
+    }
+
+    if version < 2 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS peer_identity_keys (
+                peer_id       TEXT PRIMARY KEY,
+                identity_key  TEXT NOT NULL,
+                first_seen    INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE TABLE IF NOT EXISTS verified_contacts (
+                peer_id       TEXT PRIMARY KEY,
+                fingerprint   TEXT NOT NULL,
+                verified_at   INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            ",
+        )?;
         tx.pragma_update(None, "user_version", CURRENT_VERSION)?;
         tx.commit()?;
     }
@@ -85,6 +105,106 @@ pub(crate) fn insert_message(
         "INSERT OR IGNORE INTO messages (peer_id, direction, message_id, body)
          VALUES (?1, ?2, ?3, ?4)",
         params![peer_id, direction as u8, message_id, body],
+    )?;
+    Ok(())
+}
+
+/// Result of storing a peer's identity key — indicates whether it changed.
+#[allow(dead_code)] // `Changed::old_key` reserved for future identity-change UI
+pub(crate) enum IdentityKeyStatus {
+    /// First time seeing this peer's key.
+    New,
+    /// Key matches the stored value.
+    Unchanged,
+    /// Key differs from the stored value.
+    Changed { old_key: String },
+}
+
+/// Store a peer's identity key. Returns the status indicating whether this is
+/// new, unchanged, or changed compared to a previously stored key.
+pub(crate) fn store_peer_identity_key(
+    conn: &Connection,
+    peer_id: &str,
+    identity_key_b64: &str,
+) -> anyhow::Result<IdentityKeyStatus> {
+    // Atomic: key update + verification removal must not be split.
+    // unchecked_transaction because conn is &Connection (shared ref); safe
+    // because the client event loop is single-threaded.
+    let tx = conn.unchecked_transaction()?;
+
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT identity_key FROM peer_identity_keys WHERE peer_id = ?1",
+            params![peer_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let status = match existing {
+        Some(ref stored) if stored == identity_key_b64 => IdentityKeyStatus::Unchanged,
+        Some(old_key) => {
+            tx.execute(
+                "UPDATE peer_identity_keys SET identity_key = ?2, first_seen = unixepoch()
+                 WHERE peer_id = ?1",
+                params![peer_id, identity_key_b64],
+            )?;
+            tx.execute(
+                "DELETE FROM verified_contacts WHERE peer_id = ?1",
+                params![peer_id],
+            )?;
+            IdentityKeyStatus::Changed { old_key }
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO peer_identity_keys (peer_id, identity_key) VALUES (?1, ?2)",
+                params![peer_id, identity_key_b64],
+            )?;
+            IdentityKeyStatus::New
+        }
+    };
+
+    tx.commit()?;
+    Ok(status)
+}
+
+/// Get the stored identity key for a peer.
+pub(crate) fn get_peer_identity_key(conn: &Connection, peer_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT identity_key FROM peer_identity_keys WHERE peer_id = ?1",
+        params![peer_id],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// Store (or update) a verification record for a peer.
+pub(crate) fn store_verification(
+    conn: &Connection,
+    peer_id: &str,
+    fingerprint: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO verified_contacts (peer_id, fingerprint) VALUES (?1, ?2)",
+        params![peer_id, fingerprint],
+    )?;
+    Ok(())
+}
+
+/// Get the verification record for a peer, if any.
+pub(crate) fn get_verification(conn: &Connection, peer_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT fingerprint FROM verified_contacts WHERE peer_id = ?1",
+        params![peer_id],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// Remove verification for a peer (called when their identity key changes).
+pub(crate) fn remove_verification(conn: &Connection, peer_id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM verified_contacts WHERE peer_id = ?1",
+        params![peer_id],
     )?;
     Ok(())
 }

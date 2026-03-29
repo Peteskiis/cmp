@@ -358,6 +358,7 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [x] Typing indicators (debounced, ephemeral relay, no queueing)
 - [x] Delivery receipts (server-generated on successful push)
 - [x] Read receipts (E2EE encrypted inside envelope, server can't see who read what)
-- [ ] Session reset / safety number change UI
+- [x] Safety number verification (`/verify`, `/verify confirm`, identity key change warnings)
+- [ ] Session reset UI
 - [x] TLS (wss://) for production server (rustls + ring)
 - [ ] Phone number auth (Signal/WhatsApp style OTP — SMS provider, phone-as-identity, server-side verification)

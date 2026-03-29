@@ -39,6 +39,12 @@ const COMMANDS: &[CommandDef] = &[
         has_args: false,
     },
     CommandDef {
+        name: "verify",
+        usage: "/verify [confirm|clear]",
+        description: "Show safety number",
+        has_args: true,
+    },
+    CommandDef {
         name: "quit",
         usage: "/quit",
         description: "Exit",

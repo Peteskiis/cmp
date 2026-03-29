@@ -2,6 +2,7 @@
 
 pub mod aead;
 pub mod error;
+pub mod fingerprint;
 pub mod kdf;
 pub mod keys;
 pub mod ratchet;
