@@ -41,6 +41,7 @@ cargo run -p client -- --user alice  # Run client (production server is default)
 - Use `?` operator for error propagation, never `unwrap()` or `expect()`
 - `expect()`/`unwrap()` are automatically allowed in `#[cfg(test)]` via `clippy.toml` — no manual `#[allow]` needed
 - Keep functions small and focused (max 100 lines, cognitive complexity < 10)
+- Keep files under 800 lines — split into modules when approaching the limit
 - Handle errors explicitly via `Result` and `thiserror`/`anyhow`
 - All public enums must be `#[non_exhaustive]` for forward compatibility
 - Use `#[serde(try_from = "...")]` on validated newtypes to enforce invariants at the deserialization boundary

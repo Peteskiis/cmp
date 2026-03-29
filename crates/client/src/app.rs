@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers};
 use futures::StreamExt;
 use protocol::{ClientMessage, MessageId, ServerMessage, UserId, consts};
 use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
 
+use crate::command_popup::{CommandPopup, PopupAction};
 use crate::crypto_mgr::CryptoManager;
 use crate::{net, ui};
 
@@ -43,6 +42,7 @@ struct App {
     unread_messages: HashMap<String, Vec<MessageId>>,
     chat_history: Vec<ChatEntry>,
     db: Option<rusqlite::Connection>,
+    command_popup: Option<CommandPopup>,
 }
 
 impl App {
@@ -61,6 +61,7 @@ impl App {
             unread_messages: HashMap::new(),
             chat_history: Vec::new(),
             db,
+            command_popup: None,
         }
     }
 
@@ -72,6 +73,17 @@ impl App {
         self.input.clear();
         self.cursor_pos = 0;
         self.input_scroll = 0;
+    }
+
+    fn sync_command_popup(&mut self) {
+        if self.input.starts_with('/') {
+            let popup = self.command_popup.get_or_insert_with(CommandPopup::new);
+            if !popup.sync(&self.input) {
+                self.command_popup = None;
+            }
+        } else {
+            self.command_popup = None;
+        }
     }
 
     fn insert_at_cursor(&mut self, ch: char) {
@@ -93,7 +105,7 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
     let mut crypto = CryptoManager::load_or_generate(&data_dir)?;
 
     if crypto.needs_registration() {
-        match register_with_server(user_id, server_url, &mut crypto).await {
+        match net::register_with_server(user_id, server_url, &mut crypto).await {
             Ok(()) => {}
             Err(e) => eprintln!("Registration failed: {e}"),
         }
@@ -125,7 +137,7 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
     if app.db.is_none() {
         app.status("warning: message history unavailable");
     }
-    app.status("type /help for commands");
+    app.status("type / for commands");
     let mut event_stream = EventStream::new();
 
     while app.running {
@@ -159,6 +171,7 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
             cursor_col,
             app.input_scroll,
             typing_label,
+            app.command_popup.as_ref(),
         )?;
 
         let typing_tick = async {
@@ -253,6 +266,30 @@ fn handle_key_event(
         return Ok(());
     };
 
+    // Intercept keys when the command popup is active
+    if let Some(popup) = &mut app.command_popup {
+        match popup.handle_key(key.code) {
+            PopupAction::Consumed => return Ok(()),
+            PopupAction::Complete(text) => {
+                app.input = text;
+                app.cursor_pos = app.input.chars().count();
+                app.command_popup = None;
+                return Ok(());
+            }
+            PopupAction::Submit(text) => {
+                app.input = text;
+                app.cursor_pos = app.input.chars().count();
+                app.command_popup = None;
+                // Fall through to Enter handling below
+            }
+            PopupAction::Dismiss => {
+                app.command_popup = None;
+                return Ok(());
+            }
+            PopupAction::PassThrough => {} // continue to normal key handling
+        }
+    }
+
     match (key.code, key.modifiers) {
         (KeyCode::Char('d' | 'c'), KeyModifiers::CONTROL) => {
             app.running = false;
@@ -331,6 +368,7 @@ fn handle_key_event(
         }
         _ => {}
     }
+    app.sync_command_popup();
     Ok(())
 }
 
@@ -481,17 +519,6 @@ fn handle_command(
 
     if text == "/quit" || text == "/q" {
         app.running = false;
-        app.clear_input();
-        return Ok(());
-    }
-
-    if text == "/help" || text == "/h" {
-        app.status("commands:");
-        app.status("  /chat <user>  \u{2014} start or switch conversation");
-        app.status("  /notes        \u{2014} note to self");
-        app.status("  /contacts     \u{2014} list all contacts");
-        app.status("  /quit         \u{2014} exit");
-        app.status("  /help         \u{2014} show this help");
         app.clear_input();
         return Ok(());
     }
@@ -757,65 +784,4 @@ fn encrypt_read_receipt(
         return Err(crate::crypto_mgr::CryptoError::RatchetFailed);
     }
     crypto.encrypt(peer_id, &plaintext)
-}
-
-async fn register_with_server(
-    user_id: &str,
-    server_url: &str,
-    crypto: &mut CryptoManager,
-) -> anyhow::Result<()> {
-    let identity = crypto.identity();
-    let (ws, _) = connect_async(server_url).await?;
-    let (mut sink, mut stream) = futures::StreamExt::split(ws);
-
-    let spk = crypto::keys::SignedPreKey::generate(0, identity);
-    let opks = crypto::keys::generate_one_time_prekeys(0, 100)?;
-
-    let bundle = protocol::PreKeyBundle {
-        identity_key: B64.encode(identity.verifying_key().as_bytes()),
-        signed_prekey: B64.encode(spk.public().as_bytes()),
-        signed_prekey_id: spk.key_id(),
-        signed_prekey_signature: B64.encode(spk.signature().to_bytes()),
-        one_time_prekey: None,
-    };
-
-    let otk_uploads: Vec<protocol::OneTimePreKey> = opks
-        .iter()
-        .map(|k| protocol::OneTimePreKey {
-            key_id: k.key_id(),
-            public_key: B64.encode(k.public().as_bytes()),
-        })
-        .collect();
-
-    let uid = UserId::new(user_id)?;
-    let register = ClientMessage::Register {
-        user_id: uid,
-        bundle,
-        one_time_prekeys: otk_uploads,
-    };
-
-    let json = serde_json::to_string(&register)?;
-    futures::SinkExt::send(
-        &mut sink,
-        tokio_tungstenite::tungstenite::Message::Text(json.into()),
-    )
-    .await?;
-
-    let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
-        futures::StreamExt::next(&mut stream).await
-    else {
-        anyhow::bail!("no response from server during registration");
-    };
-
-    if matches!(serde_json::from_str(&text), Ok(ServerMessage::AuthSuccess)) {
-        // Persist SPK/OPK private keys for future X3DH as Bob
-        crypto.persist_registration_keys(&spk, &opks)?;
-        return Ok(());
-    }
-    if let Ok(ServerMessage::AuthFailure { reason }) = serde_json::from_str(&text) {
-        // "already exists" on first launch means someone else owns this username.
-        // Don't silently succeed — the user needs to pick a different name.
-        anyhow::bail!("registration rejected: {reason}");
-    }
-    anyhow::bail!("unexpected server response during registration");
 }

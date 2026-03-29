@@ -1,4 +1,5 @@
 mod app;
+mod command_popup;
 mod crypto_mgr;
 mod db;
 mod net;

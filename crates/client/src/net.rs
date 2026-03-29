@@ -4,9 +4,11 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use ed25519_dalek::Signer;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
-use protocol::{ClientMessage, ServerMessage, UserId};
+use protocol::{ClientMessage, OneTimePreKey, PreKeyBundle, ServerMessage, UserId};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+
+use crate::crypto_mgr::CryptoManager;
 use tracing::{info, warn};
 
 use crate::app::AppEvent;
@@ -160,4 +162,57 @@ async fn handle_auth_flow(
     };
 
     sink.send(Message::Text(json.into())).await.is_ok()
+}
+
+/// One-shot registration: connect, upload bundle, wait for confirmation.
+pub(crate) async fn register_with_server(
+    user_id: &str,
+    server_url: &str,
+    crypto: &mut CryptoManager,
+) -> anyhow::Result<()> {
+    let identity = crypto.identity();
+    let (ws, _) = connect_async(server_url).await?;
+    let (mut sink, mut stream) = ws.split();
+
+    let spk = crypto::keys::SignedPreKey::generate(0, identity);
+    let opks = crypto::keys::generate_one_time_prekeys(0, 100)?;
+
+    let bundle = PreKeyBundle {
+        identity_key: B64.encode(identity.verifying_key().as_bytes()),
+        signed_prekey: B64.encode(spk.public().as_bytes()),
+        signed_prekey_id: spk.key_id(),
+        signed_prekey_signature: B64.encode(spk.signature().to_bytes()),
+        one_time_prekey: None,
+    };
+
+    let otk_uploads: Vec<OneTimePreKey> = opks
+        .iter()
+        .map(|k| OneTimePreKey {
+            key_id: k.key_id(),
+            public_key: B64.encode(k.public().as_bytes()),
+        })
+        .collect();
+
+    let uid = UserId::new(user_id)?;
+    let register = ClientMessage::Register {
+        user_id: uid,
+        bundle,
+        one_time_prekeys: otk_uploads,
+    };
+
+    let json = serde_json::to_string(&register)?;
+    SinkExt::send(&mut sink, Message::Text(json.into())).await?;
+
+    let Some(Ok(Message::Text(text))) = stream.next().await else {
+        anyhow::bail!("no response from server during registration");
+    };
+
+    if matches!(serde_json::from_str(&text), Ok(ServerMessage::AuthSuccess)) {
+        crypto.persist_registration_keys(&spk, &opks)?;
+        return Ok(());
+    }
+    if let Ok(ServerMessage::AuthFailure { reason }) = serde_json::from_str(&text) {
+        anyhow::bail!("registration rejected: {reason}");
+    }
+    anyhow::bail!("unexpected server response during registration");
 }

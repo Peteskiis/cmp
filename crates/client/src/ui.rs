@@ -16,7 +16,7 @@ use ratatui::widgets::{Paragraph, Widget};
 const INPUT_HEIGHT: u16 = 40;
 pub(crate) const PREFIX_WIDTH: usize = 3; // " › " or "   "
 const BG_DARK: Color = Color::Rgb(40, 44, 52);
-const PROMPT_COLOR: Color = Color::Rgb(34, 199, 168);
+pub(crate) const ACCENT_COLOR: Color = Color::Rgb(34, 199, 168);
 const PLACEHOLDER_COLOR: Color = Color::Rgb(90, 90, 90);
 
 /// RAII guard that restores the terminal on drop.
@@ -258,6 +258,7 @@ pub fn flush_chat_to_scrollback(
 #[allow(
     clippy::cast_possible_truncation,
     clippy::too_many_lines,
+    clippy::too_many_arguments,
     clippy::cognitive_complexity
 )]
 pub fn draw_input(
@@ -268,6 +269,7 @@ pub fn draw_input(
     cursor_col: usize,
     scroll: usize,
     typing_indicator: Option<&str>,
+    command_popup: Option<&crate::command_popup::CommandPopup>,
 ) -> anyhow::Result<()> {
     terminal.draw(|frame| {
         let area = frame.area();
@@ -279,20 +281,27 @@ pub fn draw_input(
         }
 
         // Input gets priority — as it grows, chat shrinks (scrolls up)
-        // +3 = typing + bottom padding + footer
+        let popup_height =
+            command_popup.map_or(0_u16, crate::command_popup::CommandPopup::row_count);
+        let footer_height = if popup_height > 0 {
+            popup_height
+        } else {
+            1_u16
+        };
         let input_height = (input_lines.len() as u16)
             .max(1)
-            .min(area.height.saturating_sub(5));
-        let chat_height =
-            (chat_rows.len() as u16).min(area.height.saturating_sub(input_height + 3));
+            .min(area.height.saturating_sub(2 + footer_height));
+        // non_chat = typing(1) + input + padding(1) + footer/popup
+        let non_chat = 1 + input_height + 1 + footer_height;
+        let chat_height = (chat_rows.len() as u16).min(area.height.saturating_sub(non_chat));
 
         let chunks = Layout::vertical([
             Constraint::Length(chat_height),
-            Constraint::Length(1),            // typing
-            Constraint::Length(input_height), // input
-            Constraint::Length(1),            // bottom padding
-            Constraint::Length(1),            // footer
-            Constraint::Min(0),               // empty
+            Constraint::Length(1),             // typing
+            Constraint::Length(input_height),  // input
+            Constraint::Length(1),             // bottom padding (always dark bg)
+            Constraint::Length(footer_height), // footer or popup
+            Constraint::Min(0),                // empty
         ])
         .split(area);
 
@@ -351,7 +360,7 @@ pub fn draw_input(
                 Span::styled(
                     " \u{203a} ",
                     Style::default()
-                        .fg(PROMPT_COLOR)
+                        .fg(ACCENT_COLOR)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
@@ -375,16 +384,20 @@ pub fn draw_input(
         // Bottom padding
         frame.render_widget(Paragraph::new("").style(bg_style), chunks[3]);
 
-        // Footer
-        let footer = Line::from(vec![
-            Span::styled("  Enter", Style::default().fg(Color::DarkGray)),
-            Span::styled(" send  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Shift+Enter", Style::default().fg(Color::DarkGray)),
-            Span::styled(" newline  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Ctrl+D", Style::default().fg(Color::DarkGray)),
-            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
-        ]);
-        frame.render_widget(Paragraph::new(footer), chunks[4]);
+        // Footer or command popup
+        if let Some(popup) = command_popup {
+            popup.render(chunks[4], frame.buffer_mut());
+        } else {
+            let footer = Line::from(vec![
+                Span::styled("  Enter", Style::default().fg(Color::DarkGray)),
+                Span::styled(" send  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Shift+Enter", Style::default().fg(Color::DarkGray)),
+                Span::styled(" newline  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Ctrl+D", Style::default().fg(Color::DarkGray)),
+                Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+            ]);
+            frame.render_widget(Paragraph::new(footer), chunks[4]);
+        }
 
         // Cursor
         let cursor_visible_row = cursor_row.saturating_sub(scroll);
