@@ -30,6 +30,7 @@ pub(crate) enum ChatEntry {
 }
 
 struct App {
+    user_id: UserId,
     input: String,
     cursor_pos: usize,
     input_scroll: usize,
@@ -45,8 +46,9 @@ struct App {
 }
 
 impl App {
-    fn new(crypto: CryptoManager, db: Option<rusqlite::Connection>) -> Self {
+    fn new(user_id: UserId, crypto: CryptoManager, db: Option<rusqlite::Connection>) -> Self {
         Self {
+            user_id,
             input: String::new(),
             cursor_pos: 0,
             input_scroll: 0,
@@ -119,7 +121,7 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
     print_banner(user_id, server_url);
 
     let (mut terminal, _guard) = ui::init()?;
-    let mut app = App::new(crypto, db);
+    let mut app = App::new(validated_uid, crypto, db);
     if app.db.is_none() {
         app.status("warning: message history unavailable");
     }
@@ -312,6 +314,7 @@ fn handle_key_event(
 
             // Send typing indicator (debounced, only if session exists)
             if let Some(ref target) = app.target_user
+                && target.as_str() != app.user_id.as_str()
                 && app.crypto.has_session(target.as_str())
             {
                 let now = Instant::now();
@@ -331,6 +334,7 @@ fn handle_key_event(
     Ok(())
 }
 
+#[allow(clippy::cognitive_complexity)]
 fn handle_enter(
     app: &mut App,
     outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
@@ -351,6 +355,25 @@ fn handle_enter(
         return Ok(());
     };
     let target_str = target.as_str();
+
+    // Note to self: skip crypto and server, just store locally
+    if target_str == app.user_id.as_str() {
+        let msg_id = MessageId::new();
+        if let Some(ref conn) = app.db
+            && let Err(e) = crate::db::insert_message(
+                conn,
+                target_str,
+                crate::db::MessageDirection::Sent,
+                &msg_id.to_string(),
+                &text,
+            )
+        {
+            tracing::warn!("failed to persist note: {e}");
+        }
+        app.chat_history.push(ChatEntry::Sent(text));
+        app.clear_input();
+        return Ok(());
+    }
 
     if !app.crypto.has_session(target_str) {
         app.status("waiting for session establishment...");
@@ -402,7 +425,11 @@ fn handle_enter(
     Ok(())
 }
 
-#[allow(clippy::cognitive_complexity, clippy::unnecessary_wraps)]
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::unnecessary_wraps,
+    clippy::too_many_lines
+)]
 fn handle_command(
     app: &mut App,
     outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
@@ -432,6 +459,26 @@ fn handle_command(
         return Ok(());
     }
 
+    if text == "/notes" || text == "/notetoself" {
+        app.chat_history.clear();
+        let self_id = app.user_id.as_str();
+        if let Some(ref conn) = app.db {
+            match crate::db::load_recent_messages(conn, self_id) {
+                Ok(messages) => {
+                    app.chat_history
+                        .extend(messages.into_iter().map(ChatEntry::from));
+                }
+                Err(e) => {
+                    tracing::warn!("failed to load notes: {e}");
+                }
+            }
+        }
+        app.target_user = Some(app.user_id.clone());
+        app.status("note to self \u{1f4dd}");
+        app.clear_input();
+        return Ok(());
+    }
+
     if text == "/quit" || text == "/q" {
         app.running = false;
         app.clear_input();
@@ -441,6 +488,7 @@ fn handle_command(
     if text == "/help" || text == "/h" {
         app.status("commands:");
         app.status("  /chat <user>  \u{2014} start or switch conversation");
+        app.status("  /notes        \u{2014} note to self");
         app.status("  /contacts     \u{2014} list all contacts");
         app.status("  /quit         \u{2014} exit");
         app.status("  /help         \u{2014} show this help");
@@ -472,19 +520,25 @@ fn handle_command(
                     }
                 }
 
-                if app.crypto.has_session(target) {
+                if target == app.user_id.as_str() {
+                    app.target_user = Some(uid);
+                    app.status("note to self \u{1f4dd}");
+                } else if app.crypto.has_session(target) {
                     app.status(&format!("chatting with {target} (E2EE active \u{1f512})"));
+                    app.target_user = Some(uid.clone());
+                    app.peer_typing = None;
+                    app.last_typing_sent = None;
+                    flush_read_receipts(app, outgoing_tx, &uid);
                 } else {
                     app.crypto.add_pending(target);
                     let _ = outgoing_tx.send(ClientMessage::FetchPreKeyBundle {
                         target_user_id: uid.clone(),
                     });
                     app.status(&format!("fetching keys for {target}..."));
+                    app.target_user = Some(uid.clone());
+                    app.peer_typing = None;
+                    app.last_typing_sent = None;
                 }
-                app.target_user = Some(uid.clone());
-                app.peer_typing = None;
-                app.last_typing_sent = None;
-                flush_read_receipts(app, outgoing_tx, &uid);
             }
             Err(e) => {
                 app.status(&format!("invalid username: {e}"));
