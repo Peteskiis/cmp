@@ -2,6 +2,7 @@ mod app;
 mod command_popup;
 mod crypto_mgr;
 mod db;
+mod input;
 mod net;
 mod ui;
 mod verification;

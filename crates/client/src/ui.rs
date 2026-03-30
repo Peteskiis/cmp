@@ -24,6 +24,7 @@ pub struct RawModeGuard;
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        let _ = execute!(stdout(), crossterm::event::DisableBracketedPaste);
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
         // Erase the viewport's dark background and emit a trailing newline
         // so zsh doesn't show a `%` PROMPT_EOL_MARK
@@ -45,6 +46,7 @@ pub type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 pub fn init() -> anyhow::Result<(Term, RawModeGuard)> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(stdout(), crossterm::event::DisableBracketedPaste);
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), SetCursorStyle::DefaultUserShape);
@@ -58,6 +60,9 @@ pub fn init() -> anyhow::Result<(Term, RawModeGuard)> {
         stdout(),
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
+    // Enable bracketed paste so multi-line paste arrives as a single Event::Paste
+    // instead of individual key events (which would trigger Enter = send).
+    let _ = execute!(stdout(), crossterm::event::EnableBracketedPaste);
     let guard = RawModeGuard;
 
     let backend = CrosstermBackend::new(stdout());

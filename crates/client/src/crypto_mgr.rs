@@ -291,14 +291,7 @@ impl CryptoManager {
         {
             // Parse header + ciphertext BEFORE session creation so parsing
             // failures can't leave an orphan session in the map.
-            let header = RatchetHeader {
-                ratchet_key: b64_decode_fixed::<32>(
-                    &ratchet.ratchet_key,
-                    CryptoError::BadEnvelope,
-                )?,
-                previous_chain_length: ratchet.previous_chain_length,
-                message_number: ratchet.message_number,
-            };
+            let header = decode_ratchet_header(ratchet)?;
             let ct = B64
                 .decode(&envelope.ciphertext)
                 .map_err(|_| CryptoError::BadEnvelope)?;
@@ -354,14 +347,7 @@ impl CryptoManager {
             .get_mut(peer_id)
             .ok_or(CryptoError::NoSession)?;
 
-        let header = RatchetHeader {
-            ratchet_key: b64_decode_fixed::<32>(
-                &ratchet_header.ratchet_key,
-                CryptoError::BadEnvelope,
-            )?,
-            previous_chain_length: ratchet_header.previous_chain_length,
-            message_number: ratchet_header.message_number,
-        };
+        let header = decode_ratchet_header(ratchet_header)?;
 
         let ciphertext = B64
             .decode(&envelope.ciphertext)
@@ -604,6 +590,14 @@ fn load_prekey_headers(data_dir: &Path) -> HashMap<String, StoredX3dhResult> {
 fn b64_decode_fixed<const N: usize>(s: &str, err: CryptoError) -> Result<[u8; N], CryptoError> {
     let bytes = B64.decode(s).map_err(|_| err)?;
     bytes.try_into().map_err(|_| CryptoError::BadBundle)
+}
+
+fn decode_ratchet_header(proto: &ProtoRatchetHeader) -> Result<RatchetHeader, CryptoError> {
+    Ok(RatchetHeader {
+        ratchet_key: b64_decode_fixed::<32>(&proto.ratchet_key, CryptoError::BadEnvelope)?,
+        previous_chain_length: proto.previous_chain_length,
+        message_number: proto.message_number,
+    })
 }
 
 /// Write a NEW key file with restricted permissions. Fails if file already exists.

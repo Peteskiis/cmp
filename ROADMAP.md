@@ -283,7 +283,7 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [x] Horizontal input scrolling for long messages
 - [x] Ctrl+modifier filtering (only printable chars inserted)
 - [ ] Adaptive background color (query terminal bg via crossterm)
-- [ ] Input history (up/down arrow)
+- [x] Input history (up/down arrow)
 
 ### App event loop (`app.rs`)
 - [x] `AppEvent` enum (Key, ServerMessage, Connected, Disconnected, AuthFailed)

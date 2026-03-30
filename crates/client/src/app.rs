@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers};
+use crossterm::event::EventStream;
 use futures::StreamExt;
 use protocol::{ClientMessage, MessageId, ServerMessage, UserId, consts};
 use tokio::sync::mpsc;
 
-use crate::command_popup::{CommandPopup, PopupAction};
+use crate::command_popup::CommandPopup;
 use crate::crypto_mgr::CryptoManager;
 use crate::{net, ui};
 
@@ -29,25 +29,35 @@ pub(crate) enum ChatEntry {
     Warning(String),
 }
 
-struct App {
-    user_id: UserId,
-    input: String,
-    cursor_pos: usize,
-    input_scroll: usize,
-    target_user: Option<UserId>,
-    running: bool,
-    crypto: CryptoManager,
-    last_typing_sent: Option<Instant>,
-    peer_typing: Option<(String, Instant)>,
-    pending_msg_ids: Vec<MessageId>,
-    unread_messages: HashMap<String, Vec<MessageId>>,
-    chat_history: Vec<ChatEntry>,
-    db: Option<rusqlite::Connection>,
-    command_popup: Option<CommandPopup>,
+pub(crate) struct App {
+    pub(crate) user_id: UserId,
+    pub(crate) input: String,
+    pub(crate) cursor_pos: usize,
+    pub(crate) input_scroll: usize,
+    pub(crate) target_user: Option<UserId>,
+    pub(crate) running: bool,
+    pub(crate) crypto: CryptoManager,
+    pub(crate) last_typing_sent: Option<Instant>,
+    pub(crate) peer_typing: Option<(String, Instant)>,
+    pub(crate) pending_msg_ids: Vec<MessageId>,
+    pub(crate) unread_messages: HashMap<String, Vec<MessageId>>,
+    pub(crate) chat_history: Vec<ChatEntry>,
+    pub(crate) db: Option<rusqlite::Connection>,
+    pub(crate) command_popup: Option<CommandPopup>,
+    /// Previously sent messages for up/down arrow recall.
+    pub(crate) input_history: VecDeque<String>,
+    /// Current position in input history (`None` = editing fresh input).
+    pub(crate) history_index: Option<usize>,
+    /// Saved draft when browsing history, restored on down-past-end.
+    pub(crate) history_draft: String,
 }
 
 impl App {
-    fn new(user_id: UserId, crypto: CryptoManager, db: Option<rusqlite::Connection>) -> Self {
+    pub(crate) fn new(
+        user_id: UserId,
+        crypto: CryptoManager,
+        db: Option<rusqlite::Connection>,
+    ) -> Self {
         Self {
             user_id,
             input: String::new(),
@@ -63,20 +73,46 @@ impl App {
             chat_history: Vec::new(),
             db,
             command_popup: None,
+            input_history: VecDeque::new(),
+            history_index: None,
+            history_draft: String::new(),
         }
     }
 
-    fn status(&mut self, text: &str) {
+    pub(crate) fn status(&mut self, text: &str) {
         self.chat_history.push(ChatEntry::Status(text.to_owned()));
     }
 
-    fn clear_input(&mut self) {
+    pub(crate) const MAX_INPUT_HISTORY: usize = 500;
+
+    pub(crate) fn clear_input(&mut self) {
+        self.save_to_history();
+        self.reset_input();
+    }
+
+    pub(crate) fn discard_input(&mut self) {
+        self.reset_input();
+    }
+
+    fn save_to_history(&mut self) {
+        let trimmed = self.input.trim();
+        if !trimmed.is_empty() && self.input_history.back().is_none_or(|last| last != trimmed) {
+            if self.input_history.len() >= Self::MAX_INPUT_HISTORY {
+                self.input_history.pop_front();
+            }
+            self.input_history.push_back(trimmed.to_owned());
+        }
+    }
+
+    fn reset_input(&mut self) {
         self.input.clear();
         self.cursor_pos = 0;
         self.input_scroll = 0;
+        self.history_index = None;
+        self.history_draft.clear();
     }
 
-    fn sync_command_popup(&mut self) {
+    pub(crate) fn sync_command_popup(&mut self) {
         if self.input.starts_with('/') {
             let popup = self.command_popup.get_or_insert_with(CommandPopup::new);
             if !popup.sync(&self.input) {
@@ -87,7 +123,7 @@ impl App {
         }
     }
 
-    fn insert_at_cursor(&mut self, ch: char) {
+    pub(crate) fn insert_at_cursor(&mut self, ch: char) {
         let byte_pos = self
             .input
             .char_indices()
@@ -95,6 +131,35 @@ impl App {
             .map_or(self.input.len(), |(i, _)| i);
         self.input.insert(byte_pos, ch);
         self.cursor_pos += 1;
+    }
+
+    fn load_chat_history(&mut self, peer_id: &str) {
+        self.chat_history.clear();
+        if let Some(ref conn) = self.db {
+            match crate::db::load_recent_messages(conn, peer_id) {
+                Ok(messages) => {
+                    self.chat_history
+                        .extend(messages.into_iter().map(ChatEntry::from));
+                }
+                Err(e) => {
+                    tracing::warn!("failed to load message history: {e}");
+                }
+            }
+        }
+    }
+
+    fn persist_message(
+        &self,
+        peer_id: &str,
+        direction: crate::db::MessageDirection,
+        msg_id: &str,
+        body: &str,
+    ) {
+        if let Some(ref conn) = self.db
+            && let Err(e) = crate::db::insert_message(conn, peer_id, direction, msg_id, body)
+        {
+            tracing::warn!("failed to persist message: {e}");
+        }
     }
 }
 
@@ -185,7 +250,7 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
 
         tokio::select! {
             Some(Ok(event)) = event_stream.next() => {
-                handle_key_event(&mut app, &terminal, &outgoing_tx, event)?;
+                crate::input::handle_key_event(&mut app, &terminal, &outgoing_tx, event)?;
             }
             Some(event) = event_rx.recv() => {
                 handle_app_event(&mut app, &outgoing_tx, event)?;
@@ -255,126 +320,8 @@ fn dirs_data_dir(user_id: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".cmp").join(user_id)
 }
 
-#[allow(clippy::cognitive_complexity, clippy::needless_pass_by_value)]
-fn handle_key_event(
-    app: &mut App,
-    terminal: &ui::Term,
-    outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
-    event: Event,
-) -> anyhow::Result<()> {
-    let Event::Key(key) = event else {
-        // Resize and other events — just let the loop redraw
-        return Ok(());
-    };
-
-    // Intercept keys when the command popup is active
-    if let Some(popup) = &mut app.command_popup {
-        match popup.handle_key(key.code) {
-            PopupAction::Consumed => return Ok(()),
-            PopupAction::Complete(text) => {
-                app.input = text;
-                app.cursor_pos = app.input.chars().count();
-                app.command_popup = None;
-                return Ok(());
-            }
-            PopupAction::Submit(text) => {
-                app.input = text;
-                app.cursor_pos = app.input.chars().count();
-                app.command_popup = None;
-                // Fall through to Enter handling below
-            }
-            PopupAction::Dismiss => {
-                app.command_popup = None;
-                return Ok(());
-            }
-            PopupAction::PassThrough => {} // continue to normal key handling
-        }
-    }
-
-    match (key.code, key.modifiers) {
-        (KeyCode::Char('d' | 'c'), KeyModifiers::CONTROL) => {
-            app.running = false;
-        }
-        // Plain Enter → submit
-        (KeyCode::Enter, KeyModifiers::NONE) => {
-            handle_enter(app, outgoing_tx)?;
-        }
-        // Modified Enter (Shift/Alt) or Ctrl+J → insert newline
-        (KeyCode::Enter, _) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
-            app.insert_at_cursor('\n');
-        }
-        (KeyCode::Backspace, _) => {
-            if app.cursor_pos > 0 {
-                let byte_pos = app
-                    .input
-                    .char_indices()
-                    .nth(app.cursor_pos - 1)
-                    .map_or(0, |(i, _)| i);
-                let end_pos = app
-                    .input
-                    .char_indices()
-                    .nth(app.cursor_pos)
-                    .map_or(app.input.len(), |(i, _)| i);
-                app.input.replace_range(byte_pos..end_pos, "");
-                app.cursor_pos -= 1;
-            }
-        }
-        (KeyCode::Left, _) => {
-            if app.cursor_pos > 0 {
-                app.cursor_pos -= 1;
-            }
-        }
-        (KeyCode::Right, _) => {
-            if app.cursor_pos < app.input.chars().count() {
-                app.cursor_pos += 1;
-            }
-        }
-        (KeyCode::Up, _) => {
-            let width = terminal.size()?.width as usize;
-            let max_cols = width.saturating_sub(ui::PREFIX_WIDTH);
-            let (lines, starts) = ui::wrap_input(&app.input, max_cols);
-            let (row, col) = ui::cursor_visual_pos(app.cursor_pos, &starts);
-            if row > 0 {
-                app.cursor_pos = ui::visual_to_cursor(row - 1, col, &starts, &lines);
-            }
-        }
-        (KeyCode::Down, _) => {
-            let width = terminal.size()?.width as usize;
-            let max_cols = width.saturating_sub(ui::PREFIX_WIDTH);
-            let (lines, starts) = ui::wrap_input(&app.input, max_cols);
-            let (row, col) = ui::cursor_visual_pos(app.cursor_pos, &starts);
-            if row + 1 < lines.len() {
-                app.cursor_pos = ui::visual_to_cursor(row + 1, col, &starts, &lines);
-            }
-        }
-        (KeyCode::Char(c), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
-            app.insert_at_cursor(c);
-
-            // Send typing indicator (debounced, only if session exists)
-            if let Some(ref target) = app.target_user
-                && target.as_str() != app.user_id.as_str()
-                && app.crypto.has_session(target.as_str())
-            {
-                let now = Instant::now();
-                let should_send = app
-                    .last_typing_sent
-                    .is_none_or(|t| now.duration_since(t) > Duration::from_secs(3));
-                if should_send {
-                    let _ = outgoing_tx.send(ClientMessage::Typing {
-                        recipient_id: target.clone(),
-                    });
-                    app.last_typing_sent = Some(now);
-                }
-            }
-        }
-        _ => {}
-    }
-    app.sync_command_popup();
-    Ok(())
-}
-
 #[allow(clippy::cognitive_complexity)]
-fn handle_enter(
+pub(crate) fn handle_enter(
     app: &mut App,
     outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
 ) -> anyhow::Result<()> {
@@ -398,17 +345,12 @@ fn handle_enter(
     // Note to self: skip crypto and server, just store locally
     if target_str == app.user_id.as_str() {
         let msg_id = MessageId::new();
-        if let Some(ref conn) = app.db
-            && let Err(e) = crate::db::insert_message(
-                conn,
-                target_str,
-                crate::db::MessageDirection::Sent,
-                &msg_id.to_string(),
-                &text,
-            )
-        {
-            tracing::warn!("failed to persist note: {e}");
-        }
+        app.persist_message(
+            target_str,
+            crate::db::MessageDirection::Sent,
+            &msg_id.to_string(),
+            &text,
+        );
         app.chat_history.push(ChatEntry::Sent(text));
         app.clear_input();
         return Ok(());
@@ -448,17 +390,12 @@ fn handle_enter(
         message_id: msg_id.clone(),
         envelope,
     });
-    if let Some(ref conn) = app.db
-        && let Err(e) = crate::db::insert_message(
-            conn,
-            target_str,
-            crate::db::MessageDirection::Sent,
-            &msg_id.to_string(),
-            &text,
-        )
-    {
-        tracing::warn!("failed to persist sent message: {e}");
-    }
+    app.persist_message(
+        target_str,
+        crate::db::MessageDirection::Sent,
+        &msg_id.to_string(),
+        &text,
+    );
     app.chat_history.push(ChatEntry::Sent(text));
     app.clear_input();
     Ok(())
@@ -505,20 +442,9 @@ fn handle_command(
     }
 
     if text == "/notes" || text == "/notetoself" {
-        app.chat_history.clear();
-        let self_id = app.user_id.as_str();
-        if let Some(ref conn) = app.db {
-            match crate::db::load_recent_messages(conn, self_id) {
-                Ok(messages) => {
-                    app.chat_history
-                        .extend(messages.into_iter().map(ChatEntry::from));
-                }
-                Err(e) => {
-                    tracing::warn!("failed to load notes: {e}");
-                }
-            }
-        }
-        app.target_user = Some(app.user_id.clone());
+        let self_id = app.user_id.clone();
+        app.load_chat_history(self_id.as_str());
+        app.target_user = Some(self_id);
         app.status("note to self \u{1f4dd}");
         app.clear_input();
         return Ok(());
@@ -532,6 +458,12 @@ fn handle_command(
     };
     if let Some(cmd) = verify_cmd {
         handle_verify(app, cmd);
+        app.clear_input();
+        return Ok(());
+    }
+
+    if text == "/keys" || text == "/k" {
+        crate::input::show_keybindings(app);
         app.clear_input();
         return Ok(());
     }
@@ -553,18 +485,7 @@ fn handle_command(
         match UserId::new(target) {
             Ok(uid) => {
                 // Clear viewport and load persisted history for this peer
-                app.chat_history.clear();
-                if let Some(ref conn) = app.db {
-                    match crate::db::load_recent_messages(conn, target) {
-                        Ok(messages) => {
-                            app.chat_history
-                                .extend(messages.into_iter().map(ChatEntry::from));
-                        }
-                        Err(e) => {
-                            tracing::warn!("failed to load message history: {e}");
-                        }
-                    }
-                }
+                app.load_chat_history(target);
 
                 if target == app.user_id.as_str() {
                     app.target_user = Some(uid);
@@ -743,17 +664,13 @@ fn process_inbound(app: &mut App, inbound: &protocol::InboundMessage) -> (String
     if ok && let Some(ik) = CryptoManager::extract_sender_identity_key(&inbound.envelope) {
         track_peer_identity(app, &sender, ik);
     }
-    if ok
-        && let Some(ref conn) = app.db
-        && let Err(e) = crate::db::insert_message(
-            conn,
+    if ok {
+        app.persist_message(
             &sender,
             crate::db::MessageDirection::Received,
             &inbound.message_id.to_string(),
             &text,
-        )
-    {
-        tracing::warn!("failed to persist received message: {e}");
+        );
     }
     app.chat_history.push(ChatEntry::Received {
         sender: sender.clone(),

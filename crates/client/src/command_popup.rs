@@ -45,6 +45,12 @@ const COMMANDS: &[CommandDef] = &[
         has_args: true,
     },
     CommandDef {
+        name: "keys",
+        usage: "/keys",
+        description: "Show keyboard shortcuts",
+        has_args: false,
+    },
+    CommandDef {
         name: "quit",
         usage: "/quit",
         description: "Exit",

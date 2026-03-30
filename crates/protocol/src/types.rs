@@ -39,10 +39,6 @@ impl UserId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-
-    pub fn into_inner(self) -> String {
-        self.0
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -86,10 +82,6 @@ impl MessageId {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
-    }
-
-    pub const fn as_uuid(&self) -> &Uuid {
-        &self.0
     }
 }
 
