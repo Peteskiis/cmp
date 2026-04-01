@@ -26,10 +26,11 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = execute!(stdout(), crossterm::event::DisableBracketedPaste);
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
-        // Erase the viewport's dark background and emit a trailing newline
-        // so zsh doesn't show a `%` PROMPT_EOL_MARK
+        // Move cursor above the status bar / spacer lines so the clear
+        // erases them too, not just the lines below the cursor.
         let _ = execute!(
             stdout(),
+            crossterm::cursor::MoveUp(3), // spacer + status bar + top padding
             crossterm::style::ResetColor,
             crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
             crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown),
@@ -133,10 +134,10 @@ pub fn visual_to_cursor(row: usize, col: usize, line_starts: &[usize], lines: &[
     line_starts[row] + col.min(line_len)
 }
 
-/// Maximum number of input lines visible (viewport minus typing and footer).
-/// Viewport rows minus typing + bottom padding + footer.
+/// Maximum number of input lines visible in the viewport.
+/// Viewport rows minus spacer, status bar, top padding, bottom padding, and footer (5 rows).
 pub const fn max_visible_input_lines() -> usize {
-    (INPUT_HEIGHT as usize).saturating_sub(3)
+    (INPUT_HEIGHT as usize).saturating_sub(5)
 }
 
 /// Render a `ChatEntry` into display lines with optional background style.
@@ -195,6 +196,15 @@ fn chat_entry_to_lines(
                 Line::from(Span::styled(
                     format!("  {text}"),
                     Style::default().fg(Color::DarkGray),
+                )),
+                None,
+            ));
+        }
+        crate::app::ChatEntry::Tip(text) => {
+            rows.push((
+                Line::from(Span::styled(
+                    format!("  {text}"),
+                    Style::default().fg(Color::White),
                 )),
                 None,
             ));
@@ -282,7 +292,7 @@ pub fn draw_input(
     cursor_row: usize,
     cursor_col: usize,
     scroll: usize,
-    typing_indicator: Option<&str>,
+    status_bar: &crate::status_bar::StatusBar,
     command_popup: Option<&crate::command_popup::CommandPopup>,
 ) -> anyhow::Result<()> {
     terminal.draw(|frame| {
@@ -304,16 +314,18 @@ pub fn draw_input(
         };
         let input_height = (input_lines.len() as u16)
             .max(1)
-            .min(area.height.saturating_sub(2 + footer_height));
-        // non_chat = typing(1) + input + padding(1) + footer/popup
-        let non_chat = 1 + input_height + 1 + footer_height;
+            .min(area.height.saturating_sub(4 + footer_height));
+        // non_chat = spacer(1) + status_bar(1) + top_pad(1) + input + bottom_pad(1) + footer
+        let non_chat = 1 + 1 + 1 + input_height + 1 + footer_height;
         let chat_height = (chat_rows.len() as u16).min(area.height.saturating_sub(non_chat));
 
         let chunks = Layout::vertical([
             Constraint::Length(chat_height),
-            Constraint::Length(1),             // typing
+            Constraint::Length(1),             // spacer above status bar
+            Constraint::Length(1),             // status bar
+            Constraint::Length(1),             // top padding (dark bg)
             Constraint::Length(input_height),  // input
-            Constraint::Length(1),             // bottom padding (always dark bg)
+            Constraint::Length(1),             // bottom padding (dark bg)
             Constraint::Length(footer_height), // footer or popup
             Constraint::Min(0),                // empty
         ])
@@ -321,7 +333,6 @@ pub fn draw_input(
 
         // Chat history
         let chat_area = chunks[0];
-        // Show most recent messages (scroll to bottom)
         let chat_skip = chat_rows.len().saturating_sub(chat_area.height as usize);
         for (i, (line, bg)) in chat_rows
             .iter()
@@ -340,21 +351,15 @@ pub fn draw_input(
             }
         }
 
-        // Typing indicator
-        if let Some(who) = typing_indicator {
-            let typing_line = Line::from(Span::styled(
-                format!("  {who} is typing..."),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            ));
-            frame.render_widget(Paragraph::new(typing_line).style(bg_style), chunks[1]);
-        } else {
-            frame.render_widget(Paragraph::new("").style(bg_style), chunks[1]);
-        }
+        // Status bar (no dark background — sits above the dark input area)
+        // chunks[1] is an empty spacer line above the status bar
+        status_bar.render(chunks[2], frame.buffer_mut());
+
+        // Top padding (dark bg)
+        frame.render_widget(Paragraph::new("").style(bg_style), chunks[3]);
 
         // Input lines
-        let input_area = chunks[2];
+        let input_area = chunks[4];
         let visible_count = input_area.height as usize;
 
         for row in 0..input_area.height {
@@ -396,11 +401,11 @@ pub fn draw_input(
         }
 
         // Bottom padding
-        frame.render_widget(Paragraph::new("").style(bg_style), chunks[3]);
+        frame.render_widget(Paragraph::new("").style(bg_style), chunks[5]);
 
         // Footer or command popup
         if let Some(popup) = command_popup {
-            popup.render(chunks[4], frame.buffer_mut());
+            popup.render(chunks[6], frame.buffer_mut());
         } else {
             let footer = Line::from(vec![
                 Span::styled("  Enter", Style::default().fg(Color::DarkGray)),
@@ -410,7 +415,7 @@ pub fn draw_input(
                 Span::styled("Ctrl+D", Style::default().fg(Color::DarkGray)),
                 Span::styled(" quit", Style::default().fg(Color::DarkGray)),
             ]);
-            frame.render_widget(Paragraph::new(footer), chunks[4]);
+            frame.render_widget(Paragraph::new(footer), chunks[6]);
         }
 
         // Cursor

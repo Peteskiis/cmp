@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::command_popup::CommandPopup;
 use crate::crypto_mgr::CryptoManager;
+use crate::status_bar::{ConnectionStatus, StatusBar};
 use crate::{net, ui};
 
 /// Events that flow into the main UI loop.
@@ -26,6 +27,7 @@ pub(crate) enum ChatEntry {
     Sent(String),
     Received { sender: String, text: String },
     Status(String),
+    Tip(String),
     Warning(String),
 }
 
@@ -38,7 +40,7 @@ pub(crate) struct App {
     pub(crate) running: bool,
     pub(crate) crypto: CryptoManager,
     pub(crate) last_typing_sent: Option<Instant>,
-    pub(crate) peer_typing: Option<(String, Instant)>,
+    pub(crate) status_bar: StatusBar,
     pub(crate) pending_msg_ids: Vec<MessageId>,
     pub(crate) unread_messages: HashMap<String, Vec<MessageId>>,
     pub(crate) chat_history: Vec<ChatEntry>,
@@ -67,7 +69,7 @@ impl App {
             running: true,
             crypto,
             last_typing_sent: None,
-            peer_typing: None,
+            status_bar: StatusBar::new(),
             pending_msg_ids: Vec::new(),
             unread_messages: HashMap::new(),
             chat_history: Vec::new(),
@@ -203,7 +205,8 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
     if app.db.is_none() {
         app.status("warning: message history unavailable");
     }
-    app.status("type / for commands");
+    app.chat_history
+        .push(ChatEntry::Tip("Tip: type / for commands".to_owned()));
     let mut event_stream = EventStream::new();
 
     while app.running {
@@ -224,11 +227,6 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
         let available_chat = ui::max_visible_input_lines().saturating_sub(input_rows);
         ui::flush_chat_to_scrollback(&mut terminal, &mut app.chat_history, available_chat)?;
 
-        let typing_label = app
-            .peer_typing
-            .as_ref()
-            .filter(|(_, ts)| ts.elapsed() < Duration::from_secs(5))
-            .map(|(name, _)| name.as_str());
         ui::draw_input(
             &mut terminal,
             &app.chat_history,
@@ -236,12 +234,12 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
             cursor_row,
             cursor_col,
             app.input_scroll,
-            typing_label,
+            &app.status_bar,
             app.command_popup.as_ref(),
         )?;
 
-        let typing_tick = async {
-            if app.peer_typing.is_some() {
+        let status_tick = async {
+            if app.status_bar.needs_tick() {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             } else {
                 std::future::pending::<()>().await;
@@ -255,12 +253,8 @@ pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
             Some(event) = event_rx.recv() => {
                 handle_app_event(&mut app, &outgoing_tx, event)?;
             }
-            () = typing_tick => {
-                if let Some((_, ts)) = &app.peer_typing
-                    && ts.elapsed() > Duration::from_secs(5)
-                {
-                    app.peer_typing = None;
-                }
+            () = status_tick => {
+                app.status_bar.tick();
             }
         }
     }
@@ -493,7 +487,7 @@ fn handle_command(
                 } else if app.crypto.has_session(target) {
                     app.status(&format!("chatting with {target} (E2EE active \u{1f512})"));
                     app.target_user = Some(uid.clone());
-                    app.peer_typing = None;
+                    app.status_bar.clear_typing();
                     app.last_typing_sent = None;
                     flush_read_receipts(app, outgoing_tx, &uid);
                 } else {
@@ -503,7 +497,7 @@ fn handle_command(
                     });
                     app.status(&format!("fetching keys for {target}..."));
                     app.target_user = Some(uid.clone());
-                    app.peer_typing = None;
+                    app.status_bar.clear_typing();
                     app.last_typing_sent = None;
                 }
             }
@@ -526,15 +520,25 @@ fn handle_app_event(
     event: AppEvent,
 ) -> anyhow::Result<()> {
     match event {
-        AppEvent::Connecting => app.status("connecting..."),
-        AppEvent::Connected => app.status("connected, authenticating..."),
-        AppEvent::Authenticated => app.status("authenticated \u{2713}"),
+        AppEvent::Connecting => {
+            app.status_bar.set_connection(ConnectionStatus::Connecting);
+        }
+        AppEvent::Connected => {
+            app.status_bar
+                .set_connection(ConnectionStatus::Authenticating);
+        }
+        AppEvent::Authenticated => {
+            app.status_bar
+                .set_connection(ConnectionStatus::Authenticated(Instant::now()));
+        }
         AppEvent::AuthFailed(reason) => {
-            app.status(&format!("auth failed: {reason}"));
+            app.status_bar
+                .set_connection(ConnectionStatus::AuthFailed(reason));
         }
         AppEvent::Disconnected => {
             app.pending_msg_ids.clear();
-            app.status("disconnected, reconnecting...");
+            app.status_bar
+                .set_connection(ConnectionStatus::Disconnected);
         }
         AppEvent::Server(msg) => handle_server_message(app, outgoing_tx, msg)?,
     }
@@ -619,7 +623,7 @@ fn handle_server_message(
             }
         }
         ServerMessage::PeerTyping { sender_id } => {
-            app.peer_typing = Some((sender_id.as_str().to_owned(), Instant::now()));
+            app.status_bar.set_typing(sender_id.as_str().to_owned());
         }
         ServerMessage::MessageDelivered { message_ids } => {
             // Show ✓ only if we sent these messages (not for queued delivery receipts)

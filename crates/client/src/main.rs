@@ -4,6 +4,7 @@ mod crypto_mgr;
 mod db;
 mod input;
 mod net;
+mod status_bar;
 mod ui;
 mod verification;
 
