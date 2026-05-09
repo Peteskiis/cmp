@@ -1,8 +1,8 @@
-.PHONY: help fmt fmt-check lint lint-fix test check build-cli build-server run-server release
+.PHONY: help fmt fmt-check lint lint-fix test check build-cli build-server run-server release release-server
 .DEFAULT_GOAL := help
 
 MAC_TARGETS := aarch64-apple-darwin
-LINUX_TARGETS := x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+LINUX_TARGETS := x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
 help:
 	@echo "usage: make <target>"
@@ -15,8 +15,9 @@ help:
 	@echo "  check      fmt-check + lint + test"
 	@echo "  build-cli    build and install client to ~/.local/bin/"
 	@echo "  build-server build and install server to ~/.local/bin/"
-	@echo "  run-server   start the server on 127.0.0.1:3000"
-	@echo "  release      cross-compile client for mac, linux, arm linux"
+	@echo "  run-server   start the server on 0.0.0.0:3000"
+	@echo "  release         cross-compile client for mac + linux (gnu/musl, x86_64/arm)"
+	@echo "  release-server  cross-compile server for linux (gnu/musl, x86_64/arm)"
 
 fmt:
 	cargo fmt --all
@@ -66,3 +67,15 @@ release:
 		echo "  -> dist/cmp-$$target.tar.gz"; \
 	done
 	@echo "done — all archives in dist/"
+
+release-server:
+	@mkdir -p dist
+	@for target in $(LINUX_TARGETS); do \
+		echo "building server for $$target (via cross)..."; \
+		cross build --release --target $$target -p server && \
+		mkdir -p dist/$$target && \
+		cp target/$$target/release/server dist/$$target/cmp-server && \
+		tar -czf dist/cmp-server-$$target.tar.gz -C dist/$$target cmp-server && \
+		echo "  -> dist/cmp-server-$$target.tar.gz"; \
+	done
+	@echo "done — all server archives in dist/"

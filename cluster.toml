@@ -1,0 +1,14 @@
+name = "cmp"
+mode = "binary"
+
+[binary]
+path = "/Users/peteskiis/Developer/cmp/target/x86_64-unknown-linux-musl/release/server"
+
+[service]
+internal_port = 3000
+always_on = false
+
+[managed]
+service_id = "0995b3e7-c121-43df-be6e-112ab936d84c"
+organization_id = "3fd25654-293a-4f28-ab27-c3fc37156e00"
+hostname = "cmp.clusterbase.dev"

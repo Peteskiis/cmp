@@ -7,7 +7,7 @@ use tracing_subscriber::EnvFilter;
 
 use server::state::AppState;
 
-const DEFAULT_BIND: &str = "127.0.0.1:3000";
+const DEFAULT_BIND: &str = "0.0.0.0:3000";
 const DEFAULT_DB_PATH: &str = "cmp-server.db";
 const DEFAULT_SERVER_ID: &str = "cmp-server-1";
 const GC_INTERVAL_SECS: u64 = 3600;
