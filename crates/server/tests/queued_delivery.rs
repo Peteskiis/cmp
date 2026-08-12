@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use ed25519_dalek::Signer;
 use futures::{SinkExt, StreamExt};

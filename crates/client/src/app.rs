@@ -12,7 +12,7 @@ use crate::status_bar::{ConnectionStatus, StatusBar};
 use crate::{net, ui};
 
 /// Events that flow into the main UI loop.
-pub enum AppEvent {
+pub(crate) enum AppEvent {
     Connecting,
     Connected,
     Authenticated,
@@ -166,7 +166,7 @@ impl App {
 }
 
 #[allow(clippy::cognitive_complexity)]
-pub async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
+pub(crate) async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
     let validated_uid = UserId::new(user_id)?;
 
     let data_dir = dirs_data_dir(user_id);

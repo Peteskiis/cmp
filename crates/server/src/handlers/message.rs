@@ -6,7 +6,7 @@ use crate::db::queue::EnqueueResult;
 use crate::state::AppState;
 
 #[allow(clippy::cognitive_complexity)]
-pub async fn handle_send(
+pub(crate) async fn handle_send(
     state: &AppState,
     sender_id: &str,
     recipient_id: UserId,
@@ -80,7 +80,7 @@ pub async fn handle_send(
 
 /// Delete acknowledged messages — scoped to the authenticated user's own queue.
 #[allow(clippy::cognitive_complexity)]
-pub async fn handle_ack(
+pub(crate) async fn handle_ack(
     state: &AppState,
     recipient_id: &str,
     message_ids: Vec<MessageId>,
@@ -103,7 +103,7 @@ pub async fn handle_ack(
 
 /// Relay a typing indicator — online only, never queued.
 // TODO: add per-connection rate limiting to prevent flooding
-pub fn handle_typing(state: &AppState, from: &str, to: &UserId) {
+pub(crate) fn handle_typing(state: &AppState, from: &str, to: &UserId) {
     let Ok(from_uid) = UserId::new(from) else {
         return;
     };
@@ -116,7 +116,7 @@ pub fn handle_typing(state: &AppState, from: &str, to: &UserId) {
 }
 
 /// Relay an E2EE read receipt — online only, never queued.
-pub fn handle_read_receipt(
+pub(crate) fn handle_read_receipt(
     state: &AppState,
     from: &str,
     to: &UserId,

@@ -18,7 +18,10 @@ use crate::state::AppState;
 /// maximum WebSocket page size, plus the frame currently being written.
 const OUTBOUND_CHANNEL_CAPACITY: usize = 8;
 
-pub async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+pub(crate) async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     ws.max_frame_size(protocol::consts::MAX_QUEUED_PAGE_BYTES)
         .max_message_size(protocol::consts::MAX_QUEUED_PAGE_BYTES)
         .on_upgrade(move |socket| handle_connection(socket, state))

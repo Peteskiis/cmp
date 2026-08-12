@@ -1,4 +1,4 @@
-.PHONY: help fmt fmt-check lint lint-fix test dependencies check build-cli build-server run-server release release-server
+.PHONY: help fmt fmt-check cargo-check lint lint-fix test doc line-check dependencies check build-cli build-server run-server release release-server
 .DEFAULT_GOAL := help
 
 MAC_TARGETS := aarch64-apple-darwin
@@ -9,9 +9,12 @@ help:
 	@echo ""
 	@echo "  fmt        format all code"
 	@echo "  fmt-check  verify formatting (no changes)"
+	@echo "  cargo-check type-check all targets and features"
 	@echo "  lint       run clippy (strict)"
 	@echo "  lint-fix   auto-fix clippy warnings"
 	@echo "  test       run all tests"
+	@echo "  doc        build documentation with warnings denied"
+	@echo "  line-check enforce the 800-line Rust source-file limit"
 	@echo "  dependencies check dependency advisories, licenses, bans, and sources"
 	@echo "  check      fmt-check + lint + test + dependency policy"
 	@echo "  build-cli    build and install client to ~/.local/bin/"
@@ -26,19 +29,28 @@ fmt:
 fmt-check:
 	cargo fmt --all -- --check
 
+cargo-check:
+	cargo check --workspace --all-targets --all-features
+
 lint:
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --workspace --all-targets --all-features
 
 lint-fix:
 	cargo clippy --workspace --fix --allow-dirty --allow-staged -- -D warnings
 
 test:
-	cargo test --workspace
+	cargo test --workspace --all-targets --all-features
+
+doc:
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+
+line-check:
+	bash scripts/line-check.sh
 
 dependencies:
 	cargo deny check advisories bans licenses sources
 
-check: fmt-check lint test dependencies
+check: fmt-check cargo-check lint test doc line-check dependencies
 
 run-server:
 	cargo run -p server

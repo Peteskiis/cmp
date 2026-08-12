@@ -1,6 +1,6 @@
-pub mod auth;
-pub mod message;
-pub mod prekey;
+pub(crate) mod auth;
+pub(crate) mod message;
+pub(crate) mod prekey;
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use protocol::{ClientMessage, OneTimePreKey, ServerMessage};
@@ -9,8 +9,10 @@ use tracing::warn;
 
 use crate::state::AppState;
 
+type DecodedPreKey = (u32, Vec<u8>);
+
 /// Per-connection session state — travels together through handlers.
-pub struct Session {
+pub(crate) struct Session {
     pub authed_user: Option<String>,
     pub conn_id: Option<u64>,
     pub pending_challenge: Option<auth::PendingChallenge>,
@@ -23,7 +25,7 @@ impl Default for Session {
 }
 
 impl Session {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             authed_user: None,
             conn_id: None,
@@ -34,7 +36,7 @@ impl Session {
 
 // ── Shared helpers ──
 
-pub fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -43,20 +45,20 @@ pub fn now_secs() -> u64 {
 
 // ── Shared error helpers ──
 
-pub fn auth_failure(reason: &str) -> ServerMessage {
+pub(crate) fn auth_failure(reason: &str) -> ServerMessage {
     ServerMessage::AuthFailure {
         reason: reason.to_owned(),
     }
 }
 
-pub fn error_400(message: &str) -> ServerMessage {
+pub(crate) fn error_400(message: &str) -> ServerMessage {
     ServerMessage::Error {
         code: 400,
         message: message.to_owned(),
     }
 }
 
-pub fn error_404(message: &str) -> ServerMessage {
+pub(crate) fn error_404(message: &str) -> ServerMessage {
     ServerMessage::Error {
         code: 404,
         message: message.to_owned(),
@@ -65,7 +67,7 @@ pub fn error_404(message: &str) -> ServerMessage {
 
 /// Returns a generic 500 error to the client. Callers must log the real error
 /// separately with `tracing` — never send internal details over the wire.
-pub fn error_500_generic() -> ServerMessage {
+pub(crate) fn error_500_generic() -> ServerMessage {
     ServerMessage::Error {
         code: 500,
         message: "internal server error".to_owned(),
@@ -75,8 +77,10 @@ pub fn error_500_generic() -> ServerMessage {
 /// Decode a batch of base64-encoded one-time prekeys.
 /// Rejects the entire batch if any key has invalid base64.
 #[allow(clippy::result_large_err)] // ServerMessage is the wire type; boxing adds no value here.
-pub fn decode_prekeys(prekeys: &[OneTimePreKey]) -> Result<Vec<(u32, Vec<u8>)>, ServerMessage> {
-    let pairs: Vec<(u32, Vec<u8>)> = prekeys
+pub(crate) fn decode_prekeys(
+    prekeys: &[OneTimePreKey],
+) -> Result<Vec<DecodedPreKey>, ServerMessage> {
+    let pairs: Vec<DecodedPreKey> = prekeys
         .iter()
         .filter_map(|pk| {
             let bytes = B64.decode(&pk.public_key).ok()?;
@@ -97,7 +101,7 @@ pub fn decode_prekeys(prekeys: &[OneTimePreKey]) -> Result<Vec<(u32, Vec<u8>)>, 
 
 /// Route a client message to the appropriate handler.
 #[allow(clippy::cognitive_complexity)] // Inherent in a message router.
-pub async fn handle_message(
+pub(crate) async fn handle_message(
     state: &AppState,
     tx: &mpsc::Sender<ServerMessage>,
     session: &mut Session,

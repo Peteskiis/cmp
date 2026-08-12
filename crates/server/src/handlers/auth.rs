@@ -9,14 +9,14 @@ use super::{Session, auth_failure, decode_prekeys, error_400, error_500_generic,
 use crate::db;
 use crate::state::AppState;
 
-pub struct PendingChallenge {
+pub(crate) struct PendingChallenge {
     pub user_id: String,
     pub nonce: [u8; 32],
     pub timestamp: u64,
 }
 
 #[allow(clippy::cognitive_complexity)]
-pub async fn handle_register(
+pub(crate) async fn handle_register(
     state: &AppState,
     tx: &mpsc::Sender<ServerMessage>,
     session: &mut Session,
@@ -71,12 +71,14 @@ pub async fn handle_register(
 
     match db::users::register_atomic(
         &state.db,
-        uid,
-        &identity_bytes,
-        bundle.signed_prekey_id,
-        &spk_bytes,
-        &sig_bytes,
-        &prekey_pairs,
+        db::users::Registration {
+            user_id: uid,
+            identity_key: &identity_bytes,
+            signed_prekey_id: bundle.signed_prekey_id,
+            signed_prekey_public: &spk_bytes,
+            signed_prekey_signature: &sig_bytes,
+            one_time_prekeys: &prekey_pairs,
+        },
     )
     .await
     {
@@ -97,7 +99,7 @@ pub async fn handle_register(
     ServerMessage::AuthSuccess
 }
 
-pub async fn handle_auth_challenge(
+pub(crate) async fn handle_auth_challenge(
     state: &AppState,
     session: &mut Session,
     user_id: UserId,
@@ -137,7 +139,7 @@ pub async fn handle_auth_challenge(
 }
 
 #[allow(clippy::cognitive_complexity)]
-pub async fn handle_auth_response(
+pub(crate) async fn handle_auth_response(
     state: &AppState,
     tx: &mpsc::Sender<ServerMessage>,
     session: &mut Session,
@@ -202,7 +204,7 @@ pub async fn handle_auth_response(
 /// Deliver queued messages to a freshly authenticated user.
 /// Called by `ws.rs` after `AuthSuccess` is on the wire.
 #[allow(clippy::cognitive_complexity)]
-pub async fn deliver_queued_messages(
+pub(crate) async fn deliver_queued_messages(
     state: &AppState,
     tx: &mpsc::Sender<ServerMessage>,
     user_id: &str,

@@ -18,7 +18,7 @@ use crate::crypto_store;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum CryptoError {
+pub(crate) enum CryptoError {
     #[error("invalid pre-key bundle")]
     BadBundle,
     #[error("invalid envelope")]
@@ -78,7 +78,7 @@ struct PersistedStateRef<'a> {
     sessions: &'a HashMap<String, PeerSession>,
 }
 
-pub struct CryptoManager {
+pub(crate) struct CryptoManager {
     identity: IdentityKeyPair,
     sessions: HashMap<String, PeerSession>,
     pending_inits: HashSet<String>,
@@ -91,7 +91,7 @@ pub struct CryptoManager {
 
 impl CryptoManager {
     /// Load or generate identity, SPK, OPKs, and sessions from `data_dir`.
-    pub fn load_or_generate(data_dir: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn load_or_generate(data_dir: &Path) -> anyhow::Result<Self> {
         fs::create_dir_all(data_dir)?;
         #[cfg(unix)]
         {
@@ -129,24 +129,24 @@ impl CryptoManager {
     }
 
     /// Whether registration is needed (no SPK persisted locally).
-    pub const fn needs_registration(&self) -> bool {
+    pub(crate) const fn needs_registration(&self) -> bool {
         self.stored_spk.is_none()
     }
 
-    pub const fn identity(&self) -> &IdentityKeyPair {
+    pub(crate) const fn identity(&self) -> &IdentityKeyPair {
         &self.identity
     }
 
-    pub fn add_pending(&mut self, peer_id: &str) {
+    pub(crate) fn add_pending(&mut self, peer_id: &str) {
         self.pending_inits.insert(peer_id.to_owned());
     }
 
-    pub fn is_pending(&self, peer_id: &str) -> bool {
+    pub(crate) fn is_pending(&self, peer_id: &str) -> bool {
         self.pending_inits.contains(peer_id)
     }
 
     /// Store SPK and OPK private keys after registration.
-    pub fn persist_registration_keys(
+    pub(crate) fn persist_registration_keys(
         &mut self,
         spk: &SignedPreKey,
         opks: &[OneTimePreKey],
@@ -182,7 +182,7 @@ impl CryptoManager {
     }
 
     /// Initialize a session with a peer using their pre-key bundle (Alice's side).
-    pub fn init_session_from_bundle(
+    pub(crate) fn init_session_from_bundle(
         &mut self,
         peer_id: &str,
         bundle: &protocol::PreKeyBundle,
@@ -243,7 +243,7 @@ impl CryptoManager {
         Ok(())
     }
 
-    pub fn encrypt(
+    pub(crate) fn encrypt(
         &mut self,
         peer_id: &str,
         plaintext: &[u8],
@@ -298,7 +298,7 @@ impl CryptoManager {
     }
 
     #[allow(clippy::cognitive_complexity)]
-    pub fn decrypt(
+    pub(crate) fn decrypt(
         &mut self,
         peer_id: &str,
         envelope: &EncryptedEnvelope,
@@ -430,7 +430,7 @@ impl CryptoManager {
     }
 
     /// Returns `(text, decrypted_ok)` — callers should only ack if `decrypted_ok`.
-    pub fn decrypt_to_text(
+    pub(crate) fn decrypt_to_text(
         &mut self,
         peer_id: &str,
         envelope: &EncryptedEnvelope,
@@ -445,23 +445,23 @@ impl CryptoManager {
         }
     }
 
-    pub fn has_session(&self, peer_id: &str) -> bool {
+    pub(crate) fn has_session(&self, peer_id: &str) -> bool {
         self.sessions.contains_key(peer_id)
     }
 
-    pub fn session_peers(&self) -> Vec<&str> {
+    pub(crate) fn session_peers(&self) -> Vec<&str> {
         let mut peers: Vec<&str> = self.sessions.keys().map(String::as_str).collect();
         peers.sort_unstable();
         peers
     }
 
     /// Base64-encoded local identity public key (Ed25519 verifying key).
-    pub fn local_identity_key_b64(&self) -> String {
+    pub(crate) fn local_identity_key_b64(&self) -> String {
         B64.encode(self.identity.verifying_key().as_bytes())
     }
 
     /// Encrypt a read receipt (list of message ID strings) using the E2EE session.
-    pub fn encrypt_read_receipt(
+    pub(crate) fn encrypt_read_receipt(
         &mut self,
         peer_id: &str,
         message_ids: &[protocol::MessageId],
@@ -482,7 +482,7 @@ impl CryptoManager {
 
     /// Extract the sender's identity key from a `PreKey` envelope header.
     /// Returns `None` for `Ratchet` headers (non-initial messages).
-    pub const fn extract_sender_identity_key(envelope: &EncryptedEnvelope) -> Option<&str> {
+    pub(crate) const fn extract_sender_identity_key(envelope: &EncryptedEnvelope) -> Option<&str> {
         match &envelope.header {
             MessageHeader::PreKey {
                 sender_identity_key,
@@ -595,7 +595,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Set up Alice and Bob CryptoManagers with registration keys.
+    /// Set up Alice and Bob `CryptoManager` instances with registration keys.
     fn setup_alice_and_bob() -> (CryptoManager, CryptoManager, TempDir, TempDir) {
         let alice_dir = TempDir::new().unwrap();
         let bob_dir = TempDir::new().unwrap();

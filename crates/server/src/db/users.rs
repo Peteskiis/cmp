@@ -5,20 +5,25 @@ use tokio_rusqlite::Connection;
 /// and one-time pre-keys — all in a single transaction.
 ///
 /// Returns `Ok(true)` on success, `Ok(false)` if the user already exists.
+pub struct Registration<'a> {
+    pub user_id: &'a str,
+    pub identity_key: &'a [u8],
+    pub signed_prekey_id: u32,
+    pub signed_prekey_public: &'a [u8],
+    pub signed_prekey_signature: &'a [u8],
+    pub one_time_prekeys: &'a [(u32, Vec<u8>)],
+}
+
 pub async fn register_atomic(
     conn: &Connection,
-    user_id: &str,
-    identity_key: &[u8],
-    spk_id: u32,
-    spk_public: &[u8],
-    spk_signature: &[u8],
-    prekeys: &[(u32, Vec<u8>)],
+    registration: Registration<'_>,
 ) -> anyhow::Result<bool> {
-    let user_id = user_id.to_owned();
-    let identity_key = identity_key.to_vec();
-    let spk_public = spk_public.to_vec();
-    let spk_signature = spk_signature.to_vec();
-    let prekeys = prekeys.to_vec();
+    let user_id = registration.user_id.to_owned();
+    let identity_key = registration.identity_key.to_vec();
+    let spk_id = registration.signed_prekey_id;
+    let spk_public = registration.signed_prekey_public.to_vec();
+    let spk_signature = registration.signed_prekey_signature.to_vec();
+    let prekeys = registration.one_time_prekeys.to_vec();
 
     conn.call(move |conn| {
         let tx = conn.transaction()?;

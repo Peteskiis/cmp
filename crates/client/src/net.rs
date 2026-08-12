@@ -16,7 +16,7 @@ use crate::app::AppEvent;
 /// Connect to the server, authenticate, and relay messages.
 /// `validated_uid` must be pre-validated at startup.
 #[allow(clippy::cognitive_complexity)]
-pub async fn run(
+pub(crate) async fn run(
     server_url: String,
     validated_uid: UserId,
     identity: &crypto::keys::IdentityKeyPair,
