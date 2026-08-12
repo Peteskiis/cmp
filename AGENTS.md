@@ -1,5 +1,3 @@
-# CLAUDE.md - Project Instructions for Claude Code
-
 ## Project Overview
 
 CMP is an end-to-end encrypted messaging service built in Rust. Uses Signal Protocol (X3DH key agreement + Double Ratchet) for true E2EE. The server is a dumb relay that never sees plaintext.
