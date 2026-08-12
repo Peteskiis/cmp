@@ -1,6 +1,6 @@
 use tokio_rusqlite::Connection;
 
-const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 2;
 
 /// Initialize the database schema, pragmas, and migrations.
 pub async fn initialize(conn: &Connection) -> anyhow::Result<()> {
@@ -52,7 +52,26 @@ pub async fn initialize(conn: &Connection) -> anyhow::Result<()> {
                     ON message_queue(recipient_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_queue_created
                     ON message_queue(created_at);
+
                 ",
+            )?;
+            tx.pragma_update(None, "user_version", 1)?;
+            tx.commit()?;
+        }
+
+        if version < 2 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS read_receipt_queue (
+                receipt_id  TEXT PRIMARY KEY,
+                recipient_id TEXT NOT NULL REFERENCES users(user_id),
+                sender_id   TEXT NOT NULL,
+                envelope    TEXT NOT NULL,
+                acknowledged INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_receipts_recipient
+                ON read_receipt_queue(recipient_id, created_at);",
             )?;
             tx.pragma_update(None, "user_version", CURRENT_VERSION)?;
             tx.commit()?;

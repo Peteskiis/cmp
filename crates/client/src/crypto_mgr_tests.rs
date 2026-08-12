@@ -378,12 +378,68 @@ fn ack_confirmation_removes_processed_marker() {
         InboundDecrypt::Pending(_)
     ));
     bob.confirm_inbound_stored("alice", &message_id).unwrap();
-    bob.confirm_acked(std::slice::from_ref(&message_id))
+    let ack = bob.queue_ack(vec![message_id.clone()]).unwrap();
+    let ClientMessage::Ack { ack_id, .. } = ack else {
+        panic!("expected acknowledgement");
+    };
+    bob.confirm_acked(&ack_id, std::slice::from_ref(&message_id))
         .unwrap();
     drop(bob);
 
     let restarted = CryptoManager::load_or_generate(b_dir.path()).unwrap();
     assert!(restarted.processed_messages.is_empty());
+}
+
+#[test]
+fn acknowledgement_survives_restart_until_correlated_confirmation() {
+    let (mut alice, mut bob, _a_dir, b_dir) = setup_alice_and_bob();
+    let message_id = MessageId::new();
+    let envelope = alice.encrypt("bob", b"durable acknowledgement").unwrap();
+    assert!(matches!(
+        bob.decrypt_message_to_text("alice", &message_id, &envelope),
+        InboundDecrypt::Pending(_)
+    ));
+    bob.confirm_inbound_stored("alice", &message_id).unwrap();
+    let queued = bob.queue_ack(vec![message_id.clone()]).unwrap();
+    let ClientMessage::Ack { ack_id, .. } = queued else {
+        panic!("expected acknowledgement");
+    };
+    drop(bob);
+
+    let mut restarted = CryptoManager::load_or_generate(b_dir.path()).unwrap();
+    assert!(matches!(
+        restarted.pending_messages().as_slice(),
+        [ClientMessage::Ack { ack_id: pending, message_ids }]
+            if pending == &ack_id && message_ids == std::slice::from_ref(&message_id)
+    ));
+    restarted
+        .confirm_acked(&ack_id, std::slice::from_ref(&message_id))
+        .unwrap();
+    drop(restarted);
+
+    let confirmed = CryptoManager::load_or_generate(b_dir.path()).unwrap();
+    assert!(confirmed.pending_messages().is_empty());
+    assert!(confirmed.processed_messages.is_empty());
+}
+
+#[test]
+fn uncorrelated_acknowledgement_does_not_remove_replay_marker() {
+    let (mut alice, mut bob, _a_dir, _b_dir) = setup_alice_and_bob();
+    let message_id = MessageId::new();
+    let envelope = alice.encrypt("bob", b"keep marker").unwrap();
+    assert!(matches!(
+        bob.decrypt_message_to_text("alice", &message_id, &envelope),
+        InboundDecrypt::Pending(_)
+    ));
+    bob.confirm_inbound_stored("alice", &message_id).unwrap();
+
+    bob.confirm_acked(&MessageId::new(), std::slice::from_ref(&message_id))
+        .unwrap();
+
+    assert!(matches!(
+        bob.decrypt_message_to_text("alice", &message_id, &envelope),
+        InboundDecrypt::Duplicate
+    ));
 }
 
 #[test]
@@ -450,7 +506,15 @@ fn established_decrypt_failure_restores_memory_and_disk() {
 #[test]
 fn corrupt_persisted_state_is_not_silently_discarded() {
     let directory = tempfile::tempdir().unwrap();
-    fs::write(directory.path().join("state.json"), b"not json").unwrap();
+    drop(CryptoManager::load_or_generate(directory.path()).unwrap());
+    let connection = rusqlite::Connection::open(directory.path().join("crypto.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO core_state (id, json) VALUES (1, 'not json')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
 
     assert!(CryptoManager::load_or_generate(directory.path()).is_err());
 }

@@ -148,9 +148,12 @@ pub(crate) async fn handle_message(
             let sender_id = session.authed_user.as_ref()?;
             Some(message::handle_send(state, sender_id, recipient_id, message_id, envelope).await)
         }
-        ClientMessage::Ack { message_ids } => {
+        ClientMessage::Ack {
+            ack_id,
+            message_ids,
+        } => {
             let user_id = session.authed_user.as_ref()?;
-            message::handle_ack(state, user_id, message_ids).await
+            message::handle_ack(state, user_id, ack_id, message_ids).await
         }
         ClientMessage::Typing { recipient_id } => {
             let sender_id = session.authed_user.as_ref()?;
@@ -164,6 +167,18 @@ pub(crate) async fn handle_message(
         } => {
             let sender_id = session.authed_user.as_ref()?;
             message::handle_read_receipt(state, sender_id, &recipient_id, receipt_id, &envelope)
+                .await
+        }
+        ClientMessage::AckReadReceipt {
+            ack_id,
+            receipt_ids,
+        } => {
+            let user_id = session.authed_user.as_ref()?;
+            Some(message::handle_read_receipt_ack(state, user_id, ack_id, receipt_ids).await)
+        }
+        ClientMessage::AckReadReceiptSent { receipt_ids } => {
+            let user_id = session.authed_user.as_ref()?;
+            Some(message::handle_read_receipt_sent_ack(state, user_id, receipt_ids).await)
         }
         _ => {
             warn!("unhandled message type");

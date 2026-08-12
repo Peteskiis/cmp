@@ -282,6 +282,97 @@ pub(crate) async fn deliver_queued_messages(
     }
 }
 
+pub(crate) async fn deliver_queued_receipts(
+    state: &AppState,
+    tx: &mpsc::Sender<ServerMessage>,
+    user_id: &str,
+) {
+    let receipts = load_queued_receipts(state, user_id)
+        .await
+        .unwrap_or_default();
+    for receipt in receipts {
+        let Some(message) = queued_receipt_to_message(&receipt) else {
+            remove_invalid_receipt(state, user_id, &receipt.receipt_id).await;
+            continue;
+        };
+        if tx.send(message).await.is_err() {
+            return;
+        }
+    }
+    deliver_receipt_confirmations(state, tx, user_id).await;
+}
+
+async fn deliver_receipt_confirmations(
+    state: &AppState,
+    tx: &mpsc::Sender<ServerMessage>,
+    user_id: &str,
+) {
+    let receipt_ids = load_receipt_confirmations(state, user_id)
+        .await
+        .unwrap_or_default();
+    for receipt_id in receipt_ids {
+        let Ok(receipt_id) = uuid::Uuid::parse_str(&receipt_id) else {
+            continue;
+        };
+        if tx
+            .send(ServerMessage::ReadReceiptSent {
+                receipt_id: receipt_id.into(),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+async fn load_receipt_confirmations(state: &AppState, user_id: &str) -> Option<Vec<String>> {
+    match db::receipts::confirmed_for_sender(&state.db, user_id).await {
+        Ok(receipt_ids) => Some(receipt_ids),
+        Err(error) => {
+            warn!(
+                user_id,
+                "failed to fetch read receipt confirmations: {error}"
+            );
+            None
+        }
+    }
+}
+
+async fn load_queued_receipts(
+    state: &AppState,
+    user_id: &str,
+) -> Option<Vec<db::receipts::QueuedReceipt>> {
+    match db::receipts::pending(&state.db, user_id).await {
+        Ok(receipts) => Some(receipts),
+        Err(error) => {
+            warn!(user_id, "failed to fetch queued read receipts: {error}");
+            None
+        }
+    }
+}
+
+fn queued_receipt_to_message(receipt: &db::receipts::QueuedReceipt) -> Option<ServerMessage> {
+    let receipt_id = uuid::Uuid::parse_str(&receipt.receipt_id).ok()?;
+    let sender_id = protocol::UserId::new(&receipt.sender_id).ok()?;
+    let envelope = serde_json::from_str(&receipt.envelope).ok()?;
+    super::message::validate_envelope(&envelope).ok()?;
+    Some(ServerMessage::IncomingReadReceipt {
+        sender_id,
+        receipt_id: receipt_id.into(),
+        envelope,
+    })
+}
+
+async fn remove_invalid_receipt(state: &AppState, user_id: &str, receipt_id: &str) {
+    if let Err(error) = db::receipts::delete_invalid(&state.db, user_id, receipt_id).await {
+        warn!(
+            user_id,
+            receipt_id, "failed to remove invalid queued read receipt: {error}"
+        );
+    }
+}
+
 async fn remove_invalid_queued_row(state: &AppState, user_id: &str, row_id: i64) {
     if let Err(error) = db::queue::delete_invalid_row(&state.db, user_id, row_id).await {
         warn!(

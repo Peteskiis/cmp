@@ -330,16 +330,19 @@ async fn ack_removes_from_queue() {
         panic!("expected QueuedMessages");
     };
     let ids: Vec<MessageId> = messages.into_iter().map(|m| m.message_id).collect();
+    let ack_id = MessageId::new();
     send(
         &mut bs2,
         &ClientMessage::Ack {
+            ack_id: ack_id.clone(),
             message_ids: ids.clone(),
         },
     )
     .await;
     assert!(matches!(
         recv(&mut br2).await,
-        ServerMessage::AckSuccess { message_ids } if message_ids == ids
+        ServerMessage::AckSuccess { ack_id: confirmed, message_ids }
+            if confirmed == ack_id && message_ids == ids
     ));
     drop((bs2, br2));
 
@@ -654,20 +657,39 @@ async fn read_receipt_relay() {
     )
     .await;
 
+    let resp = recv(&mut ar1).await;
+    let ServerMessage::IncomingReadReceipt {
+        sender_id,
+        receipt_id: incoming_id,
+        ..
+    } = resp
+    else {
+        panic!("expected IncomingReadReceipt: {resp:?}");
+    };
+    assert_eq!(sender_id.as_str(), "bob");
+    assert_eq!(incoming_id, receipt_id);
+
+    let ack_id = MessageId::new();
+    send(
+        &mut as1,
+        &ClientMessage::AckReadReceipt {
+            ack_id: ack_id.clone(),
+            receipt_ids: vec![receipt_id.clone()],
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut ar1).await,
+        ServerMessage::AckSuccess { ack_id: confirmed, .. } if confirmed == ack_id
+    ));
     assert!(matches!(
         recv(&mut br1).await,
         ServerMessage::ReadReceiptSent { receipt_id: sent } if sent == receipt_id
     ));
-
-    let resp = recv(&mut ar1).await;
-    let ServerMessage::IncomingReadReceipt { sender_id, .. } = resp else {
-        panic!("expected IncomingReadReceipt: {resp:?}");
-    };
-    assert_eq!(sender_id.as_str(), "bob");
 }
 
 #[tokio::test]
-async fn offline_read_receipt_is_not_confirmed() {
+async fn offline_read_receipt_is_queued_until_recipient_acknowledges() {
     let (url, _handle) = start_test_server().await;
     let alice_id = make_identity();
     let bob_id = make_identity();
@@ -677,17 +699,54 @@ async fn offline_read_receipt_is_not_confirmed() {
     register(&mut bob_sink, &mut bob_stream, "bob", &bob_id).await;
     drop((alice_sink, alice_stream));
 
+    let receipt_id = MessageId::new();
     send(
         &mut bob_sink,
         &ClientMessage::SendReadReceipt {
             recipient_id: UserId::new("alice").unwrap(),
-            receipt_id: MessageId::new(),
+            receipt_id: receipt_id.clone(),
             envelope: dummy_envelope("retry me"),
+        },
+    )
+    .await;
+
+    let (mut alice_sink, mut alice_stream) = connect(&url).await;
+    auth_challenge_response(&mut alice_sink, &mut alice_stream, "alice", &alice_id).await;
+    assert!(matches!(
+        recv(&mut alice_stream).await,
+        ServerMessage::IncomingReadReceipt { receipt_id: incoming, .. } if incoming == receipt_id
+    ));
+    drop((bob_sink, bob_stream));
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let ack_id = MessageId::new();
+    send(
+        &mut alice_sink,
+        &ClientMessage::AckReadReceipt {
+            ack_id: ack_id.clone(),
+            receipt_ids: vec![receipt_id.clone()],
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut alice_stream).await,
+        ServerMessage::AckSuccess { ack_id: confirmed, .. } if confirmed == ack_id
+    ));
+
+    let (mut bob_sink, mut bob_stream) = connect(&url).await;
+    auth_challenge_response(&mut bob_sink, &mut bob_stream, "bob", &bob_id).await;
+    assert!(matches!(
+        recv(&mut bob_stream).await,
+        ServerMessage::ReadReceiptSent { receipt_id: sent } if sent == receipt_id
+    ));
+    send(
+        &mut bob_sink,
+        &ClientMessage::AckReadReceiptSent {
+            receipt_ids: vec![receipt_id],
         },
     )
     .await;
     assert!(matches!(
         recv(&mut bob_stream).await,
-        ServerMessage::Error { code: 400, .. }
+        ServerMessage::Success
     ));
 }

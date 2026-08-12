@@ -16,6 +16,14 @@ pub(super) enum PendingOutbound {
         receipt_id: MessageId,
         envelope: EncryptedEnvelope,
     },
+    Ack {
+        ack_id: MessageId,
+        message_ids: Vec<MessageId>,
+    },
+    ReadReceiptAck {
+        ack_id: MessageId,
+        receipt_ids: Vec<MessageId>,
+    },
 }
 
 impl PendingOutbound {
@@ -39,6 +47,20 @@ impl PendingOutbound {
                 receipt_id: receipt_id.clone(),
                 envelope: envelope.clone(),
             },
+            Self::Ack {
+                ack_id,
+                message_ids,
+            } => ClientMessage::Ack {
+                ack_id: ack_id.clone(),
+                message_ids: message_ids.clone(),
+            },
+            Self::ReadReceiptAck {
+                ack_id,
+                receipt_ids,
+            } => ClientMessage::AckReadReceipt {
+                ack_id: ack_id.clone(),
+                receipt_ids: receipt_ids.clone(),
+            },
         }
     }
 
@@ -47,6 +69,16 @@ impl PendingOutbound {
             Self::Message { envelope, .. } | Self::ReadReceipt { envelope, .. } => {
                 envelope.ciphertext.len()
             }
+            Self::Ack { message_ids, .. } => message_ids.len() * 36,
+            Self::ReadReceiptAck { receipt_ids, .. } => receipt_ids.len() * 36,
+        }
+    }
+
+    pub(super) fn correlation_id(&self) -> String {
+        match self {
+            Self::Message { message_id, .. } => message_id.to_string(),
+            Self::ReadReceipt { receipt_id, .. } => receipt_id.to_string(),
+            Self::Ack { ack_id, .. } | Self::ReadReceiptAck { ack_id, .. } => ack_id.to_string(),
         }
     }
 }

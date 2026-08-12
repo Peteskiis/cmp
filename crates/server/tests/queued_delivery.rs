@@ -159,6 +159,7 @@ async fn setup() -> (String, crypto::keys::IdentityKeyPair, WsSink, WsStream) {
     let (mut bob_sink, mut bob_stream) = connect(&url).await;
     register(&mut bob_sink, &mut bob_stream, "bob", &bob_identity).await;
     drop((bob_sink, bob_stream));
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     (url, bob_identity, alice_sink, alice_stream)
 }

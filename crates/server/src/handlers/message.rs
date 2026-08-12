@@ -93,6 +93,7 @@ pub(crate) async fn handle_send(
 pub(crate) async fn handle_ack(
     state: &AppState,
     recipient_id: &str,
+    ack_id: MessageId,
     message_ids: Vec<MessageId>,
 ) -> Option<ServerMessage> {
     if message_ids.len() > consts::MAX_ACK_BATCH {
@@ -109,7 +110,10 @@ pub(crate) async fn handle_ack(
         tracing::warn!(recipient_id, "ack delete failed: {e}");
         return Some(error_500_generic());
     }
-    Some(ServerMessage::AckSuccess { message_ids })
+    Some(ServerMessage::AckSuccess {
+        ack_id,
+        message_ids,
+    })
 }
 
 /// Relay a typing indicator — online only, never queued.
@@ -126,8 +130,8 @@ pub(crate) fn handle_typing(state: &AppState, from: &str, to: &UserId) {
     );
 }
 
-/// Relay an E2EE read receipt — online only, never queued.
-pub(crate) fn handle_read_receipt(
+/// Durably relay an E2EE read receipt and confirm it only after recipient ACK.
+pub(crate) async fn handle_read_receipt(
     state: &AppState,
     from: &str,
     to: &UserId,
@@ -140,17 +144,95 @@ pub(crate) fn handle_read_receipt(
     let Ok(from_uid) = UserId::new(from) else {
         return None;
     };
-    let delivered = state.connections.send_to(
+    let Ok(envelope_json) = serde_json::to_string(envelope) else {
+        return Some(error_400("invalid envelope"));
+    };
+    let enqueue_result = db::receipts::enqueue(
+        &state.db,
+        &receipt_id.to_string(),
+        to.as_str(),
+        from,
+        envelope_json,
+        consts::MAX_QUEUE_PER_USER,
+    )
+    .await;
+    match enqueue_result {
+        Ok(db::receipts::EnqueueResult::Inserted | db::receipts::EnqueueResult::Duplicate) => {}
+        Ok(db::receipts::EnqueueResult::AlreadyAcknowledged) => {
+            return Some(ServerMessage::ReadReceiptSent { receipt_id });
+        }
+        Ok(db::receipts::EnqueueResult::QueueFull) => {
+            return Some(error_400("recipient read receipt queue is full"));
+        }
+        Ok(db::receipts::EnqueueResult::Collision) => {
+            return Some(error_400("read receipt ID already exists"));
+        }
+        Err(error) => {
+            tracing::error!("failed to queue read receipt: {error}");
+            return Some(error_500_generic());
+        }
+    }
+    state.connections.send_to(
         to.as_str(),
         ServerMessage::IncomingReadReceipt {
             sender_id: from_uid,
+            receipt_id,
             envelope: envelope.clone(),
         },
     );
-    if delivered {
-        Some(ServerMessage::ReadReceiptSent { receipt_id })
-    } else {
-        Some(error_400("recipient is not available"))
+    None
+}
+
+pub(crate) async fn handle_read_receipt_sent_ack(
+    state: &AppState,
+    sender_id: &str,
+    receipt_ids: Vec<MessageId>,
+) -> ServerMessage {
+    if receipt_ids.len() > consts::MAX_RECEIPT_BATCH {
+        return error_400("read receipt confirmation exceeds maximum size");
+    }
+    let ids: Vec<String> = receipt_ids.iter().map(ToString::to_string).collect();
+    if let Err(error) = db::receipts::confirm_sender_received(&state.db, sender_id, &ids).await {
+        tracing::error!("failed to confirm read receipt notifications: {error}");
+        return error_500_generic();
+    }
+    ServerMessage::Success
+}
+
+pub(crate) async fn handle_read_receipt_ack(
+    state: &AppState,
+    recipient_id: &str,
+    ack_id: MessageId,
+    receipt_ids: Vec<MessageId>,
+) -> ServerMessage {
+    if receipt_ids.len() > consts::MAX_RECEIPT_BATCH {
+        return error_400("read receipt ack exceeds maximum size");
+    }
+    let ids: Vec<String> = receipt_ids.iter().map(ToString::to_string).collect();
+    let acknowledged = match db::receipts::acknowledge(&state.db, recipient_id, &ids).await {
+        Ok(acknowledged) => acknowledged,
+        Err(error) => {
+            tracing::error!("failed to acknowledge read receipts: {error}");
+            return error_500_generic();
+        }
+    };
+    notify_receipt_senders(state, acknowledged);
+    ServerMessage::AckSuccess {
+        ack_id,
+        message_ids: receipt_ids,
+    }
+}
+
+fn notify_receipt_senders(state: &AppState, acknowledged: Vec<(String, String)>) {
+    for (receipt_id, sender_id) in acknowledged {
+        if let Ok(receipt_id) = uuid::Uuid::parse_str(&receipt_id) {
+            state.connections.send_to(
+                &sender_id,
+                ServerMessage::ReadReceiptSent {
+                    receipt_id: receipt_id.into(),
+                },
+            );
+        }
     }
 }
 

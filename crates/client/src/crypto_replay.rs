@@ -19,13 +19,14 @@ pub(super) fn prune_processed(
     now: u64,
 ) {
     // Server queue GC runs at 30 days. The extra day covers the full redelivery window.
-    const RETENTION_SECS: u64 = 31 * 24 * 60 * 60;
     let cutoff = now.saturating_sub(RETENTION_SECS);
     processed.retain(|_, messages| {
         messages.retain(|_, message| message.processed_at >= cutoff);
         !messages.is_empty()
     });
 }
+
+pub(super) const RETENTION_SECS: u64 = 31 * 24 * 60 * 60;
 
 pub(super) fn validate_peer_ids<T>(by_peer: &HashMap<String, T>) -> anyhow::Result<()> {
     for peer_id in by_peer.keys() {
