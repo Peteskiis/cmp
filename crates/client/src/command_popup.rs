@@ -79,7 +79,7 @@ pub(crate) struct CommandPopup {
 }
 
 impl CommandPopup {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let filtered_indices: Vec<usize> = (0..COMMANDS.len()).collect();
         Self {
             filter: String::new(),
@@ -89,7 +89,7 @@ impl CommandPopup {
     }
 
     /// Update filter from current input. Returns `false` if the popup should be dismissed.
-    pub fn sync(&mut self, input: &str) -> bool {
+    pub(crate) fn sync(&mut self, input: &str) -> bool {
         let Some(after_slash) = input.strip_prefix('/') else {
             return false;
         };
@@ -128,7 +128,7 @@ impl CommandPopup {
         }
     }
 
-    pub const fn move_up(&mut self) {
+    pub(crate) const fn move_up(&mut self) {
         if !self.filtered_indices.is_empty() {
             if self.selected == 0 {
                 self.selected = self.filtered_indices.len() - 1;
@@ -138,7 +138,7 @@ impl CommandPopup {
         }
     }
 
-    pub const fn move_down(&mut self) {
+    pub(crate) const fn move_down(&mut self) {
         if !self.filtered_indices.is_empty() {
             self.selected = (self.selected + 1) % self.filtered_indices.len();
         }
@@ -161,7 +161,7 @@ impl CommandPopup {
     }
 
     /// Handle a key event. Returns a [`PopupAction`] telling the caller what to do.
-    pub fn handle_key(&mut self, code: KeyCode) -> PopupAction {
+    pub(crate) fn handle_key(&mut self, code: KeyCode) -> PopupAction {
         match code {
             KeyCode::Up => {
                 self.move_up();
@@ -189,7 +189,7 @@ impl CommandPopup {
     }
 
     /// Number of rows the popup needs for rendering.
-    pub const fn row_count(&self) -> u16 {
+    pub(crate) const fn row_count(&self) -> u16 {
         if self.filtered_indices.is_empty() {
             1 // "no matches" row
         } else {
@@ -202,7 +202,7 @@ impl CommandPopup {
 
     /// Render the popup into the given area.
     #[allow(clippy::cast_possible_truncation)] // row index bounded by area.height (u16)
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    pub(crate) fn render(&self, area: Rect, buf: &mut Buffer) {
         if self.filtered_indices.is_empty() {
             let line = Line::from(Span::styled(
                 "  no matches",
@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn row_count_all() {
         let popup = CommandPopup::new();
-        assert_eq!(popup.row_count(), COMMANDS.len() as u16);
+        assert_eq!(popup.row_count(), u16::try_from(COMMANDS.len()).unwrap());
     }
 
     #[test]

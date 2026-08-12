@@ -1,11 +1,17 @@
 # Maximum cognitive complexity before warning
 cognitive-complexity-threshold = 10
 
-# Maximum lines per function before warning
-too-many-lines-threshold = 100
+# Maximum lines per function before failing clippy
+too-many-lines-threshold = 80
 
-# Maximum function arguments before warning
-too-many-arguments-threshold = 7
+# Maximum function arguments before failing clippy
+too-many-arguments-threshold = 6
+
+# Maximum block nesting depth before failing clippy.
+excessive-nesting-threshold = 5
+
+# Fail before Clippy's default type-complexity threshold of 250.
+type-complexity-threshold = 200
 
 # Allow expect()/unwrap() in #[cfg(test)] code — no manual #[allow] needed on test modules
 allow-expect-in-tests = true

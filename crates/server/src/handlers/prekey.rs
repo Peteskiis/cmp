@@ -8,7 +8,7 @@ use crate::state::AppState;
 const PREKEY_LOW_THRESHOLD: u32 = 10;
 
 #[allow(clippy::cognitive_complexity)]
-pub async fn handle_fetch(state: &AppState, target_user_id: UserId) -> ServerMessage {
+pub(crate) async fn handle_fetch(state: &AppState, target_user_id: UserId) -> ServerMessage {
     let uid = target_user_id.as_str();
 
     let identity_key = match db::users::get_identity_key(&state.db, uid).await {
@@ -71,7 +71,7 @@ pub async fn handle_fetch(state: &AppState, target_user_id: UserId) -> ServerMes
 }
 
 #[allow(clippy::cognitive_complexity)]
-pub async fn handle_upload(
+pub(crate) async fn handle_upload(
     state: &AppState,
     user_id: &str,
     prekeys: Vec<OneTimePreKey>,

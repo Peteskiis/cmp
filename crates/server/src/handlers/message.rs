@@ -1,4 +1,8 @@
-use protocol::{EncryptedEnvelope, InboundMessage, MessageId, ServerMessage, UserId, consts};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use protocol::{
+    EncryptedEnvelope, InboundMessage, MessageId, ServerMessage, UserId, consts,
+    types::MessageHeader,
+};
 
 use super::{error_400, error_500_generic, now_secs};
 use crate::db;
@@ -6,19 +10,37 @@ use crate::db::queue::EnqueueResult;
 use crate::state::AppState;
 
 #[allow(clippy::cognitive_complexity)]
-pub async fn handle_send(
+pub(crate) async fn handle_send(
     state: &AppState,
     sender_id: &str,
     recipient_id: UserId,
     message_id: MessageId,
     envelope: EncryptedEnvelope,
 ) -> ServerMessage {
-    if envelope.ciphertext.len() > consts::MAX_CIPHERTEXT_BYTES {
-        return error_400("ciphertext exceeds maximum size");
+    if let Err(message) = validate_envelope(&envelope) {
+        return error_400(message);
     }
 
     let msg_id_str = message_id.to_string();
     let recipient_str = recipient_id.as_str();
+
+    let Ok(sender_user_id) = UserId::new(sender_id) else {
+        return error_500_generic();
+    };
+    let inbound = InboundMessage {
+        message_id: message_id.clone(),
+        sender_id: sender_user_id,
+        envelope: envelope.clone(),
+        timestamp: now_secs(),
+    };
+    let Ok(queued_page) = serde_json::to_vec(&ServerMessage::QueuedMessages {
+        messages: vec![inbound.clone()],
+    }) else {
+        return error_400("invalid envelope");
+    };
+    if queued_page.len() > consts::MAX_QUEUED_PAGE_BYTES {
+        return error_400("message exceeds queued delivery size");
+    }
 
     let Ok(envelope_json) = serde_json::to_string(&envelope) else {
         return error_400("invalid envelope");
@@ -48,18 +70,6 @@ pub async fn handle_send(
     }
 
     // Push to recipient if online
-    let Ok(sender_user_id) = UserId::new(sender_id) else {
-        return ServerMessage::MessageSent {
-            message_id: message_id.clone(),
-        };
-    };
-
-    let inbound = InboundMessage {
-        message_id: message_id.clone(),
-        sender_id: sender_user_id,
-        envelope,
-        timestamp: now_secs(),
-    };
     let pushed = state
         .connections
         .send_to(recipient_str, ServerMessage::IncomingMessage(inbound));
@@ -80,9 +90,10 @@ pub async fn handle_send(
 
 /// Delete acknowledged messages — scoped to the authenticated user's own queue.
 #[allow(clippy::cognitive_complexity)]
-pub async fn handle_ack(
+pub(crate) async fn handle_ack(
     state: &AppState,
     recipient_id: &str,
+    ack_id: MessageId,
     message_ids: Vec<MessageId>,
 ) -> Option<ServerMessage> {
     if message_ids.len() > consts::MAX_ACK_BATCH {
@@ -97,13 +108,17 @@ pub async fn handle_ack(
     let ids: Vec<String> = message_ids.iter().map(ToString::to_string).collect();
     if let Err(e) = db::queue::delete_messages(&state.db, recipient_id, &ids).await {
         tracing::warn!(recipient_id, "ack delete failed: {e}");
+        return Some(error_500_generic());
     }
-    None
+    Some(ServerMessage::AckSuccess {
+        ack_id,
+        message_ids,
+    })
 }
 
 /// Relay a typing indicator — online only, never queued.
 // TODO: add per-connection rate limiting to prevent flooding
-pub fn handle_typing(state: &AppState, from: &str, to: &UserId) {
+pub(crate) fn handle_typing(state: &AppState, from: &str, to: &UserId) {
     let Ok(from_uid) = UserId::new(from) else {
         return;
     };
@@ -115,25 +130,141 @@ pub fn handle_typing(state: &AppState, from: &str, to: &UserId) {
     );
 }
 
-/// Relay an E2EE read receipt — online only, never queued.
-pub fn handle_read_receipt(
+/// Durably relay an E2EE read receipt and confirm it only after recipient ACK.
+pub(crate) async fn handle_read_receipt(
     state: &AppState,
     from: &str,
     to: &UserId,
+    receipt_id: MessageId,
     envelope: &protocol::EncryptedEnvelope,
 ) -> Option<ServerMessage> {
-    if envelope.ciphertext.len() > consts::MAX_CIPHERTEXT_BYTES {
-        return Some(error_400("ciphertext exceeds maximum size"));
+    if let Err(message) = validate_envelope(envelope) {
+        return Some(error_400(message));
     }
     let Ok(from_uid) = UserId::new(from) else {
         return None;
     };
+    let Ok(envelope_json) = serde_json::to_string(envelope) else {
+        return Some(error_400("invalid envelope"));
+    };
+    let enqueue_result = db::receipts::enqueue(
+        &state.db,
+        &receipt_id.to_string(),
+        to.as_str(),
+        from,
+        envelope_json,
+        consts::MAX_QUEUE_PER_USER,
+    )
+    .await;
+    match enqueue_result {
+        Ok(db::receipts::EnqueueResult::Inserted | db::receipts::EnqueueResult::Duplicate) => {}
+        Ok(db::receipts::EnqueueResult::AlreadyAcknowledged) => {
+            return Some(ServerMessage::ReadReceiptSent { receipt_id });
+        }
+        Ok(db::receipts::EnqueueResult::QueueFull) => {
+            return Some(error_400("recipient read receipt queue is full"));
+        }
+        Ok(db::receipts::EnqueueResult::Collision) => {
+            return Some(error_400("read receipt ID already exists"));
+        }
+        Err(error) => {
+            tracing::error!("failed to queue read receipt: {error}");
+            return Some(error_500_generic());
+        }
+    }
     state.connections.send_to(
         to.as_str(),
         ServerMessage::IncomingReadReceipt {
             sender_id: from_uid,
+            receipt_id,
             envelope: envelope.clone(),
         },
     );
     None
+}
+
+pub(crate) async fn handle_read_receipt_sent_ack(
+    state: &AppState,
+    sender_id: &str,
+    receipt_ids: Vec<MessageId>,
+) -> ServerMessage {
+    if receipt_ids.len() > consts::MAX_RECEIPT_BATCH {
+        return error_400("read receipt confirmation exceeds maximum size");
+    }
+    let ids: Vec<String> = receipt_ids.iter().map(ToString::to_string).collect();
+    if let Err(error) = db::receipts::confirm_sender_received(&state.db, sender_id, &ids).await {
+        tracing::error!("failed to confirm read receipt notifications: {error}");
+        return error_500_generic();
+    }
+    ServerMessage::Success
+}
+
+pub(crate) async fn handle_read_receipt_ack(
+    state: &AppState,
+    recipient_id: &str,
+    ack_id: MessageId,
+    receipt_ids: Vec<MessageId>,
+) -> ServerMessage {
+    if receipt_ids.len() > consts::MAX_RECEIPT_BATCH {
+        return error_400("read receipt ack exceeds maximum size");
+    }
+    let ids: Vec<String> = receipt_ids.iter().map(ToString::to_string).collect();
+    let acknowledged = match db::receipts::acknowledge(&state.db, recipient_id, &ids).await {
+        Ok(acknowledged) => acknowledged,
+        Err(error) => {
+            tracing::error!("failed to acknowledge read receipts: {error}");
+            return error_500_generic();
+        }
+    };
+    notify_receipt_senders(state, acknowledged);
+    ServerMessage::AckSuccess {
+        ack_id,
+        message_ids: receipt_ids,
+    }
+}
+
+fn notify_receipt_senders(state: &AppState, acknowledged: Vec<(String, String)>) {
+    for (receipt_id, sender_id) in acknowledged {
+        if let Ok(receipt_id) = uuid::Uuid::parse_str(&receipt_id) {
+            state.connections.send_to(
+                &sender_id,
+                ServerMessage::ReadReceiptSent {
+                    receipt_id: receipt_id.into(),
+                },
+            );
+        }
+    }
+}
+
+pub(crate) fn validate_envelope(envelope: &EncryptedEnvelope) -> Result<(), &'static str> {
+    if envelope.ciphertext.len() > consts::MAX_CIPHERTEXT_BYTES {
+        return Err("ciphertext exceeds maximum size");
+    }
+    if B64.decode(&envelope.ciphertext).is_err() {
+        return Err("invalid ciphertext encoding");
+    }
+
+    match &envelope.header {
+        MessageHeader::PreKey {
+            sender_identity_key,
+            sender_ephemeral_key,
+            ratchet,
+            ..
+        } => {
+            validate_b64_len::<32>(sender_identity_key)?;
+            validate_b64_len::<32>(sender_ephemeral_key)?;
+            validate_b64_len::<32>(&ratchet.ratchet_key)?;
+        }
+        MessageHeader::Ratchet(ratchet) => validate_b64_len::<32>(&ratchet.ratchet_key)?,
+        _ => return Err("unsupported message header"),
+    }
+    Ok(())
+}
+
+fn validate_b64_len<const N: usize>(encoded: &str) -> Result<(), &'static str> {
+    let decoded = B64.decode(encoded).map_err(|_| "invalid key encoding")?;
+    if decoded.len() != N {
+        return Err("invalid key length");
+    }
+    Ok(())
 }

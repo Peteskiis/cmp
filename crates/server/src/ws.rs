@@ -14,12 +14,16 @@ use crate::handlers;
 use crate::handlers::Session;
 use crate::state::AppState;
 
-/// Max WebSocket message size: `MAX_CIPHERTEXT_BYTES` + 16 KB headroom for JSON envelope overhead.
-const MAX_WS_MESSAGE_SIZE: usize = 512 * 1024 + 16 * 1024;
+/// Bounds queued server output for a slow client to roughly four MiB at the
+/// maximum WebSocket page size, plus the frame currently being written.
+const OUTBOUND_CHANNEL_CAPACITY: usize = 8;
 
-pub async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.max_frame_size(MAX_WS_MESSAGE_SIZE)
-        .max_message_size(MAX_WS_MESSAGE_SIZE)
+pub(crate) async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.max_frame_size(protocol::consts::MAX_QUEUED_PAGE_BYTES)
+        .max_message_size(protocol::consts::MAX_QUEUED_PAGE_BYTES)
         .on_upgrade(move |socket| handle_connection(socket, state))
 }
 
@@ -28,7 +32,7 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
     let (mut sink, mut stream) = socket.split();
 
     // Bounded channel — backpressure on slow/malicious clients.
-    let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
+    let (tx, mut rx) = mpsc::channel::<ServerMessage>(OUTBOUND_CHANNEL_CAPACITY);
 
     let write_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -77,6 +81,7 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
         // Deliver queued messages after AuthSuccess is on the wire
         if !was_authed && let Some(ref uid) = session.authed_user {
             handlers::auth::deliver_queued_messages(&state, &tx, uid).await;
+            handlers::auth::deliver_queued_receipts(&state, &tx, uid).await;
         }
     }
 

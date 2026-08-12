@@ -9,14 +9,14 @@ use super::{Session, auth_failure, decode_prekeys, error_400, error_500_generic,
 use crate::db;
 use crate::state::AppState;
 
-pub struct PendingChallenge {
+pub(crate) struct PendingChallenge {
     pub user_id: String,
     pub nonce: [u8; 32],
     pub timestamp: u64,
 }
 
 #[allow(clippy::cognitive_complexity)]
-pub async fn handle_register(
+pub(crate) async fn handle_register(
     state: &AppState,
     tx: &mpsc::Sender<ServerMessage>,
     session: &mut Session,
@@ -71,12 +71,14 @@ pub async fn handle_register(
 
     match db::users::register_atomic(
         &state.db,
-        uid,
-        &identity_bytes,
-        bundle.signed_prekey_id,
-        &spk_bytes,
-        &sig_bytes,
-        &prekey_pairs,
+        db::users::Registration {
+            user_id: uid,
+            identity_key: &identity_bytes,
+            signed_prekey_id: bundle.signed_prekey_id,
+            signed_prekey_public: &spk_bytes,
+            signed_prekey_signature: &sig_bytes,
+            one_time_prekeys: &prekey_pairs,
+        },
     )
     .await
     {
@@ -97,7 +99,7 @@ pub async fn handle_register(
     ServerMessage::AuthSuccess
 }
 
-pub async fn handle_auth_challenge(
+pub(crate) async fn handle_auth_challenge(
     state: &AppState,
     session: &mut Session,
     user_id: UserId,
@@ -137,7 +139,7 @@ pub async fn handle_auth_challenge(
 }
 
 #[allow(clippy::cognitive_complexity)]
-pub async fn handle_auth_response(
+pub(crate) async fn handle_auth_response(
     state: &AppState,
     tx: &mpsc::Sender<ServerMessage>,
     session: &mut Session,
@@ -202,83 +204,226 @@ pub async fn handle_auth_response(
 /// Deliver queued messages to a freshly authenticated user.
 /// Called by `ws.rs` after `AuthSuccess` is on the wire.
 #[allow(clippy::cognitive_complexity)]
-pub async fn deliver_queued_messages(
+pub(crate) async fn deliver_queued_messages(
     state: &AppState,
     tx: &mpsc::Sender<ServerMessage>,
     user_id: &str,
 ) {
-    let queued = match db::queue::get_pending(&state.db, user_id, consts::MAX_QUEUED_MESSAGES).await
-    {
-        Ok(q) if !q.is_empty() => q,
-        Ok(_) => return,
-        Err(e) => {
-            warn!(user_id, "failed to fetch queued messages: {e}");
+    let empty_page_bytes = match serde_json::to_vec(&ServerMessage::QueuedMessages {
+        messages: Vec::new(),
+    }) {
+        Ok(encoded) => encoded.len(),
+        Err(error) => {
+            warn!(user_id, "failed to size queued page: {error}");
             return;
         }
     };
+    let mut cursor = 0;
+    let mut visited = 0;
+    let mut page = Vec::new();
+    let mut page_bytes = empty_page_bytes;
 
-    let messages: Vec<protocol::InboundMessage> = queued
-        .into_iter()
-        .filter_map(|row| {
-            let envelope = match serde_json::from_str(&row.envelope_json) {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(
-                        message_id = row.message_id,
-                        "malformed queued envelope: {e}"
-                    );
-                    return None;
-                }
-            };
-            let sender_id = match protocol::UserId::new(&row.sender_id) {
-                Ok(id) => id,
-                Err(e) => {
-                    warn!(message_id = row.message_id, "invalid sender_id: {e}");
-                    return None;
-                }
-            };
-            let message_id = match uuid::Uuid::parse_str(&row.message_id) {
-                Ok(uuid) => protocol::MessageId::from(uuid),
-                Err(e) => {
-                    warn!(message_id = row.message_id, "invalid message_id: {e}");
-                    return None;
-                }
-            };
-            // Parse SQLite datetime string to unix timestamp
-            let timestamp = parse_sqlite_datetime(&row.created_at);
-            Some(protocol::InboundMessage {
-                message_id,
-                sender_id,
-                envelope,
-                timestamp,
-            })
-        })
-        .collect();
+    while visited < consts::MAX_QUEUED_MESSAGES {
+        let row = match db::queue::get_next_pending(&state.db, user_id, cursor).await {
+            Ok(Some(row)) => row,
+            Ok(None) => break,
+            Err(error) => {
+                warn!(user_id, "failed to fetch queued message: {error}");
+                return;
+            }
+        };
+        cursor = row.row_id;
+        visited += 1;
 
-    if !messages.is_empty() {
-        // Group message IDs by sender for delivery receipts
-        let mut delivery_by_sender: std::collections::HashMap<String, Vec<protocol::MessageId>> =
-            std::collections::HashMap::new();
-        for msg in &messages {
-            delivery_by_sender
-                .entry(msg.sender_id.as_str().to_owned())
-                .or_default()
-                .push(msg.message_id.clone());
+        let message = match queued_row_to_inbound(&row) {
+            Ok(message) => message,
+            Err(error) => {
+                warn!(
+                    message_id = row.message_id,
+                    "invalid queued message: {error}"
+                );
+                remove_invalid_queued_row(state, user_id, row.row_id).await;
+                continue;
+            }
+        };
+        let item_bytes = match serde_json::to_vec(&message) {
+            Ok(encoded) => encoded.len(),
+            Err(error) => {
+                warn!(user_id, "failed to size queued message: {error}");
+                remove_invalid_queued_row(state, user_id, row.row_id).await;
+                continue;
+            }
+        };
+        let separator_bytes = usize::from(!page.is_empty());
+        if empty_page_bytes + item_bytes > consts::MAX_QUEUED_PAGE_BYTES {
+            warn!(
+                message_id = row.message_id,
+                "queued message exceeds WebSocket page limit"
+            );
+            remove_invalid_queued_row(state, user_id, row.row_id).await;
+            continue;
+        }
+        let page_full = page.len() >= consts::MAX_QUEUED_MESSAGES_PER_PAGE
+            || page_bytes + separator_bytes + item_bytes > consts::MAX_QUEUED_PAGE_BYTES;
+
+        if page_full {
+            if !send_queued_page(state, tx, std::mem::take(&mut page)).await {
+                return;
+            }
+            page_bytes = empty_page_bytes;
         }
 
-        if tx
-            .try_send(ServerMessage::QueuedMessages { messages })
-            .is_ok()
-        {
-            // Server-generated delivery receipts for queued messages — notify original senders
-            for (sender, ids) in delivery_by_sender {
-                state.connections.send_to(
-                    &sender,
-                    ServerMessage::MessageDelivered { message_ids: ids },
-                );
-            }
+        page_bytes += usize::from(!page.is_empty()) + item_bytes;
+        page.push(message);
+    }
+
+    if !page.is_empty() {
+        let _ = send_queued_page(state, tx, page).await;
+    }
+}
+
+pub(crate) async fn deliver_queued_receipts(
+    state: &AppState,
+    tx: &mpsc::Sender<ServerMessage>,
+    user_id: &str,
+) {
+    let receipts = load_queued_receipts(state, user_id)
+        .await
+        .unwrap_or_default();
+    for receipt in receipts {
+        let Some(message) = queued_receipt_to_message(&receipt) else {
+            remove_invalid_receipt(state, user_id, &receipt.receipt_id).await;
+            continue;
+        };
+        if tx.send(message).await.is_err() {
+            return;
         }
     }
+    deliver_receipt_confirmations(state, tx, user_id).await;
+}
+
+async fn deliver_receipt_confirmations(
+    state: &AppState,
+    tx: &mpsc::Sender<ServerMessage>,
+    user_id: &str,
+) {
+    let receipt_ids = load_receipt_confirmations(state, user_id)
+        .await
+        .unwrap_or_default();
+    for receipt_id in receipt_ids {
+        let Ok(receipt_id) = uuid::Uuid::parse_str(&receipt_id) else {
+            continue;
+        };
+        if tx
+            .send(ServerMessage::ReadReceiptSent {
+                receipt_id: receipt_id.into(),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+async fn load_receipt_confirmations(state: &AppState, user_id: &str) -> Option<Vec<String>> {
+    match db::receipts::confirmed_for_sender(&state.db, user_id).await {
+        Ok(receipt_ids) => Some(receipt_ids),
+        Err(error) => {
+            warn!(
+                user_id,
+                "failed to fetch read receipt confirmations: {error}"
+            );
+            None
+        }
+    }
+}
+
+async fn load_queued_receipts(
+    state: &AppState,
+    user_id: &str,
+) -> Option<Vec<db::receipts::QueuedReceipt>> {
+    match db::receipts::pending(&state.db, user_id).await {
+        Ok(receipts) => Some(receipts),
+        Err(error) => {
+            warn!(user_id, "failed to fetch queued read receipts: {error}");
+            None
+        }
+    }
+}
+
+fn queued_receipt_to_message(receipt: &db::receipts::QueuedReceipt) -> Option<ServerMessage> {
+    let receipt_id = uuid::Uuid::parse_str(&receipt.receipt_id).ok()?;
+    let sender_id = protocol::UserId::new(&receipt.sender_id).ok()?;
+    let envelope = serde_json::from_str(&receipt.envelope).ok()?;
+    super::message::validate_envelope(&envelope).ok()?;
+    Some(ServerMessage::IncomingReadReceipt {
+        sender_id,
+        receipt_id: receipt_id.into(),
+        envelope,
+    })
+}
+
+async fn remove_invalid_receipt(state: &AppState, user_id: &str, receipt_id: &str) {
+    if let Err(error) = db::receipts::delete_invalid(&state.db, user_id, receipt_id).await {
+        warn!(
+            user_id,
+            receipt_id, "failed to remove invalid queued read receipt: {error}"
+        );
+    }
+}
+
+async fn remove_invalid_queued_row(state: &AppState, user_id: &str, row_id: i64) {
+    if let Err(error) = db::queue::delete_invalid_row(&state.db, user_id, row_id).await {
+        warn!(
+            user_id,
+            row_id, "failed to remove invalid queued message: {error}"
+        );
+    }
+}
+
+async fn send_queued_page(
+    state: &AppState,
+    tx: &mpsc::Sender<ServerMessage>,
+    messages: Vec<protocol::InboundMessage>,
+) -> bool {
+    let mut delivery_by_sender: std::collections::HashMap<String, Vec<protocol::MessageId>> =
+        std::collections::HashMap::new();
+    for message in &messages {
+        delivery_by_sender
+            .entry(message.sender_id.as_str().to_owned())
+            .or_default()
+            .push(message.message_id.clone());
+    }
+
+    if tx
+        .send(ServerMessage::QueuedMessages { messages })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    for (sender, ids) in delivery_by_sender {
+        state.connections.send_to(
+            &sender,
+            ServerMessage::MessageDelivered { message_ids: ids },
+        );
+    }
+    true
+}
+
+fn queued_row_to_inbound(row: &db::queue::QueuedRow) -> anyhow::Result<protocol::InboundMessage> {
+    let envelope = serde_json::from_str(&row.envelope_json)?;
+    super::message::validate_envelope(&envelope).map_err(anyhow::Error::msg)?;
+    let sender_id = protocol::UserId::new(&row.sender_id)?;
+    let message_id = protocol::MessageId::from(uuid::Uuid::parse_str(&row.message_id)?);
+    Ok(protocol::InboundMessage {
+        message_id,
+        sender_id,
+        envelope,
+        timestamp: parse_sqlite_datetime(&row.created_at),
+    })
 }
 
 /// Parse `SQLite` `datetime('now')` format (`YYYY-MM-DD HH:MM:SS`) to unix timestamp.
@@ -323,4 +468,37 @@ fn parse_sqlite_datetime(s: &str) -> u64 {
         + min * 60
         + sec) as u64;
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_invalid_envelope_is_rejected_before_delivery() {
+        let envelope = protocol::EncryptedEnvelope {
+            version: 1,
+            header: protocol::types::MessageHeader::Ratchet(protocol::types::RatchetHeader {
+                ratchet_key: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    [0_u8; 31],
+                ),
+                previous_chain_length: 0,
+                message_number: 0,
+            }),
+            ciphertext: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                b"opaque",
+            ),
+        };
+        let row = db::queue::QueuedRow {
+            row_id: 1,
+            message_id: uuid::Uuid::new_v4().to_string(),
+            sender_id: "alice".to_owned(),
+            envelope_json: serde_json::to_string(&envelope).unwrap(),
+            created_at: "2026-08-12 00:00:00".to_owned(),
+        };
+
+        assert!(queued_row_to_inbound(&row).is_err());
+    }
 }

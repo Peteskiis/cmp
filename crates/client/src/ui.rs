@@ -20,7 +20,7 @@ pub(crate) const ACCENT_COLOR: Color = Color::Rgb(34, 199, 168);
 const PLACEHOLDER_COLOR: Color = Color::Rgb(90, 90, 90);
 
 /// RAII guard that restores the terminal on drop.
-pub struct RawModeGuard;
+pub(crate) struct RawModeGuard;
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
@@ -41,10 +41,10 @@ impl Drop for RawModeGuard {
     }
 }
 
-pub type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
+pub(crate) type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
 /// Set up the inline terminal viewport.
-pub fn init() -> anyhow::Result<(Term, RawModeGuard)> {
+pub(crate) fn init() -> anyhow::Result<(Term, RawModeGuard)> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(stdout(), crossterm::event::DisableBracketedPaste);
@@ -81,7 +81,7 @@ pub fn init() -> anyhow::Result<(Term, RawModeGuard)> {
 
 /// Wrap input text for the input widget using character-level wrapping.
 /// Returns `(visual_lines, line_start_char_indices)`.
-pub fn wrap_input(input: &str, max_cols: usize) -> (Vec<String>, Vec<usize>) {
+pub(crate) fn wrap_input(input: &str, max_cols: usize) -> (Vec<String>, Vec<usize>) {
     if max_cols == 0 {
         return (vec![input.to_owned()], vec![0]);
     }
@@ -115,7 +115,7 @@ pub fn wrap_input(input: &str, max_cols: usize) -> (Vec<String>, Vec<usize>) {
 }
 
 /// Map a cursor char index to visual `(row, col)`.
-pub fn cursor_visual_pos(cursor_pos: usize, line_starts: &[usize]) -> (usize, usize) {
+pub(crate) fn cursor_visual_pos(cursor_pos: usize, line_starts: &[usize]) -> (usize, usize) {
     for (i, &start) in line_starts.iter().enumerate().rev() {
         if cursor_pos >= start {
             return (i, cursor_pos - start);
@@ -125,7 +125,12 @@ pub fn cursor_visual_pos(cursor_pos: usize, line_starts: &[usize]) -> (usize, us
 }
 
 /// Map visual `(row, col)` back to a cursor char index.
-pub fn visual_to_cursor(row: usize, col: usize, line_starts: &[usize], lines: &[String]) -> usize {
+pub(crate) fn visual_to_cursor(
+    row: usize,
+    col: usize,
+    line_starts: &[usize],
+    lines: &[String],
+) -> usize {
     if row >= lines.len() {
         let last = lines.len() - 1;
         return line_starts[last] + lines[last].chars().count();
@@ -136,7 +141,7 @@ pub fn visual_to_cursor(row: usize, col: usize, line_starts: &[usize], lines: &[
 
 /// Maximum number of input lines visible in the viewport.
 /// Viewport rows minus spacer, status bar, top padding, bottom padding, and footer (5 rows).
-pub const fn max_visible_input_lines() -> usize {
+pub(crate) const fn max_visible_input_lines() -> usize {
     (INPUT_HEIGHT as usize).saturating_sub(5)
 }
 
@@ -224,7 +229,7 @@ fn chat_entry_to_lines(
 
 /// Flush chat entries that exceed the visible area to terminal scrollback.
 #[allow(clippy::cast_possible_truncation)]
-pub fn flush_chat_to_scrollback(
+pub(crate) fn flush_chat_to_scrollback(
     terminal: &mut Term,
     history: &mut Vec<crate::app::ChatEntry>,
     max_chat_rows: usize,
@@ -285,7 +290,7 @@ pub fn flush_chat_to_scrollback(
     clippy::too_many_arguments,
     clippy::cognitive_complexity
 )]
-pub fn draw_input(
+pub(crate) fn draw_input(
     terminal: &mut Term,
     history: &[crate::app::ChatEntry],
     input_lines: &[String],

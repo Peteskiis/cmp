@@ -100,13 +100,13 @@ pub(crate) fn insert_message(
     direction: MessageDirection,
     message_id: &str,
     body: &str,
-) -> anyhow::Result<()> {
-    conn.execute(
+) -> anyhow::Result<bool> {
+    let changed = conn.execute(
         "INSERT OR IGNORE INTO messages (peer_id, direction, message_id, body)
          VALUES (?1, ?2, ?3, ?4)",
         params![peer_id, direction as u8, message_id, body],
     )?;
-    Ok(())
+    Ok(changed > 0)
 }
 
 /// Result of storing a peer's identity key — indicates whether it changed.

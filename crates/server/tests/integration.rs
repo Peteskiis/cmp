@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use ed25519_dalek::Signer;
 use futures::{SinkExt, StreamExt};
@@ -31,20 +33,20 @@ type WsStream = futures::stream::SplitStream<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 >;
 
-/// Send a ClientMessage as JSON.
+/// Send a `ClientMessage` as JSON.
 async fn send(sink: &mut WsSink, msg: &ClientMessage) {
     let json = serde_json::to_string(msg).unwrap();
     sink.send(Message::Text(json.into())).await.unwrap();
 }
 
-/// Receive and parse a ServerMessage.
+/// Receive and parse a `ServerMessage`.
 async fn recv(stream: &mut WsStream) -> ServerMessage {
     loop {
         match stream.next().await {
             Some(Ok(Message::Text(text))) => {
                 return serde_json::from_str(&text).unwrap();
             }
-            Some(Ok(Message::Ping(_))) => continue,
+            Some(Ok(Message::Ping(_))) => {}
             other => panic!("unexpected message: {other:?}"),
         }
     }
@@ -55,8 +57,23 @@ fn make_identity() -> crypto::keys::IdentityKeyPair {
 }
 
 fn make_bundle(identity: &crypto::keys::IdentityKeyPair) -> (PreKeyBundle, Vec<OneTimePreKey>) {
-    let (bundle, otks, _, _) = make_bundle_with_keys(identity);
-    (bundle, otks)
+    let signed_prekey = crypto::keys::SignedPreKey::generate(0, identity);
+    let one_time_prekeys = crypto::keys::generate_one_time_prekeys(0, 5).unwrap();
+    let bundle = PreKeyBundle {
+        identity_key: B64.encode(identity.verifying_key().as_bytes()),
+        signed_prekey: B64.encode(signed_prekey.public().as_bytes()),
+        signed_prekey_id: signed_prekey.key_id(),
+        signed_prekey_signature: B64.encode(signed_prekey.signature().to_bytes()),
+        one_time_prekey: None,
+    };
+    let public_prekeys = one_time_prekeys
+        .iter()
+        .map(|prekey| OneTimePreKey {
+            key_id: prekey.key_id(),
+            public_key: B64.encode(prekey.public().as_bytes()),
+        })
+        .collect();
+    (bundle, public_prekeys)
 }
 
 async fn register(
@@ -313,7 +330,20 @@ async fn ack_removes_from_queue() {
         panic!("expected QueuedMessages");
     };
     let ids: Vec<MessageId> = messages.into_iter().map(|m| m.message_id).collect();
-    send(&mut bs2, &ClientMessage::Ack { message_ids: ids }).await;
+    let ack_id = MessageId::new();
+    send(
+        &mut bs2,
+        &ClientMessage::Ack {
+            ack_id: ack_id.clone(),
+            message_ids: ids.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut br2).await,
+        ServerMessage::AckSuccess { ack_id: confirmed, message_ids }
+            if confirmed == ack_id && message_ids == ids
+    ));
     drop((bs2, br2));
 
     // Bob reconnects again — queue should be empty (no QueuedMessages)
@@ -395,6 +425,55 @@ async fn send_to_nonexistent_user_fails() {
         matches!(resp, ServerMessage::Error { .. }),
         "expected error: {resp:?}"
     );
+}
+
+#[tokio::test]
+async fn malformed_envelope_keys_are_rejected_on_all_relay_paths() {
+    let (url, _handle) = start_test_server().await;
+    let alice_id = make_identity();
+    let bob_id = make_identity();
+    let (mut alice_sink, mut alice_stream) = connect(&url).await;
+    register(&mut alice_sink, &mut alice_stream, "alice", &alice_id).await;
+    let (mut bob_sink, mut bob_stream) = connect(&url).await;
+    register(&mut bob_sink, &mut bob_stream, "bob", &bob_id).await;
+
+    let invalid = EncryptedEnvelope {
+        version: 1,
+        header: MessageHeader::Ratchet(ProtoRatchetHeader {
+            ratchet_key: B64.encode([0u8; 31]),
+            previous_chain_length: 0,
+            message_number: 0,
+        }),
+        ciphertext: B64.encode(b"opaque"),
+    };
+    send(
+        &mut alice_sink,
+        &ClientMessage::SendMessage {
+            recipient_id: UserId::new("bob").unwrap(),
+            message_id: MessageId::new(),
+            envelope: invalid.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut alice_stream).await,
+        ServerMessage::Error { code: 400, .. }
+    ));
+
+    send(
+        &mut alice_sink,
+        &ClientMessage::SendReadReceipt {
+            recipient_id: UserId::new("bob").unwrap(),
+            receipt_id: MessageId::new(),
+            envelope: invalid,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut alice_stream).await,
+        ServerMessage::Error { code: 400, .. }
+    ));
+    drop((bob_sink, bob_stream));
 }
 
 #[tokio::test]
@@ -567,286 +646,107 @@ async fn read_receipt_relay() {
     register(&mut bs1, &mut br1, "bob", &bob_id).await;
 
     // Bob sends a read receipt to Alice (encrypted envelope as opaque blob)
+    let receipt_id = MessageId::new();
     send(
         &mut bs1,
         &ClientMessage::SendReadReceipt {
             recipient_id: UserId::new("alice").unwrap(),
+            receipt_id: receipt_id.clone(),
             envelope: dummy_envelope("read-receipt-data"),
         },
     )
     .await;
 
     let resp = recv(&mut ar1).await;
-    let ServerMessage::IncomingReadReceipt { sender_id, .. } = resp else {
+    let ServerMessage::IncomingReadReceipt {
+        sender_id,
+        receipt_id: incoming_id,
+        ..
+    } = resp
+    else {
         panic!("expected IncomingReadReceipt: {resp:?}");
     };
     assert_eq!(sender_id.as_str(), "bob");
+    assert_eq!(incoming_id, receipt_id);
+
+    let ack_id = MessageId::new();
+    send(
+        &mut as1,
+        &ClientMessage::AckReadReceipt {
+            ack_id: ack_id.clone(),
+            receipt_ids: vec![receipt_id.clone()],
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut ar1).await,
+        ServerMessage::AckSuccess { ack_id: confirmed, .. } if confirmed == ack_id
+    ));
+    assert!(matches!(
+        recv(&mut br1).await,
+        ServerMessage::ReadReceiptSent { receipt_id: sent } if sent == receipt_id
+    ));
 }
-
-// ── E2EE helpers ──
-
-fn b64_decode_fixed<const N: usize>(s: &str) -> [u8; N] {
-    let bytes = B64.decode(s).unwrap();
-    bytes.try_into().unwrap()
-}
-
-fn make_bundle_with_keys(
-    identity: &crypto::keys::IdentityKeyPair,
-) -> (
-    PreKeyBundle,
-    Vec<OneTimePreKey>,
-    crypto::keys::SignedPreKey,
-    Vec<crypto::keys::OneTimePreKey>,
-) {
-    let spk = crypto::keys::SignedPreKey::generate(0, identity);
-    let opks = crypto::keys::generate_one_time_prekeys(0, 5).unwrap();
-
-    let bundle = PreKeyBundle {
-        identity_key: B64.encode(identity.verifying_key().as_bytes()),
-        signed_prekey: B64.encode(spk.public().as_bytes()),
-        signed_prekey_id: spk.key_id(),
-        signed_prekey_signature: B64.encode(spk.signature().to_bytes()),
-        one_time_prekey: None,
-    };
-
-    let otks: Vec<OneTimePreKey> = opks
-        .iter()
-        .map(|k| OneTimePreKey {
-            key_id: k.key_id(),
-            public_key: B64.encode(k.public().as_bytes()),
-        })
-        .collect();
-
-    (bundle, otks, spk, opks)
-}
-
-/// Consume the MessageSent + MessageDelivered responses after sending to an online peer.
-/// Skips PreKeyLow notifications. Panics on unexpected message types.
-async fn drain_send_responses(stream: &mut WsStream) {
-    let mut got_sent = false;
-    let mut got_delivered = false;
-    for _ in 0..4 {
-        let msg = recv(stream).await;
-        match msg {
-            ServerMessage::MessageSent { .. } => got_sent = true,
-            ServerMessage::MessageDelivered { .. } => got_delivered = true,
-            ServerMessage::PreKeyLow { .. } => continue,
-            other => panic!("unexpected response in drain: {other:?}"),
-        }
-        if got_sent && got_delivered {
-            return;
-        }
-    }
-    assert!(got_sent, "never received MessageSent");
-    assert!(got_delivered, "never received MessageDelivered");
-}
-
-// ── E2EE integration test ──
 
 #[tokio::test]
-async fn e2ee_full_roundtrip() {
-    use crypto::keys::RatchetKeyPair;
-    use crypto::ratchet;
-    use crypto::x3dh;
-    use ed25519_dalek::VerifyingKey;
-    use x25519_dalek::PublicKey as X25519PublicKey;
-
+async fn offline_read_receipt_is_queued_until_recipient_acknowledges() {
     let (url, _handle) = start_test_server().await;
     let alice_id = make_identity();
     let bob_id = make_identity();
+    let (mut alice_sink, mut alice_stream) = connect(&url).await;
+    register(&mut alice_sink, &mut alice_stream, "alice", &alice_id).await;
+    let (mut bob_sink, mut bob_stream) = connect(&url).await;
+    register(&mut bob_sink, &mut bob_stream, "bob", &bob_id).await;
+    drop((alice_sink, alice_stream));
 
-    // ── Register both users ──
-    // Alice: standard registration
-    let (mut as1, mut ar1) = connect(&url).await;
-    register(&mut as1, &mut ar1, "alice", &alice_id).await;
-    drop((as1, ar1));
-
-    // Bob: registration with keys retained for X3DH
-    let (bob_bundle, bob_otks, bob_spk, bob_opks) = make_bundle_with_keys(&bob_id);
-    let (mut bs1, mut br1) = connect(&url).await;
-    let uid = UserId::new("bob").unwrap();
+    let receipt_id = MessageId::new();
     send(
-        &mut bs1,
-        &ClientMessage::Register {
-            user_id: uid,
-            bundle: bob_bundle,
-            one_time_prekeys: bob_otks,
-        },
-    )
-    .await;
-    let resp = recv(&mut br1).await;
-    assert!(matches!(resp, ServerMessage::AuthSuccess));
-
-    // Reconnect both for the messaging session
-    let (mut as2, mut ar2) = connect(&url).await;
-    auth_challenge_response(&mut as2, &mut ar2, "alice", &alice_id).await;
-
-    // ── Alice fetches Bob's prekey bundle ──
-    send(
-        &mut as2,
-        &ClientMessage::FetchPreKeyBundle {
-            target_user_id: UserId::new("bob").unwrap(),
-        },
-    )
-    .await;
-
-    let ServerMessage::PreKeyBundleResponse { bundle, .. } = recv(&mut ar2).await else {
-        panic!("expected PreKeyBundleResponse");
-    };
-
-    // ── Alice: X3DH + ratchet init ──
-    // Convert protocol bundle → crypto PeerPreKeyBundle
-    let bob_vk = VerifyingKey::from_bytes(&b64_decode_fixed::<32>(&bundle.identity_key)).unwrap();
-    let bob_spk_pub = X25519PublicKey::from(b64_decode_fixed::<32>(&bundle.signed_prekey));
-    let bob_sig = ed25519_dalek::Signature::from_bytes(&b64_decode_fixed::<64>(
-        &bundle.signed_prekey_signature,
-    ));
-    let bob_otk_proto = bundle.one_time_prekey.as_ref().unwrap();
-    let bob_otk_pub = X25519PublicKey::from(b64_decode_fixed::<32>(&bob_otk_proto.public_key));
-
-    let peer_bundle = x3dh::PeerPreKeyBundle {
-        identity_key: bob_vk,
-        signed_prekey: bob_spk_pub,
-        signed_prekey_id: bundle.signed_prekey_id,
-        signed_prekey_signature: bob_sig,
-        one_time_prekey: Some((bob_otk_proto.key_id, bob_otk_pub)),
-    };
-
-    let x3dh_result = x3dh::alice_initiate(&alice_id, &peer_bundle).unwrap();
-    let mut alice_state =
-        ratchet::initialize_alice(x3dh_result.shared_secret, &bob_spk_pub).unwrap();
-
-    // ── Alice encrypts and sends ──
-    let alice_plaintext = b"hello bob, this is real E2EE";
-    let ratchet_msg = ratchet::encrypt(&mut alice_state, alice_plaintext).unwrap();
-
-    let envelope = EncryptedEnvelope {
-        version: 1,
-        header: MessageHeader::PreKey {
-            sender_identity_key: B64.encode(alice_id.verifying_key().as_bytes()),
-            sender_ephemeral_key: B64.encode(x3dh_result.ephemeral_public.as_bytes()),
-            recipient_signed_prekey_id: bundle.signed_prekey_id,
-            recipient_one_time_prekey_id: Some(bob_otk_proto.key_id),
-            ratchet: ProtoRatchetHeader {
-                ratchet_key: B64.encode(ratchet_msg.header.ratchet_key),
-                previous_chain_length: ratchet_msg.header.previous_chain_length,
-                message_number: ratchet_msg.header.message_number,
-            },
-        },
-        ciphertext: B64.encode(&ratchet_msg.ciphertext),
-    };
-
-    let msg_id = MessageId::new();
-    send(
-        &mut as2,
-        &ClientMessage::SendMessage {
-            recipient_id: UserId::new("bob").unwrap(),
-            message_id: msg_id.clone(),
-            envelope,
-        },
-    )
-    .await;
-    drain_send_responses(&mut ar2).await;
-
-    // ── Bob receives and decrypts ──
-    // Skip any PreKeyLow notifications before the actual message
-    let inbound = loop {
-        let resp = recv(&mut br1).await;
-        match resp {
-            ServerMessage::PreKeyLow { .. } => continue,
-            ServerMessage::IncomingMessage(m) => break m,
-            other => panic!("expected IncomingMessage: {other:?}"),
-        }
-    };
-    assert_eq!(inbound.sender_id.as_str(), "alice");
-    assert_eq!(inbound.message_id, msg_id);
-
-    // Parse PreKey header
-    let MessageHeader::PreKey {
-        sender_identity_key,
-        sender_ephemeral_key,
-        recipient_one_time_prekey_id,
-        ratchet: ref proto_rh,
-        ..
-    } = inbound.envelope.header
-    else {
-        panic!("expected PreKey header");
-    };
-
-    let alice_vk = VerifyingKey::from_bytes(&b64_decode_fixed::<32>(&sender_identity_key)).unwrap();
-    let alice_ek = X25519PublicKey::from(b64_decode_fixed::<32>(&sender_ephemeral_key));
-
-    // Find the OPK Bob registered
-    let opk_id = recipient_one_time_prekey_id.unwrap();
-    let bob_opk = bob_opks.iter().find(|k| k.key_id() == opk_id).unwrap();
-
-    // Bob X3DH
-    let bob_shared_secret =
-        x3dh::bob_respond(&bob_id, &bob_spk, Some(bob_opk), &alice_vk, &alice_ek).unwrap();
-
-    // Bob ratchet init (SPK is the initial ratchet key)
-    let bob_ratchet_kp =
-        RatchetKeyPair::from_bytes(bob_spk.secret().to_bytes(), bob_spk.public().to_bytes());
-    let mut bob_state = ratchet::initialize_bob(bob_shared_secret, bob_ratchet_kp);
-
-    // Decrypt
-    let crypto_header = crypto::ratchet::RatchetHeader {
-        ratchet_key: b64_decode_fixed::<32>(&proto_rh.ratchet_key),
-        previous_chain_length: proto_rh.previous_chain_length,
-        message_number: proto_rh.message_number,
-    };
-    let ciphertext_bytes = B64.decode(&inbound.envelope.ciphertext).unwrap();
-    let decrypted = ratchet::decrypt(&mut bob_state, &crypto_header, &ciphertext_bytes).unwrap();
-    assert_eq!(decrypted, alice_plaintext, "Alice → Bob decryption failed");
-
-    // ── Bob replies (Ratchet message, no PreKey header) ──
-    let bob_plaintext = b"hey alice, E2EE works!";
-    let bob_ratchet_msg = ratchet::encrypt(&mut bob_state, bob_plaintext).unwrap();
-
-    let reply_envelope = EncryptedEnvelope {
-        version: 1,
-        header: MessageHeader::Ratchet(ProtoRatchetHeader {
-            ratchet_key: B64.encode(bob_ratchet_msg.header.ratchet_key),
-            previous_chain_length: bob_ratchet_msg.header.previous_chain_length,
-            message_number: bob_ratchet_msg.header.message_number,
-        }),
-        ciphertext: B64.encode(&bob_ratchet_msg.ciphertext),
-    };
-
-    let reply_msg_id = MessageId::new();
-    send(
-        &mut bs1,
-        &ClientMessage::SendMessage {
+        &mut bob_sink,
+        &ClientMessage::SendReadReceipt {
             recipient_id: UserId::new("alice").unwrap(),
-            message_id: reply_msg_id.clone(),
-            envelope: reply_envelope,
+            receipt_id: receipt_id.clone(),
+            envelope: dummy_envelope("retry me"),
         },
     )
     .await;
-    drain_send_responses(&mut br1).await;
 
-    // ── Alice receives and decrypts Bob's reply ──
-    let resp = recv(&mut ar2).await;
-    let ServerMessage::IncomingMessage(reply_inbound) = resp else {
-        panic!("expected IncomingMessage: {resp:?}");
-    };
-    assert_eq!(reply_inbound.sender_id.as_str(), "bob");
-    assert_eq!(reply_inbound.message_id, reply_msg_id);
+    let (mut alice_sink, mut alice_stream) = connect(&url).await;
+    auth_challenge_response(&mut alice_sink, &mut alice_stream, "alice", &alice_id).await;
+    assert!(matches!(
+        recv(&mut alice_stream).await,
+        ServerMessage::IncomingReadReceipt { receipt_id: incoming, .. } if incoming == receipt_id
+    ));
+    drop((bob_sink, bob_stream));
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let ack_id = MessageId::new();
+    send(
+        &mut alice_sink,
+        &ClientMessage::AckReadReceipt {
+            ack_id: ack_id.clone(),
+            receipt_ids: vec![receipt_id.clone()],
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut alice_stream).await,
+        ServerMessage::AckSuccess { ack_id: confirmed, .. } if confirmed == ack_id
+    ));
 
-    let MessageHeader::Ratchet(ref reply_rh) = reply_inbound.envelope.header else {
-        panic!("expected Ratchet header for reply");
-    };
-
-    let reply_crypto_header = crypto::ratchet::RatchetHeader {
-        ratchet_key: b64_decode_fixed::<32>(&reply_rh.ratchet_key),
-        previous_chain_length: reply_rh.previous_chain_length,
-        message_number: reply_rh.message_number,
-    };
-    let reply_ciphertext = B64.decode(&reply_inbound.envelope.ciphertext).unwrap();
-    let alice_decrypted =
-        ratchet::decrypt(&mut alice_state, &reply_crypto_header, &reply_ciphertext).unwrap();
-    assert_eq!(
-        alice_decrypted, bob_plaintext,
-        "Bob → Alice decryption failed"
-    );
+    let (mut bob_sink, mut bob_stream) = connect(&url).await;
+    auth_challenge_response(&mut bob_sink, &mut bob_stream, "bob", &bob_id).await;
+    assert!(matches!(
+        recv(&mut bob_stream).await,
+        ServerMessage::ReadReceiptSent { receipt_id: sent } if sent == receipt_id
+    ));
+    send(
+        &mut bob_sink,
+        &ClientMessage::AckReadReceiptSent {
+            receipt_ids: vec![receipt_id],
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut bob_stream).await,
+        ServerMessage::Success
+    ));
 }

@@ -1,10 +1,8 @@
-//! Client-side crypto manager: identity persistence, X3DH session init,
-//! Double Ratchet encrypt/decrypt, SPK/OPK/session persistence.
+//! Client-side identity, X3DH, Double Ratchet, and session persistence.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use crypto::keys::{IdentityKeyPair, OneTimePreKey, RatchetKeyPair, SignedPreKey};
@@ -12,13 +10,22 @@ use crypto::ratchet::{self, RatchetHeader, RatchetMessage, SessionState};
 use crypto::x3dh::{self, PeerPreKeyBundle};
 use ed25519_dalek::VerifyingKey;
 use protocol::types::{EncryptedEnvelope, MessageHeader, RatchetHeader as ProtoRatchetHeader};
+use protocol::{ClientMessage, MessageId, UserId};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 use x25519_dalek::PublicKey as X25519PublicKey;
+
+use crate::crypto_decode::{b64_decode_fixed, decode_ratchet_header};
+use crate::crypto_outbox::{PendingOutbound, ensure_capacity};
+use crate::crypto_replay::{ProcessedMessage, now_secs, prune_processed, validate_peer_ids};
+use crate::crypto_store;
+
+#[path = "crypto_mgr_persistence.rs"]
+mod persistence;
+use persistence::{decode_stored_opks, decode_stored_spk, restore_entry};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum CryptoError {
+pub(crate) enum CryptoError {
     #[error("invalid pre-key bundle")]
     BadBundle,
     #[error("invalid envelope")]
@@ -31,6 +38,12 @@ pub enum CryptoError {
     NoSession,
     #[error("decryption failed")]
     DecryptFailed,
+    #[error("cryptographic state could not be persisted")]
+    Persistence(#[source] anyhow::Error),
+    #[error("durable message queue is full")]
+    OutboxFull,
+    #[error("processed-message ledger is full")]
+    ReplayLedgerFull,
 }
 
 #[derive(Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
@@ -48,41 +61,60 @@ struct StoredOpk {
     public_bytes: [u8; 32],
 }
 
-/// X3DH data needed for the `PreKey` header on the first message.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct StoredX3dhResult {
     ephemeral_public: [u8; 32],
     recipient_signed_prekey_id: u32,
     recipient_one_time_prekey_id: Option<u32>,
 }
 
-pub struct CryptoManager {
+#[derive(Clone, Serialize, Deserialize)]
+struct PeerSession {
+    ratchet: SessionState,
+    prekey_header: Option<StoredX3dhResult>,
+}
+
+pub(crate) enum InboundDecrypt {
+    Pending(String),
+    Duplicate,
+    Failed,
+}
+
+#[derive(Default, Deserialize)]
+struct CoreState {
+    signed_prekey: Option<StoredSpk>,
+    one_time_prekeys: Vec<StoredOpk>,
+    sessions: HashMap<String, PeerSession>,
+}
+
+#[derive(Serialize)]
+struct CoreStateRef<'a> {
+    signed_prekey: Option<StoredSpk>,
+    one_time_prekeys: Vec<StoredOpk>,
+    sessions: &'a HashMap<String, PeerSession>,
+}
+
+pub(crate) struct CryptoManager {
     identity: IdentityKeyPair,
-    sessions: HashMap<String, SessionState>,
+    sessions: HashMap<String, PeerSession>,
     pending_inits: HashSet<String>,
-    prekey_headers: HashMap<String, StoredX3dhResult>,
     stored_spk: Option<SignedPreKey>,
     stored_opks: HashMap<u32, OneTimePreKey>,
-    data_dir: PathBuf,
+    pending_outbound: Vec<PendingOutbound>,
+    processed_messages: HashMap<String, HashMap<String, ProcessedMessage>>,
+    store: crypto_store::CryptoStore,
+    fail_persistence: bool,
 }
 
 impl CryptoManager {
     /// Load or generate identity, SPK, OPKs, and sessions from `data_dir`.
-    pub fn load_or_generate(data_dir: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn load_or_generate(data_dir: &Path) -> anyhow::Result<Self> {
         fs::create_dir_all(data_dir)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700))?;
         }
-        let sessions_dir = data_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o700))?;
-        }
-
         let key_path = data_dir.join("identity.key");
         let identity = if key_path.exists() {
             let bytes = fs::read(&key_path)?;
@@ -92,91 +124,103 @@ impl CryptoManager {
             IdentityKeyPair::from_bytes(&arr)
         } else {
             let ik = IdentityKeyPair::generate();
-            write_new_key_file(&key_path, &ik.to_bytes())?;
+            crypto_store::write_new(&key_path, &ik.to_bytes())?;
             ik
         };
 
-        let stored_spk = load_spk(data_dir);
-        let stored_opks = load_opks(data_dir);
-        let sessions = load_sessions(data_dir);
-        let prekey_headers = load_prekey_headers(data_dir);
+        let store = crypto_store::CryptoStore::open(&data_dir.join("crypto.db"))?;
+        let persisted: CoreState = store.load_core()?;
+        let pending_outbound = store.load_outbox()?;
+        let mut processed_messages: HashMap<String, HashMap<String, ProcessedMessage>> =
+            HashMap::new();
+        for row in store.load_processed()? {
+            processed_messages.entry(row.peer_id).or_default().insert(
+                row.message_id,
+                ProcessedMessage {
+                    pending_plaintext: row.pending_plaintext,
+                    processed_at: row.processed_at,
+                },
+            );
+        }
+        let stored_spk = decode_stored_spk(persisted.signed_prekey)?;
+        let stored_opks = decode_stored_opks(persisted.one_time_prekeys);
+        validate_peer_ids(&persisted.sessions)?;
+        validate_peer_ids(&processed_messages)?;
+        let cutoff = now_secs().saturating_sub(crate::crypto_replay::RETENTION_SECS);
+        store.prune_processed(cutoff)?;
+        prune_processed(&mut processed_messages, now_secs());
 
         Ok(Self {
             identity,
-            sessions,
+            sessions: persisted.sessions,
             pending_inits: HashSet::new(),
-            prekey_headers,
             stored_spk,
             stored_opks,
-            data_dir: data_dir.to_owned(),
+            pending_outbound,
+            processed_messages,
+            store,
+            fail_persistence: false,
         })
     }
 
-    /// Whether registration is needed (no SPK persisted locally).
-    pub const fn needs_registration(&self) -> bool {
+    pub(crate) const fn needs_registration(&self) -> bool {
         self.stored_spk.is_none()
     }
 
-    pub const fn identity(&self) -> &IdentityKeyPair {
+    pub(crate) const fn identity(&self) -> &IdentityKeyPair {
         &self.identity
     }
 
-    pub fn add_pending(&mut self, peer_id: &str) {
+    pub(crate) fn add_pending(&mut self, peer_id: &str) {
         self.pending_inits.insert(peer_id.to_owned());
     }
 
-    pub fn is_pending(&self, peer_id: &str) -> bool {
+    pub(crate) fn is_pending(&self, peer_id: &str) -> bool {
         self.pending_inits.contains(peer_id)
     }
 
+    pub(crate) fn pending_peers(&self) -> Vec<String> {
+        self.pending_inits.iter().cloned().collect()
+    }
+
     /// Store SPK and OPK private keys after registration.
-    pub fn persist_registration_keys(
+    pub(crate) fn persist_registration_keys(
         &mut self,
         spk: &SignedPreKey,
         opks: &[OneTimePreKey],
     ) -> anyhow::Result<()> {
-        let stored = StoredSpk {
-            key_id: spk.key_id(),
-            secret_bytes: spk.secret().to_bytes(),
-            public_bytes: spk.public().to_bytes(),
-            signature_b64: B64.encode(spk.signature().to_bytes()),
-        };
-        let json = serde_json::to_string(&stored)?;
-        write_key_file(&self.data_dir.join("spk.json"), json.as_bytes())?;
-        self.stored_spk = Some(SignedPreKey::from_parts(
-            stored.key_id,
-            stored.secret_bytes,
-            stored.public_bytes,
+        let new_spk = SignedPreKey::from_parts(
+            spk.key_id(),
+            spk.secret().to_bytes(),
+            spk.public().to_bytes(),
             *spk.signature(),
-        ));
-
-        let stored_opks: Vec<StoredOpk> = opks
+        );
+        let new_opks = opks
             .iter()
-            .map(|k| StoredOpk {
-                key_id: k.key_id(),
-                secret_bytes: k.secret().to_bytes(),
-                public_bytes: k.public().to_bytes(),
+            .map(|opk| {
+                (
+                    opk.key_id(),
+                    OneTimePreKey::from_parts(
+                        opk.key_id(),
+                        opk.secret().to_bytes(),
+                        opk.public().to_bytes(),
+                    ),
+                )
             })
             .collect();
-        let json = serde_json::to_string(&stored_opks)?;
-        write_key_file(&self.data_dir.join("opks.json"), json.as_bytes())?;
 
-        for opk in opks {
-            self.stored_opks.insert(
-                opk.key_id(),
-                OneTimePreKey::from_parts(
-                    opk.key_id(),
-                    opk.secret().to_bytes(),
-                    opk.public().to_bytes(),
-                ),
-            );
+        let previous_spk = self.stored_spk.replace(new_spk);
+        let previous_opks = std::mem::replace(&mut self.stored_opks, new_opks);
+        if let Err(error) = self.persist_state() {
+            self.stored_spk = previous_spk;
+            self.stored_opks = previous_opks;
+            return Err(error);
         }
-
         Ok(())
     }
 
     /// Initialize a session with a peer using their pre-key bundle (Alice's side).
-    pub fn init_session_from_bundle(
+    pub(crate) fn init_session_from_bundle(
         &mut self,
         peer_id: &str,
         bundle: &protocol::PreKeyBundle,
@@ -219,67 +263,262 @@ impl CryptoManager {
             recipient_signed_prekey_id: bundle.signed_prekey_id,
             recipient_one_time_prekey_id: opk.map(|(id, _)| id),
         };
-        self.prekey_headers.insert(peer_id.to_owned(), x3dh_data);
-        self.save_prekey_headers();
-
         let session = ratchet::initialize_alice(x3dh_result.shared_secret, &spk_public)
             .map_err(|_| CryptoError::RatchetFailed)?;
 
-        self.sessions.insert(peer_id.to_owned(), session);
+        let previous = self.sessions.insert(
+            peer_id.to_owned(),
+            PeerSession {
+                ratchet: session,
+                prekey_header: Some(x3dh_data),
+            },
+        );
+        if let Err(error) = self.persist_state() {
+            restore_entry(&mut self.sessions, peer_id, previous);
+            return Err(CryptoError::Persistence(error));
+        }
         self.pending_inits.remove(peer_id);
-        self.save_session(peer_id);
         Ok(())
     }
 
-    pub fn encrypt(
+    #[cfg(test)]
+    pub(crate) fn encrypt(
         &mut self,
         peer_id: &str,
         plaintext: &[u8],
     ) -> Result<EncryptedEnvelope, CryptoError> {
+        let (original, envelope) = self.advance_encryption(peer_id, plaintext)?;
+        if let Err(error) = self.persist_state() {
+            self.sessions.insert(peer_id.to_owned(), original);
+            return Err(CryptoError::Persistence(error));
+        }
+        Ok(envelope)
+    }
+
+    pub(crate) fn encrypt_message(
+        &mut self,
+        peer_id: &str,
+        recipient_id: &UserId,
+        message_id: &MessageId,
+        plaintext: &[u8],
+    ) -> Result<ClientMessage, CryptoError> {
+        ensure_capacity(&self.pending_outbound, plaintext.len())?;
+        let (original_session, envelope) = self.advance_encryption(peer_id, plaintext)?;
+        let pending = PendingOutbound::Message {
+            recipient_id: recipient_id.clone(),
+            message_id: message_id.clone(),
+            envelope,
+        };
+        self.pending_outbound.push(pending.clone());
+
+        if let Err(error) = self.persist_outbound(&pending) {
+            self.sessions.insert(peer_id.to_owned(), original_session);
+            self.pending_outbound.pop();
+            return Err(CryptoError::Persistence(error));
+        }
+        Ok(pending.to_client_message())
+    }
+
+    pub(crate) fn pending_messages(&self) -> Vec<ClientMessage> {
+        self.pending_outbound
+            .iter()
+            .map(PendingOutbound::to_client_message)
+            .collect()
+    }
+
+    pub(crate) fn confirm_message_sent(&mut self, message_id: &MessageId) -> anyhow::Result<()> {
+        let Some(index) = self.pending_outbound.iter().position(|pending| {
+            matches!(
+                pending,
+                PendingOutbound::Message { message_id: pending_id, .. }
+                    if pending_id == message_id
+            )
+        }) else {
+            return Ok(());
+        };
+        let pending = self.pending_outbound.remove(index);
+        if let Err(error) = self.store.delete_outbound(&message_id.to_string()) {
+            self.pending_outbound.insert(index, pending);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn confirm_read_receipt_sent(
+        &mut self,
+        receipt_id: &MessageId,
+    ) -> anyhow::Result<()> {
+        let Some(index) = self.pending_outbound.iter().position(|pending| {
+            matches!(
+                pending,
+                PendingOutbound::ReadReceipt { receipt_id: pending_id, .. }
+                    if pending_id == receipt_id
+            )
+        }) else {
+            return Ok(());
+        };
+        let pending = self.pending_outbound.remove(index);
+        if let Err(error) = self.store.delete_outbound(&receipt_id.to_string()) {
+            self.pending_outbound.insert(index, pending);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn confirm_acked(
+        &mut self,
+        ack_id: &MessageId,
+        message_ids: &[MessageId],
+    ) -> anyhow::Result<()> {
+        let Some(pending_index) = self.pending_outbound.iter().position(|pending| {
+            matches!(
+                pending,
+                PendingOutbound::Ack { ack_id: pending_id, .. }
+                    | PendingOutbound::ReadReceiptAck { ack_id: pending_id, .. }
+                    if pending_id == ack_id
+            )
+        }) else {
+            return Ok(());
+        };
+        let expected_ids = match &self.pending_outbound[pending_index] {
+            PendingOutbound::Ack { message_ids, .. } => message_ids.clone(),
+            PendingOutbound::ReadReceiptAck { receipt_ids, .. } => receipt_ids.clone(),
+            _ => return Ok(()),
+        };
+        if expected_ids != message_ids {
+            return Ok(());
+        }
+
+        let previous = self.processed_messages.clone();
+        let pending = self.pending_outbound.remove(pending_index);
+        for message_id in &expected_ids {
+            let key = message_id.to_string();
+            for messages in self.processed_messages.values_mut() {
+                messages.remove(&key);
+            }
+        }
+        self.processed_messages
+            .retain(|_, messages| !messages.is_empty());
+        let ids: Vec<String> = message_ids.iter().map(ToString::to_string).collect();
+        if let Err(error) = self.store.confirm_ack(&ack_id.to_string(), &ids) {
+            self.processed_messages = previous;
+            self.pending_outbound.insert(pending_index, pending);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn queue_ack(
+        &mut self,
+        message_ids: Vec<MessageId>,
+    ) -> Result<ClientMessage, CryptoError> {
+        ensure_capacity(&self.pending_outbound, message_ids.len() * 36)?;
+        let pending = PendingOutbound::Ack {
+            ack_id: MessageId::new(),
+            message_ids,
+        };
+        self.pending_outbound.push(pending.clone());
+        if let Err(error) = self.persist_outbound(&pending) {
+            self.pending_outbound.pop();
+            return Err(CryptoError::Persistence(error));
+        }
+        Ok(pending.to_client_message())
+    }
+
+    pub(crate) fn queue_read_receipt_ack(
+        &mut self,
+        receipt_ids: Vec<MessageId>,
+    ) -> Result<ClientMessage, CryptoError> {
+        ensure_capacity(&self.pending_outbound, receipt_ids.len() * 36)?;
+        let pending = PendingOutbound::ReadReceiptAck {
+            ack_id: MessageId::new(),
+            receipt_ids,
+        };
+        self.pending_outbound.push(pending.clone());
+        if let Err(error) = self.persist_outbound(&pending) {
+            self.pending_outbound.pop();
+            return Err(CryptoError::Persistence(error));
+        }
+        Ok(pending.to_client_message())
+    }
+
+    fn advance_encryption(
+        &mut self,
+        peer_id: &str,
+        plaintext: &[u8],
+    ) -> Result<(PeerSession, EncryptedEnvelope), CryptoError> {
+        let original = self
+            .sessions
+            .get(peer_id)
+            .cloned()
+            .ok_or(CryptoError::NoSession)?;
         let session = self
             .sessions
             .get_mut(peer_id)
             .ok_or(CryptoError::NoSession)?;
-
         let RatchetMessage { header, ciphertext } =
-            ratchet::encrypt(session, plaintext).map_err(|_| CryptoError::RatchetFailed)?;
-
-        let proto_header = if let Some(x3dh_data) = self.prekey_headers.remove(peer_id) {
-            self.save_prekey_headers();
+            ratchet::encrypt(&mut session.ratchet, plaintext)
+                .map_err(|_| CryptoError::RatchetFailed)?;
+        let proto_ratchet = ProtoRatchetHeader {
+            ratchet_key: B64.encode(header.ratchet_key),
+            previous_chain_length: header.previous_chain_length,
+            message_number: header.message_number,
+        };
+        let header = if let Some(x3dh_data) = session.prekey_header.take() {
             MessageHeader::PreKey {
                 sender_identity_key: B64.encode(self.identity.verifying_key().as_bytes()),
                 sender_ephemeral_key: B64.encode(x3dh_data.ephemeral_public),
                 recipient_signed_prekey_id: x3dh_data.recipient_signed_prekey_id,
                 recipient_one_time_prekey_id: x3dh_data.recipient_one_time_prekey_id,
-                ratchet: ProtoRatchetHeader {
-                    ratchet_key: B64.encode(header.ratchet_key),
-                    previous_chain_length: header.previous_chain_length,
-                    message_number: header.message_number,
-                },
+                ratchet: proto_ratchet,
             }
         } else {
-            MessageHeader::Ratchet(ProtoRatchetHeader {
-                ratchet_key: B64.encode(header.ratchet_key),
-                previous_chain_length: header.previous_chain_length,
-                message_number: header.message_number,
-            })
+            MessageHeader::Ratchet(proto_ratchet)
         };
-
-        self.save_session(peer_id);
-
-        Ok(EncryptedEnvelope {
-            version: 1,
-            header: proto_header,
-            ciphertext: B64.encode(ciphertext),
-        })
+        Ok((
+            original,
+            EncryptedEnvelope {
+                version: 1,
+                header,
+                ciphertext: B64.encode(ciphertext),
+            },
+        ))
     }
 
     #[allow(clippy::cognitive_complexity)]
-    pub fn decrypt(
+    #[cfg(test)]
+    pub(crate) fn decrypt(
         &mut self,
         peer_id: &str,
         envelope: &EncryptedEnvelope,
     ) -> Result<Vec<u8>, CryptoError> {
+        self.decrypt_with_marker(peer_id, envelope, None)
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    fn decrypt_with_marker(
+        &mut self,
+        peer_id: &str,
+        envelope: &EncryptedEnvelope,
+        processed_message_id: Option<&str>,
+    ) -> Result<Vec<u8>, CryptoError> {
+        self.check_persistence().map_err(CryptoError::Persistence)?;
+        let now = now_secs();
+        let cutoff = now.saturating_sub(crate::crypto_replay::RETENTION_SECS);
+        self.store
+            .prune_processed(cutoff)
+            .map_err(CryptoError::Persistence)?;
+        prune_processed(&mut self.processed_messages, now);
+        if processed_message_id.is_some()
+            && self
+                .processed_messages
+                .values()
+                .map(HashMap::len)
+                .sum::<usize>()
+                >= protocol::consts::MAX_PROCESSED_MESSAGES
+        {
+            return Err(CryptoError::ReplayLedgerFull);
+        }
         if let MessageHeader::PreKey {
             sender_identity_key,
             sender_ephemeral_key,
@@ -296,45 +535,42 @@ impl CryptoManager {
                 .decode(&envelope.ciphertext)
                 .map_err(|_| CryptoError::BadEnvelope)?;
 
-            // Now safe to create session — parsing already succeeded
-            let created_new = if self.sessions.contains_key(peer_id) {
-                false
-            } else {
-                self.try_bob_x3dh(
-                    peer_id,
-                    sender_identity_key,
-                    sender_ephemeral_key,
-                    *recipient_signed_prekey_id,
-                    *recipient_one_time_prekey_id,
-                )?;
-                true
-            };
+            if self.sessions.contains_key(peer_id) {
+                return self.decrypt_existing(peer_id, &header, &ct, processed_message_id);
+            }
 
-            let session = self
-                .sessions
-                .get_mut(peer_id)
-                .ok_or(CryptoError::NoSession)?;
-            let result = ratchet::decrypt(session, &header, &ct);
+            let mut session = self.create_bob_session(
+                sender_identity_key,
+                sender_ephemeral_key,
+                *recipient_signed_prekey_id,
+                *recipient_one_time_prekey_id,
+            )?;
+            let plaintext = ratchet::decrypt(&mut session, &header, &ct)
+                .map_err(|_| CryptoError::DecryptFailed)?;
 
-            if result.is_err() && created_new {
-                // Only remove sessions we just created — never destroy established ones
+            self.sessions.insert(
+                peer_id.to_owned(),
+                PeerSession {
+                    ratchet: session,
+                    prekey_header: None,
+                },
+            );
+            let consumed_opk = recipient_one_time_prekey_id
+                .and_then(|opk_id| self.stored_opks.remove(&opk_id).map(|opk| (opk_id, opk)));
+            let inserted_marker = processed_message_id
+                .is_some_and(|message_id| self.mark_processed(peer_id, message_id, &plaintext));
+
+            if let Err(error) = self.persist_decrypt(peer_id, processed_message_id) {
                 self.sessions.remove(peer_id);
-                self.remove_session_file(peer_id);
-                return Err(CryptoError::DecryptFailed);
-            }
-
-            if let Ok(ref _plaintext) = result {
-                // Save session FIRST — if we crash after this but before OPK
-                // consumption, the OPK stays on disk (harmless). The reverse
-                // (OPK consumed, session lost) would brick the peer.
-                self.save_session(peer_id);
-                if created_new && let Some(opk_id) = recipient_one_time_prekey_id {
-                    self.stored_opks.remove(opk_id);
-                    self.save_opks();
+                if let Some((opk_id, opk)) = consumed_opk {
+                    self.stored_opks.insert(opk_id, opk);
                 }
+                if inserted_marker {
+                    self.remove_processed(peer_id, processed_message_id.unwrap_or_default());
+                }
+                return Err(CryptoError::Persistence(error));
             }
-
-            return result.map_err(|_| CryptoError::DecryptFailed);
+            return Ok(plaintext);
         }
 
         // Normal ratchet message
@@ -342,37 +578,24 @@ impl CryptoManager {
             return Err(CryptoError::BadEnvelope);
         };
 
-        let session = self
-            .sessions
-            .get_mut(peer_id)
-            .ok_or(CryptoError::NoSession)?;
-
         let header = decode_ratchet_header(ratchet_header)?;
 
         let ciphertext = B64
             .decode(&envelope.ciphertext)
             .map_err(|_| CryptoError::BadEnvelope)?;
-        let result =
-            ratchet::decrypt(session, &header, &ciphertext).map_err(|_| CryptoError::DecryptFailed);
-
-        if result.is_ok() {
-            self.save_session(peer_id);
-        }
-
-        result
+        self.decrypt_existing(peer_id, &header, &ciphertext, processed_message_id)
     }
 
     /// Bob's X3DH: use stored SPK (and optionally OPK) to derive the shared secret.
     /// OPK is NOT consumed here — only after AEAD authentication succeeds.
     #[allow(clippy::similar_names)]
-    fn try_bob_x3dh(
-        &mut self,
-        peer_id: &str,
+    fn create_bob_session(
+        &self,
         sender_identity_key_b64: &str,
         sender_ephemeral_key_b64: &str,
         expected_spk_id: u32,
         opk_id: Option<u32>,
-    ) -> Result<(), CryptoError> {
+    ) -> Result<SessionState, CryptoError> {
         let spk = self.stored_spk.as_ref().ok_or(CryptoError::NoSession)?;
         // Validate the sender used the SPK we actually have
         if spk.key_id() != expected_spk_id {
@@ -397,49 +620,147 @@ impl CryptoManager {
         // Bob's initial ratchet key pair must be his SPK
         let bob_ratchet =
             RatchetKeyPair::from_bytes(spk.secret().to_bytes(), spk.public().to_bytes());
-        let session = ratchet::initialize_bob(bob_secret, bob_ratchet);
-        self.sessions.insert(peer_id.to_owned(), session);
-
-        Ok(())
+        Ok(ratchet::initialize_bob(bob_secret, bob_ratchet))
     }
 
-    /// Returns `(text, decrypted_ok)` — callers should only ack if `decrypted_ok`.
-    pub fn decrypt_to_text(
+    fn decrypt_existing(
         &mut self,
         peer_id: &str,
-        envelope: &EncryptedEnvelope,
-    ) -> (String, bool) {
-        match self.decrypt(peer_id, envelope) {
-            Ok(plaintext) => {
-                let text =
-                    String::from_utf8(plaintext).unwrap_or_else(|_| "[invalid utf-8]".to_owned());
-                (text, true)
+        header: &RatchetHeader,
+        ciphertext: &[u8],
+        processed_message_id: Option<&str>,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let original = self
+            .sessions
+            .get(peer_id)
+            .cloned()
+            .ok_or(CryptoError::NoSession)?;
+        let plaintext = {
+            let session = self
+                .sessions
+                .get_mut(peer_id)
+                .ok_or(CryptoError::NoSession)?;
+            ratchet::decrypt(&mut session.ratchet, header, ciphertext)
+                .map_err(|_| CryptoError::DecryptFailed)?
+        };
+        let inserted_marker = processed_message_id
+            .is_some_and(|message_id| self.mark_processed(peer_id, message_id, &plaintext));
+
+        if let Err(error) = self.persist_decrypt(peer_id, processed_message_id) {
+            self.sessions.insert(peer_id.to_owned(), original);
+            if inserted_marker {
+                self.remove_processed(peer_id, processed_message_id.unwrap_or_default());
             }
-            Err(_) => ("[undecryptable message]".to_owned(), false),
+            return Err(CryptoError::Persistence(error));
+        }
+        Ok(plaintext)
+    }
+
+    pub(crate) fn decrypt_message_to_text(
+        &mut self,
+        peer_id: &str,
+        message_id: &MessageId,
+        envelope: &EncryptedEnvelope,
+    ) -> InboundDecrypt {
+        let message_id = message_id.to_string();
+        if let Some(processed) = self
+            .processed_messages
+            .get(peer_id)
+            .and_then(|messages| messages.get(&message_id))
+        {
+            return processed
+                .pending_plaintext
+                .as_ref()
+                .map_or(InboundDecrypt::Duplicate, |text| {
+                    InboundDecrypt::Pending(text.clone())
+                });
+        }
+        match self.decrypt_with_marker(peer_id, envelope, Some(&message_id)) {
+            Ok(plaintext) => InboundDecrypt::Pending(
+                String::from_utf8(plaintext).unwrap_or_else(|_| "[invalid utf-8]".to_owned()),
+            ),
+            Err(_) => InboundDecrypt::Failed,
         }
     }
 
-    pub fn has_session(&self, peer_id: &str) -> bool {
+    pub(crate) fn confirm_inbound_stored(
+        &mut self,
+        peer_id: &str,
+        message_id: &MessageId,
+    ) -> anyhow::Result<()> {
+        let message_id = message_id.to_string();
+        let Some(processed) = self
+            .processed_messages
+            .get_mut(peer_id)
+            .and_then(|messages| messages.get_mut(&message_id))
+        else {
+            return Ok(());
+        };
+        let pending = processed.pending_plaintext.take();
+        if let Err(error) = self.store.mark_processed_committed(peer_id, &message_id) {
+            if let Some(processed) = self
+                .processed_messages
+                .get_mut(peer_id)
+                .and_then(|messages| messages.get_mut(&message_id))
+            {
+                processed.pending_plaintext = pending;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn mark_processed(&mut self, peer_id: &str, message_id: &str, plaintext: &[u8]) -> bool {
+        prune_processed(&mut self.processed_messages, now_secs());
+        self.processed_messages
+            .entry(peer_id.to_owned())
+            .or_default()
+            .insert(
+                message_id.to_owned(),
+                ProcessedMessage {
+                    pending_plaintext: Some(
+                        String::from_utf8(plaintext.to_vec())
+                            .unwrap_or_else(|_| "[invalid utf-8]".to_owned()),
+                    ),
+                    processed_at: now_secs(),
+                },
+            )
+            .is_none()
+    }
+
+    fn remove_processed(&mut self, peer_id: &str, message_id: &str) {
+        let remove_peer = self
+            .processed_messages
+            .get_mut(peer_id)
+            .is_some_and(|messages| {
+                messages.remove(message_id);
+                messages.is_empty()
+            });
+        if remove_peer {
+            self.processed_messages.remove(peer_id);
+        }
+    }
+
+    pub(crate) fn has_session(&self, peer_id: &str) -> bool {
         self.sessions.contains_key(peer_id)
     }
 
-    pub fn session_peers(&self) -> Vec<&str> {
+    pub(crate) fn session_peers(&self) -> Vec<&str> {
         let mut peers: Vec<&str> = self.sessions.keys().map(String::as_str).collect();
         peers.sort_unstable();
         peers
     }
 
-    /// Base64-encoded local identity public key (Ed25519 verifying key).
-    pub fn local_identity_key_b64(&self) -> String {
+    pub(crate) fn local_identity_key_b64(&self) -> String {
         B64.encode(self.identity.verifying_key().as_bytes())
     }
 
-    /// Encrypt a read receipt (list of message ID strings) using the E2EE session.
-    pub fn encrypt_read_receipt(
+    pub(crate) fn encrypt_read_receipt(
         &mut self,
         peer_id: &str,
+        recipient_id: &UserId,
         message_ids: &[protocol::MessageId],
-    ) -> Result<EncryptedEnvelope, CryptoError> {
+    ) -> Result<ClientMessage, CryptoError> {
         let capped = if message_ids.len() > protocol::consts::MAX_RECEIPT_BATCH {
             &message_ids[..protocol::consts::MAX_RECEIPT_BATCH]
         } else {
@@ -451,351 +772,23 @@ impl CryptoManager {
         if estimated_ct_len > protocol::consts::MAX_CIPHERTEXT_BYTES {
             return Err(CryptoError::RatchetFailed);
         }
-        self.encrypt(peer_id, &plaintext)
-    }
-
-    /// Extract the sender's identity key from a `PreKey` envelope header.
-    /// Returns `None` for `Ratchet` headers (non-initial messages).
-    pub const fn extract_sender_identity_key(envelope: &EncryptedEnvelope) -> Option<&str> {
-        match &envelope.header {
-            MessageHeader::PreKey {
-                sender_identity_key,
-                ..
-            } => Some(sender_identity_key.as_str()),
-            _ => None,
+        ensure_capacity(&self.pending_outbound, plaintext.len())?;
+        let receipt_id = MessageId::new();
+        let (original_session, envelope) = self.advance_encryption(peer_id, &plaintext)?;
+        let pending = PendingOutbound::ReadReceipt {
+            recipient_id: recipient_id.clone(),
+            receipt_id,
+            envelope,
+        };
+        self.pending_outbound.push(pending.clone());
+        if let Err(error) = self.persist_outbound(&pending) {
+            self.sessions.insert(peer_id.to_owned(), original_session);
+            self.pending_outbound.pop();
+            return Err(CryptoError::Persistence(error));
         }
-    }
-
-    #[allow(clippy::cognitive_complexity)] // Simple serialize+write, clippy overestimates
-    fn save_session(&self, peer_id: &str) {
-        if let Some(session) = self.sessions.get(peer_id) {
-            let path = self
-                .data_dir
-                .join("sessions")
-                .join(format!("{peer_id}.json"));
-            match serde_json::to_string(session) {
-                Ok(json) => {
-                    if let Err(e) = write_key_file(&path, json.as_bytes()) {
-                        warn!("failed to save session for {peer_id}: {e}");
-                    }
-                }
-                Err(e) => warn!("failed to serialize session for {peer_id}: {e}"),
-            }
-        }
-    }
-
-    fn remove_session_file(&self, peer_id: &str) {
-        let path = self
-            .data_dir
-            .join("sessions")
-            .join(format!("{peer_id}.json"));
-        let _ = fs::remove_file(path);
-    }
-
-    #[allow(clippy::cognitive_complexity)] // Simple serialize+write, clippy overestimates
-    fn save_opks(&self) {
-        let stored: Vec<StoredOpk> = self
-            .stored_opks
-            .values()
-            .map(|k| StoredOpk {
-                key_id: k.key_id(),
-                secret_bytes: k.secret().to_bytes(),
-                public_bytes: k.public().to_bytes(),
-            })
-            .collect();
-        match serde_json::to_string(&stored) {
-            Ok(json) => {
-                if let Err(e) = write_key_file(&self.data_dir.join("opks.json"), json.as_bytes()) {
-                    warn!("failed to save OPKs: {e}");
-                }
-            }
-            Err(e) => warn!("failed to serialize OPKs: {e}"),
-        }
-    }
-
-    #[allow(clippy::cognitive_complexity)] // Simple serialize+write, clippy overestimates
-    fn save_prekey_headers(&self) {
-        match serde_json::to_string(&self.prekey_headers) {
-            Ok(json) => {
-                if let Err(e) =
-                    write_key_file(&self.data_dir.join("prekey_headers.json"), json.as_bytes())
-                {
-                    warn!("failed to save prekey headers: {e}");
-                }
-            }
-            Err(e) => warn!("failed to serialize prekey headers: {e}"),
-        }
+        Ok(pending.to_client_message())
     }
 }
-
-// ── File persistence helpers ──
-
-fn load_spk(data_dir: &Path) -> Option<SignedPreKey> {
-    let json = fs::read_to_string(data_dir.join("spk.json")).ok()?;
-    let stored: StoredSpk = serde_json::from_str(&json).ok()?;
-    let sig_bytes = B64.decode(&stored.signature_b64).ok()?;
-    let sig_arr: [u8; 64] = sig_bytes.try_into().ok()?;
-    Some(SignedPreKey::from_parts(
-        stored.key_id,
-        stored.secret_bytes,
-        stored.public_bytes,
-        ed25519_dalek::Signature::from_bytes(&sig_arr),
-    ))
-}
-
-fn load_opks(data_dir: &Path) -> HashMap<u32, OneTimePreKey> {
-    let Ok(json) = fs::read_to_string(data_dir.join("opks.json")) else {
-        return HashMap::new();
-    };
-    let Ok(stored): Result<Vec<StoredOpk>, _> = serde_json::from_str(&json) else {
-        return HashMap::new();
-    };
-    stored
-        .into_iter()
-        .map(|s| {
-            (
-                s.key_id,
-                OneTimePreKey::from_parts(s.key_id, s.secret_bytes, s.public_bytes),
-            )
-        })
-        .collect()
-}
-
-fn load_sessions(data_dir: &Path) -> HashMap<String, SessionState> {
-    let Ok(entries) = fs::read_dir(data_dir.join("sessions")) else {
-        return HashMap::new();
-    };
-    let mut sessions = HashMap::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("json")
-            && let Some(peer_id) = path.file_stem().and_then(|s| s.to_str())
-            && protocol::UserId::new(peer_id).is_ok() // Validate peer_id
-            && let Ok(json) = fs::read_to_string(&path)
-            && let Ok(session) = serde_json::from_str(&json)
-        {
-            sessions.insert(peer_id.to_owned(), session);
-        }
-    }
-    sessions
-}
-
-fn load_prekey_headers(data_dir: &Path) -> HashMap<String, StoredX3dhResult> {
-    let Ok(json) = fs::read_to_string(data_dir.join("prekey_headers.json")) else {
-        return HashMap::new();
-    };
-    serde_json::from_str(&json).unwrap_or_default()
-}
-
-fn b64_decode_fixed<const N: usize>(s: &str, err: CryptoError) -> Result<[u8; N], CryptoError> {
-    let bytes = B64.decode(s).map_err(|_| err)?;
-    bytes.try_into().map_err(|_| CryptoError::BadBundle)
-}
-
-fn decode_ratchet_header(proto: &ProtoRatchetHeader) -> Result<RatchetHeader, CryptoError> {
-    Ok(RatchetHeader {
-        ratchet_key: b64_decode_fixed::<32>(&proto.ratchet_key, CryptoError::BadEnvelope)?,
-        previous_chain_length: proto.previous_chain_length,
-        message_number: proto.message_number,
-    })
-}
-
-/// Write a NEW key file with restricted permissions. Fails if file already exists.
-fn write_new_key_file(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(data)?;
-        file.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, data)?;
-    }
-    Ok(())
-}
-
-/// Write/update a key file with restricted permissions.
-fn write_key_file(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(data)?;
-        file.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, data)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    /// Set up Alice and Bob CryptoManagers with registration keys.
-    fn setup_alice_and_bob() -> (CryptoManager, CryptoManager, TempDir, TempDir) {
-        let alice_dir = TempDir::new().unwrap();
-        let bob_dir = TempDir::new().unwrap();
-
-        let mut alice = CryptoManager::load_or_generate(alice_dir.path()).unwrap();
-        let mut bob = CryptoManager::load_or_generate(bob_dir.path()).unwrap();
-
-        // Bob registers — persist SPK + OPKs
-        let bob_spk = SignedPreKey::generate(0, bob.identity());
-        let bob_opks = crypto::keys::generate_one_time_prekeys(0, 5).unwrap();
-        bob.persist_registration_keys(&bob_spk, &bob_opks).unwrap();
-
-        // Alice gets Bob's bundle (simulating server fetch)
-        let bundle = protocol::PreKeyBundle {
-            identity_key: B64.encode(bob.identity().verifying_key().as_bytes()),
-            signed_prekey: B64.encode(bob_spk.public().as_bytes()),
-            signed_prekey_id: bob_spk.key_id(),
-            signed_prekey_signature: B64.encode(bob_spk.signature().to_bytes()),
-            one_time_prekey: Some(protocol::OneTimePreKey {
-                key_id: bob_opks[0].key_id(),
-                public_key: B64.encode(bob_opks[0].public().as_bytes()),
-            }),
-        };
-        alice.init_session_from_bundle("bob", &bundle).unwrap();
-
-        (alice, bob, alice_dir, bob_dir)
-    }
-
-    #[test]
-    fn alice_encrypt_bob_decrypt_prekey() {
-        let (mut alice, mut bob, _a_dir, _b_dir) = setup_alice_and_bob();
-
-        let envelope = alice.encrypt("bob", b"hello bob").unwrap();
-        // Should be a PreKey message
-        assert!(matches!(envelope.header, MessageHeader::PreKey { .. }));
-
-        let plaintext = bob.decrypt("alice", &envelope).unwrap();
-        assert_eq!(plaintext, b"hello bob");
-
-        // Bob should now have a session
-        assert!(bob.has_session("alice"));
-        // OPK should be consumed
-        assert!(bob.stored_opks.is_empty() || bob.stored_opks.len() == 4);
-    }
-
-    #[test]
-    fn forged_prekey_no_orphan_session_no_opk_consumed() {
-        let (_alice, mut bob, _a_dir, _b_dir) = setup_alice_and_bob();
-        let opk_count_before = bob.stored_opks.len();
-
-        // Forge a PreKey message with garbage ciphertext
-        let forged = EncryptedEnvelope {
-            version: 1,
-            header: MessageHeader::PreKey {
-                sender_identity_key: B64.encode([1u8; 32]),
-                sender_ephemeral_key: B64.encode([2u8; 32]),
-                recipient_signed_prekey_id: 0,
-                recipient_one_time_prekey_id: Some(0),
-                ratchet: ProtoRatchetHeader {
-                    ratchet_key: B64.encode([3u8; 32]),
-                    previous_chain_length: 0,
-                    message_number: 0,
-                },
-            },
-            ciphertext: B64.encode(b"garbage"),
-        };
-
-        let result = bob.decrypt("mallory", &forged);
-        assert!(result.is_err());
-        // No orphan session
-        assert!(!bob.has_session("mallory"));
-        // OPK not consumed
-        assert_eq!(bob.stored_opks.len(), opk_count_before);
-    }
-
-    #[test]
-    fn existing_session_not_destroyed_by_prekey() {
-        let (mut alice, mut bob, _a_dir, _b_dir) = setup_alice_and_bob();
-
-        // Alice sends first message — Bob creates session
-        let env1 = alice.encrypt("bob", b"first").unwrap();
-        bob.decrypt("alice", &env1).unwrap();
-        assert!(bob.has_session("alice"));
-
-        // Forge a PreKey from "alice" with garbage — should NOT destroy session
-        let forged = EncryptedEnvelope {
-            version: 1,
-            header: MessageHeader::PreKey {
-                sender_identity_key: B64.encode([9u8; 32]),
-                sender_ephemeral_key: B64.encode([9u8; 32]),
-                recipient_signed_prekey_id: 0,
-                recipient_one_time_prekey_id: None,
-                ratchet: ProtoRatchetHeader {
-                    ratchet_key: B64.encode([9u8; 32]),
-                    previous_chain_length: 0,
-                    message_number: 0,
-                },
-            },
-            ciphertext: B64.encode(b"fake"),
-        };
-        let _ = bob.decrypt("alice", &forged); // should fail but NOT nuke session
-
-        // Session still works
-        assert!(bob.has_session("alice"));
-        let env2 = alice.encrypt("bob", b"second").unwrap();
-        let pt2 = bob.decrypt("alice", &env2).unwrap();
-        assert_eq!(pt2, b"second");
-    }
-
-    #[test]
-    fn missing_opk_returns_error() {
-        let (_alice, mut bob, _a_dir, _b_dir) = setup_alice_and_bob();
-
-        // PreKey message claiming OPK 999 which Bob doesn't have
-        let forged = EncryptedEnvelope {
-            version: 1,
-            header: MessageHeader::PreKey {
-                sender_identity_key: B64.encode([1u8; 32]),
-                sender_ephemeral_key: B64.encode([2u8; 32]),
-                recipient_signed_prekey_id: 0,
-                recipient_one_time_prekey_id: Some(999),
-                ratchet: ProtoRatchetHeader {
-                    ratchet_key: B64.encode([3u8; 32]),
-                    previous_chain_length: 0,
-                    message_number: 0,
-                },
-            },
-            ciphertext: B64.encode(b"anything"),
-        };
-
-        let result = bob.decrypt("someone", &forged);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn persistence_roundtrip() {
-        let (mut alice, mut bob, _a_dir, b_dir) = setup_alice_and_bob();
-
-        // Alice sends, Bob decrypts
-        let env1 = alice.encrypt("bob", b"persist me").unwrap();
-        bob.decrypt("alice", &env1).unwrap();
-
-        // Reload Bob from disk
-        let mut bob2 = CryptoManager::load_or_generate(b_dir.path()).unwrap();
-        assert!(bob2.has_session("alice"));
-
-        // Alice sends another message — Bob2 should decrypt it
-        let env2 = alice.encrypt("bob", b"after reload").unwrap();
-        let pt2 = bob2.decrypt("alice", &env2).unwrap();
-        assert_eq!(pt2, b"after reload");
-    }
-}
+#[path = "crypto_mgr_tests.rs"]
+mod tests;

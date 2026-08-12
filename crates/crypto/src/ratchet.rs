@@ -308,7 +308,7 @@ mod skipped_keys_serde {
         message_key: [u8; 32],
     }
 
-    pub fn serialize<S>(map: &SkippedKeysMap, serializer: S) -> Result<S::Ok, S::Error>
+    pub(super) fn serialize<S>(map: &SkippedKeysMap, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -323,7 +323,7 @@ mod skipped_keys_serde {
         entries.serialize(serializer)
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<SkippedKeysMap, D::Error>
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<SkippedKeysMap, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -591,8 +591,8 @@ mod tests {
     }
 
     /// Receive message 3 first (skipping 0-2), then receive 4 in-order.
-    /// This catches a bug where recv_count increments by 1 instead of
-    /// tracking message_number+1 after a gap.
+    /// This catches a bug where `recv_count` increments by 1 instead of
+    /// tracking `message_number + 1` after a gap.
     #[test]
     fn in_order_after_gap() {
         let (mut alice, mut bob) = setup_session();

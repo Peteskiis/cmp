@@ -41,6 +41,7 @@ pub enum ClientMessage {
     /// Acknowledge receipt of messages (allows server to delete from queue).
     /// Max `consts::MAX_ACK_BATCH` items.
     Ack {
+        ack_id: MessageId,
         message_ids: Vec<MessageId>,
     },
 
@@ -52,7 +53,16 @@ pub enum ClientMessage {
     /// E2EE encrypted read receipt — relayed to online recipient only, never queued.
     SendReadReceipt {
         recipient_id: UserId,
+        receipt_id: MessageId,
         envelope: EncryptedEnvelope,
+    },
+
+    AckReadReceipt {
+        ack_id: MessageId,
+        receipt_ids: Vec<MessageId>,
+    },
+    AckReadReceiptSent {
+        receipt_ids: Vec<MessageId>,
     },
 }
 
@@ -82,13 +92,23 @@ pub enum ServerMessage {
 
     IncomingMessage(InboundMessage),
 
-    /// Max `consts::MAX_QUEUED_MESSAGES` items.
+    /// Max `consts::MAX_QUEUED_MESSAGES_PER_PAGE` items and
+    /// `consts::MAX_QUEUED_PAGE_BYTES` encoded bytes per response.
     QueuedMessages {
         messages: Vec<InboundMessage>,
     },
 
     MessageSent {
         message_id: MessageId,
+    },
+
+    AckSuccess {
+        ack_id: MessageId,
+        message_ids: Vec<MessageId>,
+    },
+
+    ReadReceiptSent {
+        receipt_id: MessageId,
     },
 
     /// Generic success acknowledgment (e.g., prekey upload).
@@ -117,6 +137,7 @@ pub enum ServerMessage {
     /// E2EE encrypted read receipt from a peer.
     IncomingReadReceipt {
         sender_id: UserId,
+        receipt_id: MessageId,
         envelope: EncryptedEnvelope,
     },
 }
@@ -272,7 +293,15 @@ mod tests {
     #[test]
     fn client_ack() {
         roundtrip_client(&ClientMessage::Ack {
+            ack_id: MessageId::new(),
             message_ids: vec![MessageId::new(), MessageId::new()],
+        });
+    }
+
+    #[test]
+    fn client_ack_read_receipt_sent() {
+        roundtrip_client(&ClientMessage::AckReadReceiptSent {
+            receipt_ids: vec![MessageId::new()],
         });
     }
 
@@ -456,6 +485,7 @@ mod tests {
     fn client_send_read_receipt() {
         roundtrip_client(&ClientMessage::SendReadReceipt {
             recipient_id: user("bob"),
+            receipt_id: MessageId::new(),
             envelope: sample_envelope(),
         });
     }
@@ -478,6 +508,7 @@ mod tests {
     fn server_incoming_read_receipt() {
         roundtrip_server(&ServerMessage::IncomingReadReceipt {
             sender_id: user("alice"),
+            receipt_id: MessageId::new(),
             envelope: sample_envelope(),
         });
     }
