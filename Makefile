@@ -36,7 +36,7 @@ lint:
 	cargo clippy --workspace --all-targets --all-features
 
 lint-fix:
-	cargo clippy --workspace --fix --allow-dirty --allow-staged -- -D warnings
+	cargo clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged
 
 test:
 	cargo test --workspace --all-targets --all-features

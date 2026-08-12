@@ -7,7 +7,7 @@ use protocol::{ClientMessage, MessageId, ServerMessage, UserId, consts};
 use tokio::sync::mpsc;
 
 use crate::command_popup::CommandPopup;
-use crate::crypto_mgr::CryptoManager;
+use crate::crypto_mgr::{CryptoManager, InboundDecrypt};
 use crate::status_bar::{ConnectionStatus, StatusBar};
 use crate::{net, ui};
 
@@ -156,12 +156,12 @@ impl App {
         direction: crate::db::MessageDirection,
         msg_id: &str,
         body: &str,
-    ) {
-        if let Some(ref conn) = self.db
-            && let Err(e) = crate::db::insert_message(conn, peer_id, direction, msg_id, body)
-        {
-            tracing::warn!("failed to persist message: {e}");
-        }
+    ) -> anyhow::Result<bool> {
+        let conn = self
+            .db
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("message database unavailable"))?;
+        crate::db::insert_message(conn, peer_id, direction, msg_id, body)
     }
 }
 
@@ -339,12 +339,14 @@ pub(crate) fn handle_enter(
     // Note to self: skip crypto and server, just store locally
     if target_str == app.user_id.as_str() {
         let msg_id = MessageId::new();
-        app.persist_message(
+        if let Err(error) = app.persist_message(
             target_str,
             crate::db::MessageDirection::Sent,
             &msg_id.to_string(),
             &text,
-        );
+        ) {
+            tracing::warn!("failed to persist note: {error}");
+        }
         app.chat_history.push(ChatEntry::Sent(text));
         app.clear_input();
         return Ok(());
@@ -364,8 +366,12 @@ pub(crate) fn handle_enter(
         return Ok(());
     }
 
-    let envelope = match app.crypto.encrypt(target_str, text.as_bytes()) {
-        Ok(env) => env,
+    let msg_id = MessageId::new();
+    let outbound = match app
+        .crypto
+        .encrypt_message(target_str, target, &msg_id, text.as_bytes())
+    {
+        Ok(message) => message,
         Err(e) => {
             app.status(&format!("encrypt error: {e}"));
             app.clear_input();
@@ -373,23 +379,20 @@ pub(crate) fn handle_enter(
         }
     };
 
-    let msg_id = MessageId::new();
     // Cap pending IDs to prevent unbounded growth
     if app.pending_msg_ids.len() >= 10_000 {
         app.pending_msg_ids.clear();
     }
     app.pending_msg_ids.push(msg_id.clone());
-    let _ = outgoing_tx.send(ClientMessage::SendMessage {
-        recipient_id: target.clone(),
-        message_id: msg_id.clone(),
-        envelope,
-    });
-    app.persist_message(
+    let _ = outgoing_tx.send(outbound);
+    if let Err(error) = app.persist_message(
         target_str,
         crate::db::MessageDirection::Sent,
         &msg_id.to_string(),
         &text,
-    );
+    ) {
+        tracing::warn!("failed to persist sent message: {error}");
+    }
     app.chat_history.push(ChatEntry::Sent(text));
     app.clear_input();
     Ok(())
@@ -530,6 +533,9 @@ fn handle_app_event(
         AppEvent::Authenticated => {
             app.status_bar
                 .set_connection(ConnectionStatus::Authenticated(Instant::now()));
+            for pending in app.crypto.pending_messages() {
+                let _ = outgoing_tx.send(pending);
+            }
         }
         AppEvent::AuthFailed(reason) => {
             app.status_bar
@@ -576,11 +582,13 @@ fn handle_server_message(
         }
         ServerMessage::IncomingMessage(inbound) => {
             let sender_id = inbound.sender_id.clone();
-            let (sender, msg_id, ok) = process_inbound(app, &inbound);
-            if ok {
+            let (sender, msg_id, should_ack, fresh) = process_inbound(app, &inbound);
+            if should_ack {
                 let _ = outgoing_tx.send(ClientMessage::Ack {
                     message_ids: vec![inbound.message_id],
                 });
+            }
+            if fresh {
                 if app.target_user.is_none()
                     && let Ok(uid) = UserId::new(&sender)
                 {
@@ -593,11 +601,11 @@ fn handle_server_message(
                     .is_some_and(|t| t.as_str() == sender)
                     && app.crypto.has_session(&sender)
                 {
-                    if let Ok(receipt_env) = app.crypto.encrypt_read_receipt(&sender, &[msg_id]) {
-                        let _ = outgoing_tx.send(ClientMessage::SendReadReceipt {
-                            recipient_id: sender_id,
-                            envelope: receipt_env,
-                        });
+                    if let Ok(receipt) =
+                        app.crypto
+                            .encrypt_read_receipt(&sender, &sender_id, &[msg_id])
+                    {
+                        let _ = outgoing_tx.send(receipt);
                     }
                 } else {
                     accumulate_unread(app, sender, msg_id);
@@ -607,9 +615,11 @@ fn handle_server_message(
         ServerMessage::QueuedMessages { messages } => {
             let mut ack_ids = Vec::with_capacity(messages.len());
             for inbound in &messages {
-                let (sender, msg_id, ok) = process_inbound(app, inbound);
-                if ok {
+                let (sender, msg_id, should_ack, fresh) = process_inbound(app, inbound);
+                if should_ack {
                     ack_ids.push(inbound.message_id.clone());
+                }
+                if fresh {
                     accumulate_unread(app, sender, msg_id);
                 }
             }
@@ -633,6 +643,16 @@ fn handle_server_message(
             {
                 app.pending_msg_ids.retain(|id| !message_ids.contains(id));
                 app.status("  \u{2713}");
+            }
+        }
+        ServerMessage::MessageSent { message_id } => {
+            if let Err(error) = app.crypto.confirm_message_sent(&message_id) {
+                tracing::warn!("failed to confirm durable outbound message: {error}");
+            }
+        }
+        ServerMessage::Success => {
+            if let Err(error) = app.crypto.confirm_read_receipt_sent() {
+                tracing::warn!("failed to confirm durable read receipt: {error}");
             }
         }
         ServerMessage::IncomingReadReceipt {
@@ -660,27 +680,65 @@ fn handle_server_message(
 }
 
 /// Decrypt an inbound message and push to chat history.
-fn process_inbound(app: &mut App, inbound: &protocol::InboundMessage) -> (String, MessageId, bool) {
+fn process_inbound(
+    app: &mut App,
+    inbound: &protocol::InboundMessage,
+) -> (String, MessageId, bool, bool) {
     let sender = inbound.sender_id.as_str().to_owned();
-    let (text, ok) = app.crypto.decrypt_to_text(&sender, &inbound.envelope);
-    // Only store identity key after AEAD authentication succeeds — a forged PreKey
-    // header must not overwrite a legitimate key or clear verification state.
-    if ok && let Some(ik) = CryptoManager::extract_sender_identity_key(&inbound.envelope) {
+    match app
+        .crypto
+        .decrypt_message_to_text(&sender, &inbound.message_id, &inbound.envelope)
+    {
+        InboundDecrypt::Pending(text) => process_pending_inbound(app, inbound, sender, text),
+        InboundDecrypt::Duplicate => (sender, inbound.message_id.clone(), true, false),
+        InboundDecrypt::Failed => {
+            app.chat_history.push(ChatEntry::Received {
+                sender: sender.clone(),
+                text: "[undecryptable message]".to_owned(),
+            });
+            (sender, inbound.message_id.clone(), false, false)
+        }
+    }
+}
+
+fn process_pending_inbound(
+    app: &mut App,
+    inbound: &protocol::InboundMessage,
+    sender: String,
+    text: String,
+) -> (String, MessageId, bool, bool) {
+    // Only store identity keys after AEAD authentication succeeds.
+    if let Some(ik) = CryptoManager::extract_sender_identity_key(&inbound.envelope) {
         track_peer_identity(app, &sender, ik);
     }
-    if ok {
-        app.persist_message(
-            &sender,
-            crate::db::MessageDirection::Received,
-            &inbound.message_id.to_string(),
-            &text,
-        );
+    let Ok(inserted) = commit_pending_inbound(app, inbound, &sender, &text) else {
+        tracing::warn!("failed to commit received message");
+        return (sender, inbound.message_id.clone(), false, false);
+    };
+    if inserted {
+        app.chat_history.push(ChatEntry::Received {
+            sender: sender.clone(),
+            text,
+        });
     }
-    app.chat_history.push(ChatEntry::Received {
-        sender: sender.clone(),
+    (sender, inbound.message_id.clone(), true, inserted)
+}
+
+fn commit_pending_inbound(
+    app: &mut App,
+    inbound: &protocol::InboundMessage,
+    sender: &str,
+    text: &str,
+) -> anyhow::Result<bool> {
+    let inserted = app.persist_message(
+        sender,
+        crate::db::MessageDirection::Received,
+        &inbound.message_id.to_string(),
         text,
-    });
-    (sender, inbound.message_id.clone(), ok)
+    )?;
+    app.crypto
+        .confirm_inbound_stored(sender, &inbound.message_id)?;
+    Ok(inserted)
 }
 
 /// Try to flush pending read receipts for `target` — encrypt, send, remove from unread map.
@@ -693,12 +751,9 @@ fn flush_read_receipts(
     if let Some(unread) = app.unread_messages.get(target_str)
         && !unread.is_empty()
         && app.crypto.has_session(target_str)
-        && let Ok(receipt_env) = app.crypto.encrypt_read_receipt(target_str, unread)
+        && let Ok(receipt) = app.crypto.encrypt_read_receipt(target_str, target, unread)
     {
-        let _ = outgoing_tx.send(ClientMessage::SendReadReceipt {
-            recipient_id: target.clone(),
-            envelope: receipt_env,
-        });
+        let _ = outgoing_tx.send(receipt);
         app.unread_messages.remove(target_str);
     }
 }

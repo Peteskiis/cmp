@@ -1,4 +1,8 @@
-use protocol::{EncryptedEnvelope, InboundMessage, MessageId, ServerMessage, UserId, consts};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use protocol::{
+    EncryptedEnvelope, InboundMessage, MessageId, ServerMessage, UserId, consts,
+    types::MessageHeader,
+};
 
 use super::{error_400, error_500_generic, now_secs};
 use crate::db;
@@ -13,12 +17,30 @@ pub(crate) async fn handle_send(
     message_id: MessageId,
     envelope: EncryptedEnvelope,
 ) -> ServerMessage {
-    if envelope.ciphertext.len() > consts::MAX_CIPHERTEXT_BYTES {
-        return error_400("ciphertext exceeds maximum size");
+    if let Err(message) = validate_envelope(&envelope) {
+        return error_400(message);
     }
 
     let msg_id_str = message_id.to_string();
     let recipient_str = recipient_id.as_str();
+
+    let Ok(sender_user_id) = UserId::new(sender_id) else {
+        return error_500_generic();
+    };
+    let inbound = InboundMessage {
+        message_id: message_id.clone(),
+        sender_id: sender_user_id,
+        envelope: envelope.clone(),
+        timestamp: now_secs(),
+    };
+    let Ok(queued_page) = serde_json::to_vec(&ServerMessage::QueuedMessages {
+        messages: vec![inbound.clone()],
+    }) else {
+        return error_400("invalid envelope");
+    };
+    if queued_page.len() > consts::MAX_QUEUED_PAGE_BYTES {
+        return error_400("message exceeds queued delivery size");
+    }
 
     let Ok(envelope_json) = serde_json::to_string(&envelope) else {
         return error_400("invalid envelope");
@@ -48,18 +70,6 @@ pub(crate) async fn handle_send(
     }
 
     // Push to recipient if online
-    let Ok(sender_user_id) = UserId::new(sender_id) else {
-        return ServerMessage::MessageSent {
-            message_id: message_id.clone(),
-        };
-    };
-
-    let inbound = InboundMessage {
-        message_id: message_id.clone(),
-        sender_id: sender_user_id,
-        envelope,
-        timestamp: now_secs(),
-    };
     let pushed = state
         .connections
         .send_to(recipient_str, ServerMessage::IncomingMessage(inbound));
@@ -122,8 +132,8 @@ pub(crate) fn handle_read_receipt(
     to: &UserId,
     envelope: &protocol::EncryptedEnvelope,
 ) -> Option<ServerMessage> {
-    if envelope.ciphertext.len() > consts::MAX_CIPHERTEXT_BYTES {
-        return Some(error_400("ciphertext exceeds maximum size"));
+    if let Err(message) = validate_envelope(envelope) {
+        return Some(error_400(message));
     }
     let Ok(from_uid) = UserId::new(from) else {
         return None;
@@ -135,5 +145,38 @@ pub(crate) fn handle_read_receipt(
             envelope: envelope.clone(),
         },
     );
-    None
+    Some(ServerMessage::Success)
+}
+
+fn validate_envelope(envelope: &EncryptedEnvelope) -> Result<(), &'static str> {
+    if envelope.ciphertext.len() > consts::MAX_CIPHERTEXT_BYTES {
+        return Err("ciphertext exceeds maximum size");
+    }
+    if B64.decode(&envelope.ciphertext).is_err() {
+        return Err("invalid ciphertext encoding");
+    }
+
+    match &envelope.header {
+        MessageHeader::PreKey {
+            sender_identity_key,
+            sender_ephemeral_key,
+            ratchet,
+            ..
+        } => {
+            validate_b64_len::<32>(sender_identity_key)?;
+            validate_b64_len::<32>(sender_ephemeral_key)?;
+            validate_b64_len::<32>(&ratchet.ratchet_key)?;
+        }
+        MessageHeader::Ratchet(ratchet) => validate_b64_len::<32>(&ratchet.ratchet_key)?,
+        _ => return Err("unsupported message header"),
+    }
+    Ok(())
+}
+
+fn validate_b64_len<const N: usize>(encoded: &str) -> Result<(), &'static str> {
+    let decoded = B64.decode(encoded).map_err(|_| "invalid key encoding")?;
+    if decoded.len() != N {
+        return Err("invalid key length");
+    }
+    Ok(())
 }

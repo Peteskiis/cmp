@@ -136,6 +136,24 @@ pub async fn delete_messages(
     .map_err(Into::into)
 }
 
+/// Delete one invalid queued row after it fails durable delivery validation.
+pub async fn delete_invalid_row(
+    conn: &Connection,
+    recipient_id: &str,
+    row_id: i64,
+) -> anyhow::Result<()> {
+    let recipient_id = recipient_id.to_owned();
+    conn.call(move |conn| {
+        conn.execute(
+            "DELETE FROM message_queue WHERE rowid = ?1 AND recipient_id = ?2",
+            rusqlite::params![row_id, recipient_id],
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(Into::into)
+}
+
 /// Delete messages older than `max_age_days` days. Returns count deleted.
 pub async fn gc_old_messages(conn: &Connection, max_age_days: u32) -> anyhow::Result<u64> {
     conn.call(move |conn| {

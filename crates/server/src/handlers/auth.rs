@@ -242,6 +242,7 @@ pub(crate) async fn deliver_queued_messages(
                     message_id = row.message_id,
                     "invalid queued message: {error}"
                 );
+                remove_invalid_queued_row(state, user_id, row.row_id).await;
                 continue;
             }
         };
@@ -249,18 +250,23 @@ pub(crate) async fn deliver_queued_messages(
             Ok(encoded) => encoded.len(),
             Err(error) => {
                 warn!(user_id, "failed to size queued message: {error}");
+                remove_invalid_queued_row(state, user_id, row.row_id).await;
                 continue;
             }
         };
         let separator_bytes = usize::from(!page.is_empty());
+        if empty_page_bytes + item_bytes > consts::MAX_QUEUED_PAGE_BYTES {
+            warn!(
+                message_id = row.message_id,
+                "queued message exceeds WebSocket page limit"
+            );
+            remove_invalid_queued_row(state, user_id, row.row_id).await;
+            continue;
+        }
         let page_full = page.len() >= consts::MAX_QUEUED_MESSAGES_PER_PAGE
             || page_bytes + separator_bytes + item_bytes > consts::MAX_QUEUED_PAGE_BYTES;
 
         if page_full {
-            if page.is_empty() {
-                warn!(user_id, "queued message exceeds WebSocket page limit");
-                return;
-            }
             if !send_queued_page(state, tx, std::mem::take(&mut page)).await {
                 return;
             }
@@ -273,6 +279,15 @@ pub(crate) async fn deliver_queued_messages(
 
     if !page.is_empty() {
         let _ = send_queued_page(state, tx, page).await;
+    }
+}
+
+async fn remove_invalid_queued_row(state: &AppState, user_id: &str, row_id: i64) {
+    if let Err(error) = db::queue::delete_invalid_row(&state.db, user_id, row_id).await {
+        warn!(
+            user_id,
+            row_id, "failed to remove invalid queued message: {error}"
+        );
     }
 }
 

@@ -415,6 +415,54 @@ async fn send_to_nonexistent_user_fails() {
 }
 
 #[tokio::test]
+async fn malformed_envelope_keys_are_rejected_on_all_relay_paths() {
+    let (url, _handle) = start_test_server().await;
+    let alice_id = make_identity();
+    let bob_id = make_identity();
+    let (mut alice_sink, mut alice_stream) = connect(&url).await;
+    register(&mut alice_sink, &mut alice_stream, "alice", &alice_id).await;
+    let (mut bob_sink, mut bob_stream) = connect(&url).await;
+    register(&mut bob_sink, &mut bob_stream, "bob", &bob_id).await;
+
+    let invalid = EncryptedEnvelope {
+        version: 1,
+        header: MessageHeader::Ratchet(ProtoRatchetHeader {
+            ratchet_key: B64.encode([0u8; 31]),
+            previous_chain_length: 0,
+            message_number: 0,
+        }),
+        ciphertext: B64.encode(b"opaque"),
+    };
+    send(
+        &mut alice_sink,
+        &ClientMessage::SendMessage {
+            recipient_id: UserId::new("bob").unwrap(),
+            message_id: MessageId::new(),
+            envelope: invalid.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut alice_stream).await,
+        ServerMessage::Error { code: 400, .. }
+    ));
+
+    send(
+        &mut alice_sink,
+        &ClientMessage::SendReadReceipt {
+            recipient_id: UserId::new("bob").unwrap(),
+            envelope: invalid,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut alice_stream).await,
+        ServerMessage::Error { code: 400, .. }
+    ));
+    drop((bob_sink, bob_stream));
+}
+
+#[tokio::test]
 async fn auth_with_wrong_key_rejected() {
     let (url, _handle) = start_test_server().await;
     let real_identity = make_identity();
@@ -592,6 +640,8 @@ async fn read_receipt_relay() {
         },
     )
     .await;
+
+    assert!(matches!(recv(&mut br1).await, ServerMessage::Success));
 
     let resp = recv(&mut ar1).await;
     let ServerMessage::IncomingReadReceipt { sender_id, .. } = resp else {
