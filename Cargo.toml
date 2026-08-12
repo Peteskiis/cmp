@@ -50,6 +50,7 @@ argon2 = "0.5"
 futures = "0.3"
 futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }
+tempfile = "3"
 
 # Internal crates
 protocol = { path = "crates/protocol" }
