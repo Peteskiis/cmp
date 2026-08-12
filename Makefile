@@ -1,4 +1,4 @@
-.PHONY: help fmt fmt-check lint lint-fix test check build-cli build-server run-server release release-server
+.PHONY: help fmt fmt-check lint lint-fix test dependencies check build-cli build-server run-server release release-server
 .DEFAULT_GOAL := help
 
 MAC_TARGETS := aarch64-apple-darwin
@@ -12,7 +12,8 @@ help:
 	@echo "  lint       run clippy (strict)"
 	@echo "  lint-fix   auto-fix clippy warnings"
 	@echo "  test       run all tests"
-	@echo "  check      fmt-check + lint + test"
+	@echo "  dependencies check dependency advisories, licenses, bans, and sources"
+	@echo "  check      fmt-check + lint + test + dependency policy"
 	@echo "  build-cli    build and install client to ~/.local/bin/"
 	@echo "  build-server build and install server to ~/.local/bin/"
 	@echo "  run-server   start the server on 0.0.0.0:3000"
@@ -34,7 +35,10 @@ lint-fix:
 test:
 	cargo test --workspace
 
-check: fmt-check lint test
+dependencies:
+	cargo deny check advisories bans licenses sources
+
+check: fmt-check lint test dependencies
 
 run-server:
 	cargo run -p server

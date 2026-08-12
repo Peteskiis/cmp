@@ -38,8 +38,7 @@ pub fn now_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 // ── Shared error helpers ──

@@ -13,7 +13,10 @@ use state::AppState;
 /// Build the axum router with the given state.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(|| async { "CMP relay — WebSocket endpoint at /ws\n" }))
+        .route(
+            "/",
+            get(|| async { "CMP relay — WebSocket endpoint at /ws\n" }),
+        )
         .route("/health", get(|| async { "OK\n" }))
         .route("/ws", get(ws::ws_upgrade))
         .with_state(state)
