@@ -277,14 +277,19 @@ fn read_receipt_survives_restart_until_server_confirmation() {
     let mut restarted = CryptoManager::load_or_generate(a_dir.path()).unwrap();
     let pending = restarted.pending_messages();
     assert_eq!(pending.len(), 1);
-    let ClientMessage::SendReadReceipt { envelope, .. } = &pending[0] else {
+    let ClientMessage::SendReadReceipt {
+        receipt_id,
+        envelope,
+        ..
+    } = &pending[0]
+    else {
         panic!("expected pending read receipt");
     };
     let plaintext = bob.decrypt("alice", envelope).unwrap();
     let ids: Vec<String> = serde_json::from_slice(&plaintext).unwrap();
     assert_eq!(ids, [received_id.to_string()]);
 
-    restarted.confirm_read_receipt_sent().unwrap();
+    restarted.confirm_read_receipt_sent(receipt_id).unwrap();
     drop(restarted);
     assert!(
         CryptoManager::load_or_generate(a_dir.path())
@@ -319,6 +324,66 @@ fn processed_message_retention_is_bounded_to_server_gc_window() {
     let messages = processed.get("alice").unwrap();
     assert!(!messages.contains_key("expired"));
     assert!(messages.contains_key("current"));
+}
+
+#[test]
+fn durable_outbox_rejects_new_items_at_capacity_before_ratchet_advances() {
+    let (mut alice, _bob, a_dir, _b_dir) = setup_alice_and_bob();
+    let recipient = UserId::new("bob").unwrap();
+    let envelope = EncryptedEnvelope {
+        version: 1,
+        header: MessageHeader::Ratchet(ProtoRatchetHeader {
+            ratchet_key: B64.encode([0_u8; 32]),
+            previous_chain_length: 0,
+            message_number: 0,
+        }),
+        ciphertext: B64.encode(b"queued"),
+    };
+    alice.pending_outbound = (0..protocol::consts::MAX_PENDING_OUTBOUND_ITEMS)
+        .map(|_| PendingOutbound::Message {
+            recipient_id: recipient.clone(),
+            message_id: MessageId::new(),
+            envelope: envelope.clone(),
+        })
+        .collect();
+
+    assert!(matches!(
+        alice.encrypt_message("bob", &recipient, &MessageId::new(), b"blocked"),
+        Err(CryptoError::OutboxFull)
+    ));
+    alice.pending_outbound.clear();
+    drop(alice);
+    let mut restarted = CryptoManager::load_or_generate(a_dir.path()).unwrap();
+    assert!(matches!(
+        restarted
+            .encrypt_message("bob", &recipient, &MessageId::new(), b"still first")
+            .unwrap(),
+        ClientMessage::SendMessage {
+            envelope: EncryptedEnvelope {
+                header: MessageHeader::PreKey { .. },
+                ..
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn ack_confirmation_removes_processed_marker() {
+    let (mut alice, mut bob, _a_dir, b_dir) = setup_alice_and_bob();
+    let message_id = MessageId::new();
+    let envelope = alice.encrypt("bob", b"ack confirmed").unwrap();
+    assert!(matches!(
+        bob.decrypt_message_to_text("alice", &message_id, &envelope),
+        InboundDecrypt::Pending(_)
+    ));
+    bob.confirm_inbound_stored("alice", &message_id).unwrap();
+    bob.confirm_acked(std::slice::from_ref(&message_id))
+        .unwrap();
+    drop(bob);
+
+    let restarted = CryptoManager::load_or_generate(b_dir.path()).unwrap();
+    assert!(restarted.processed_messages.is_empty());
 }
 
 #[test]

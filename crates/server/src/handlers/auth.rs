@@ -324,6 +324,7 @@ async fn send_queued_page(
 
 fn queued_row_to_inbound(row: &db::queue::QueuedRow) -> anyhow::Result<protocol::InboundMessage> {
     let envelope = serde_json::from_str(&row.envelope_json)?;
+    super::message::validate_envelope(&envelope).map_err(anyhow::Error::msg)?;
     let sender_id = protocol::UserId::new(&row.sender_id)?;
     let message_id = protocol::MessageId::from(uuid::Uuid::parse_str(&row.message_id)?);
     Ok(protocol::InboundMessage {
@@ -376,4 +377,37 @@ fn parse_sqlite_datetime(s: &str) -> u64 {
         + min * 60
         + sec) as u64;
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_invalid_envelope_is_rejected_before_delivery() {
+        let envelope = protocol::EncryptedEnvelope {
+            version: 1,
+            header: protocol::types::MessageHeader::Ratchet(protocol::types::RatchetHeader {
+                ratchet_key: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    [0_u8; 31],
+                ),
+                previous_chain_length: 0,
+                message_number: 0,
+            }),
+            ciphertext: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                b"opaque",
+            ),
+        };
+        let row = db::queue::QueuedRow {
+            row_id: 1,
+            message_id: uuid::Uuid::new_v4().to_string(),
+            sender_id: "alice".to_owned(),
+            envelope_json: serde_json::to_string(&envelope).unwrap(),
+            created_at: "2026-08-12 00:00:00".to_owned(),
+        };
+
+        assert!(queued_row_to_inbound(&row).is_err());
+    }
 }

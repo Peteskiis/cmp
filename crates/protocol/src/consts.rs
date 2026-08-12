@@ -24,3 +24,12 @@ pub const MAX_QUEUE_PER_USER: usize = 10_000;
 
 /// Maximum message IDs in a single read receipt batch.
 pub const MAX_RECEIPT_BATCH: usize = 100;
+
+/// Maximum durable outbound items retained by one client.
+pub const MAX_PENDING_OUTBOUND_ITEMS: usize = 1000;
+
+/// Maximum encoded ciphertext bytes retained in the durable client outbox.
+pub const MAX_PENDING_OUTBOUND_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum unconfirmed processed-message IDs retained by one client.
+pub const MAX_PROCESSED_MESSAGES: usize = 10_000;

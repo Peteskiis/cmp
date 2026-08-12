@@ -85,6 +85,10 @@ pub(crate) async fn run(
 
         // Auth succeeded — reset backoff
         backoff = Duration::from_secs(1);
+        // Drop the stale transport backlog before the app replays its ordered
+        // durable outbox. Messages and receipts are persisted before entering
+        // this channel; ephemeral commands are intentionally not replayed.
+        drain_stale_outgoing(&mut outgoing_rx);
         let _ = event_tx.send(AppEvent::Authenticated);
 
         relay_loop(&mut stream, &mut sink, &event_tx, &mut outgoing_rx).await;
@@ -93,6 +97,10 @@ pub(crate) async fn run(
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(max_backoff);
     }
+}
+
+fn drain_stale_outgoing(outgoing_rx: &mut mpsc::UnboundedReceiver<ClientMessage>) {
+    while outgoing_rx.try_recv().is_ok() {}
 }
 
 type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>;
@@ -215,4 +223,30 @@ pub(crate) async fn register_with_server(
         anyhow::bail!("registration rejected: {reason}");
     }
     anyhow::bail!("unexpected server response during registration");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_discards_stale_transport_backlog_before_durable_replay() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        sender
+            .send(ClientMessage::Typing {
+                recipient_id: UserId::new("bob").unwrap(),
+            })
+            .unwrap();
+        sender
+            .send(ClientMessage::Typing {
+                recipient_id: UserId::new("carol").unwrap(),
+            })
+            .unwrap();
+
+        drain_stale_outgoing(&mut receiver);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
 }

@@ -52,6 +52,7 @@ pub enum ClientMessage {
     /// E2EE encrypted read receipt — relayed to online recipient only, never queued.
     SendReadReceipt {
         recipient_id: UserId,
+        receipt_id: MessageId,
         envelope: EncryptedEnvelope,
     },
 }
@@ -90,6 +91,14 @@ pub enum ServerMessage {
 
     MessageSent {
         message_id: MessageId,
+    },
+
+    AckSuccess {
+        message_ids: Vec<MessageId>,
+    },
+
+    ReadReceiptSent {
+        receipt_id: MessageId,
     },
 
     /// Generic success acknowledgment (e.g., prekey upload).
@@ -457,6 +466,7 @@ mod tests {
     fn client_send_read_receipt() {
         roundtrip_client(&ClientMessage::SendReadReceipt {
             recipient_id: user("bob"),
+            receipt_id: MessageId::new(),
             envelope: sample_envelope(),
         });
     }

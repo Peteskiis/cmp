@@ -650,8 +650,13 @@ fn handle_server_message(
                 tracing::warn!("failed to confirm durable outbound message: {error}");
             }
         }
-        ServerMessage::Success => {
-            if let Err(error) = app.crypto.confirm_read_receipt_sent() {
+        ServerMessage::AckSuccess { message_ids } => {
+            if let Err(error) = app.crypto.confirm_acked(&message_ids) {
+                tracing::warn!("failed to confirm durable acknowledgements: {error}");
+            }
+        }
+        ServerMessage::ReadReceiptSent { receipt_id } => {
+            if let Err(error) = app.crypto.confirm_read_receipt_sent(&receipt_id) {
                 tracing::warn!("failed to confirm durable read receipt: {error}");
             }
         }

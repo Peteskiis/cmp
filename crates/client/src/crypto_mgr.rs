@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use x25519_dalek::PublicKey as X25519PublicKey;
 
 use crate::crypto_decode::{b64_decode_fixed, decode_ratchet_header};
+use crate::crypto_outbox::{PendingOutbound, ensure_capacity};
 use crate::crypto_replay::{ProcessedMessage, now_secs, prune_processed, validate_peer_ids};
 use crate::crypto_store;
 
@@ -36,6 +37,10 @@ pub(crate) enum CryptoError {
     DecryptFailed,
     #[error("cryptographic state could not be persisted")]
     Persistence(#[source] anyhow::Error),
+    #[error("durable message queue is full")]
+    OutboxFull,
+    #[error("processed-message ledger is full")]
+    ReplayLedgerFull,
 }
 
 #[derive(Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
@@ -53,7 +58,6 @@ struct StoredOpk {
     public_bytes: [u8; 32],
 }
 
-/// X3DH data needed for the `PreKey` header on the first message.
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredX3dhResult {
     ephemeral_public: [u8; 32],
@@ -65,43 +69,6 @@ struct StoredX3dhResult {
 struct PeerSession {
     ratchet: SessionState,
     prekey_header: Option<StoredX3dhResult>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
-enum PendingOutbound {
-    Message {
-        recipient_id: UserId,
-        message_id: MessageId,
-        envelope: EncryptedEnvelope,
-    },
-    ReadReceipt {
-        recipient_id: UserId,
-        envelope: EncryptedEnvelope,
-    },
-}
-
-impl PendingOutbound {
-    fn to_client_message(&self) -> ClientMessage {
-        match self {
-            Self::Message {
-                recipient_id,
-                message_id,
-                envelope,
-            } => ClientMessage::SendMessage {
-                recipient_id: recipient_id.clone(),
-                message_id: message_id.clone(),
-                envelope: envelope.clone(),
-            },
-            Self::ReadReceipt {
-                recipient_id,
-                envelope,
-            } => ClientMessage::SendReadReceipt {
-                recipient_id: recipient_id.clone(),
-                envelope: envelope.clone(),
-            },
-        }
-    }
 }
 
 pub(crate) enum InboundDecrypt {
@@ -184,7 +151,6 @@ impl CryptoManager {
         })
     }
 
-    /// Whether registration is needed (no SPK persisted locally).
     pub(crate) const fn needs_registration(&self) -> bool {
         self.stored_spk.is_none()
     }
@@ -313,7 +279,6 @@ impl CryptoManager {
         Ok(envelope)
     }
 
-    /// Atomically persist an advanced ratchet and the ciphertext it produced.
     pub(crate) fn encrypt_message(
         &mut self,
         peer_id: &str,
@@ -321,6 +286,7 @@ impl CryptoManager {
         message_id: &MessageId,
         plaintext: &[u8],
     ) -> Result<ClientMessage, CryptoError> {
+        ensure_capacity(&self.pending_outbound, plaintext.len())?;
         let (original_session, envelope) = self.advance_encryption(peer_id, plaintext)?;
         let pending = PendingOutbound::Message {
             recipient_id: recipient_id.clone(),
@@ -362,17 +328,39 @@ impl CryptoManager {
         Ok(())
     }
 
-    pub(crate) fn confirm_read_receipt_sent(&mut self) -> anyhow::Result<()> {
-        let Some(index) = self
-            .pending_outbound
-            .iter()
-            .position(|pending| matches!(pending, PendingOutbound::ReadReceipt { .. }))
-        else {
+    pub(crate) fn confirm_read_receipt_sent(
+        &mut self,
+        receipt_id: &MessageId,
+    ) -> anyhow::Result<()> {
+        let Some(index) = self.pending_outbound.iter().position(|pending| {
+            matches!(
+                pending,
+                PendingOutbound::ReadReceipt { receipt_id: pending_id, .. }
+                    if pending_id == receipt_id
+            )
+        }) else {
             return Ok(());
         };
         let pending = self.pending_outbound.remove(index);
         if let Err(error) = self.persist_state() {
             self.pending_outbound.insert(index, pending);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn confirm_acked(&mut self, message_ids: &[MessageId]) -> anyhow::Result<()> {
+        let previous = self.processed_messages.clone();
+        for message_id in message_ids {
+            let key = message_id.to_string();
+            for messages in self.processed_messages.values_mut() {
+                messages.remove(&key);
+            }
+        }
+        self.processed_messages
+            .retain(|_, messages| !messages.is_empty());
+        if let Err(error) = self.persist_state() {
+            self.processed_messages = previous;
             return Err(error);
         }
         Ok(())
@@ -437,6 +425,17 @@ impl CryptoManager {
         envelope: &EncryptedEnvelope,
         processed_message_id: Option<&str>,
     ) -> Result<Vec<u8>, CryptoError> {
+        prune_processed(&mut self.processed_messages, now_secs());
+        if processed_message_id.is_some()
+            && self
+                .processed_messages
+                .values()
+                .map(HashMap::len)
+                .sum::<usize>()
+                >= protocol::consts::MAX_PROCESSED_MESSAGES
+        {
+            return Err(CryptoError::ReplayLedgerFull);
+        }
         if let MessageHeader::PreKey {
             sender_identity_key,
             sender_ephemeral_key,
@@ -669,12 +668,10 @@ impl CryptoManager {
         peers
     }
 
-    /// Base64-encoded local identity public key (Ed25519 verifying key).
     pub(crate) fn local_identity_key_b64(&self) -> String {
         B64.encode(self.identity.verifying_key().as_bytes())
     }
 
-    /// Encrypt a read receipt (list of message ID strings) using the E2EE session.
     pub(crate) fn encrypt_read_receipt(
         &mut self,
         peer_id: &str,
@@ -692,9 +689,12 @@ impl CryptoManager {
         if estimated_ct_len > protocol::consts::MAX_CIPHERTEXT_BYTES {
             return Err(CryptoError::RatchetFailed);
         }
+        ensure_capacity(&self.pending_outbound, plaintext.len())?;
+        let receipt_id = MessageId::new();
         let (original_session, envelope) = self.advance_encryption(peer_id, &plaintext)?;
         let pending = PendingOutbound::ReadReceipt {
             recipient_id: recipient_id.clone(),
+            receipt_id,
             envelope,
         };
         self.pending_outbound.push(pending.clone());

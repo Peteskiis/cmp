@@ -159,10 +159,11 @@ pub(crate) async fn handle_message(
         }
         ClientMessage::SendReadReceipt {
             recipient_id,
+            receipt_id,
             envelope,
         } => {
             let sender_id = session.authed_user.as_ref()?;
-            message::handle_read_receipt(state, sender_id, &recipient_id, &envelope)
+            message::handle_read_receipt(state, sender_id, &recipient_id, receipt_id, &envelope)
         }
         _ => {
             warn!("unhandled message type");

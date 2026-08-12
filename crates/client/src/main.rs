@@ -4,6 +4,7 @@ mod app;
 mod command_popup;
 mod crypto_decode;
 mod crypto_mgr;
+mod crypto_outbox;
 mod crypto_replay;
 mod crypto_store;
 mod db;

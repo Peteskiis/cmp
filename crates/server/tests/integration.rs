@@ -330,7 +330,17 @@ async fn ack_removes_from_queue() {
         panic!("expected QueuedMessages");
     };
     let ids: Vec<MessageId> = messages.into_iter().map(|m| m.message_id).collect();
-    send(&mut bs2, &ClientMessage::Ack { message_ids: ids }).await;
+    send(
+        &mut bs2,
+        &ClientMessage::Ack {
+            message_ids: ids.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut br2).await,
+        ServerMessage::AckSuccess { message_ids } if message_ids == ids
+    ));
     drop((bs2, br2));
 
     // Bob reconnects again — queue should be empty (no QueuedMessages)
@@ -451,6 +461,7 @@ async fn malformed_envelope_keys_are_rejected_on_all_relay_paths() {
         &mut alice_sink,
         &ClientMessage::SendReadReceipt {
             recipient_id: UserId::new("bob").unwrap(),
+            receipt_id: MessageId::new(),
             envelope: invalid,
         },
     )
@@ -632,20 +643,51 @@ async fn read_receipt_relay() {
     register(&mut bs1, &mut br1, "bob", &bob_id).await;
 
     // Bob sends a read receipt to Alice (encrypted envelope as opaque blob)
+    let receipt_id = MessageId::new();
     send(
         &mut bs1,
         &ClientMessage::SendReadReceipt {
             recipient_id: UserId::new("alice").unwrap(),
+            receipt_id: receipt_id.clone(),
             envelope: dummy_envelope("read-receipt-data"),
         },
     )
     .await;
 
-    assert!(matches!(recv(&mut br1).await, ServerMessage::Success));
+    assert!(matches!(
+        recv(&mut br1).await,
+        ServerMessage::ReadReceiptSent { receipt_id: sent } if sent == receipt_id
+    ));
 
     let resp = recv(&mut ar1).await;
     let ServerMessage::IncomingReadReceipt { sender_id, .. } = resp else {
         panic!("expected IncomingReadReceipt: {resp:?}");
     };
     assert_eq!(sender_id.as_str(), "bob");
+}
+
+#[tokio::test]
+async fn offline_read_receipt_is_not_confirmed() {
+    let (url, _handle) = start_test_server().await;
+    let alice_id = make_identity();
+    let bob_id = make_identity();
+    let (mut alice_sink, mut alice_stream) = connect(&url).await;
+    register(&mut alice_sink, &mut alice_stream, "alice", &alice_id).await;
+    let (mut bob_sink, mut bob_stream) = connect(&url).await;
+    register(&mut bob_sink, &mut bob_stream, "bob", &bob_id).await;
+    drop((alice_sink, alice_stream));
+
+    send(
+        &mut bob_sink,
+        &ClientMessage::SendReadReceipt {
+            recipient_id: UserId::new("alice").unwrap(),
+            receipt_id: MessageId::new(),
+            envelope: dummy_envelope("retry me"),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut bob_stream).await,
+        ServerMessage::Error { code: 400, .. }
+    ));
 }

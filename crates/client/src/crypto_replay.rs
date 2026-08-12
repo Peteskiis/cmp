@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct ProcessedMessage {
     pub(super) pending_plaintext: Option<String>,
     pub(super) processed_at: u64,

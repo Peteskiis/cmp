@@ -107,8 +107,9 @@ pub(crate) async fn handle_ack(
     let ids: Vec<String> = message_ids.iter().map(ToString::to_string).collect();
     if let Err(e) = db::queue::delete_messages(&state.db, recipient_id, &ids).await {
         tracing::warn!(recipient_id, "ack delete failed: {e}");
+        return Some(error_500_generic());
     }
-    None
+    Some(ServerMessage::AckSuccess { message_ids })
 }
 
 /// Relay a typing indicator — online only, never queued.
@@ -130,6 +131,7 @@ pub(crate) fn handle_read_receipt(
     state: &AppState,
     from: &str,
     to: &UserId,
+    receipt_id: MessageId,
     envelope: &protocol::EncryptedEnvelope,
 ) -> Option<ServerMessage> {
     if let Err(message) = validate_envelope(envelope) {
@@ -138,17 +140,21 @@ pub(crate) fn handle_read_receipt(
     let Ok(from_uid) = UserId::new(from) else {
         return None;
     };
-    state.connections.send_to(
+    let delivered = state.connections.send_to(
         to.as_str(),
         ServerMessage::IncomingReadReceipt {
             sender_id: from_uid,
             envelope: envelope.clone(),
         },
     );
-    Some(ServerMessage::Success)
+    if delivered {
+        Some(ServerMessage::ReadReceiptSent { receipt_id })
+    } else {
+        Some(error_400("recipient is not available"))
+    }
 }
 
-fn validate_envelope(envelope: &EncryptedEnvelope) -> Result<(), &'static str> {
+pub(crate) fn validate_envelope(envelope: &EncryptedEnvelope) -> Result<(), &'static str> {
     if envelope.ciphertext.len() > consts::MAX_CIPHERTEXT_BYTES {
         return Err("ciphertext exceeds maximum size");
     }
