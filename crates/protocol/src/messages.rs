@@ -82,7 +82,8 @@ pub enum ServerMessage {
 
     IncomingMessage(InboundMessage),
 
-    /// Max `consts::MAX_QUEUED_MESSAGES` items.
+    /// Max `consts::MAX_QUEUED_MESSAGES_PER_PAGE` items and
+    /// `consts::MAX_QUEUED_PAGE_BYTES` encoded bytes per response.
     QueuedMessages {
         messages: Vec<InboundMessage>,
     },

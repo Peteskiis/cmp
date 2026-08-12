@@ -69,37 +69,37 @@ pub enum EnqueueResult {
     RecipientNotFound,
 }
 
-/// Retrieve queued messages for a recipient, ordered by creation time.
-/// Limited to `max_count` to prevent unbounded memory use.
-pub async fn get_pending(
+/// Retrieve the next queued message after `after_row_id`.
+///
+/// Fetching one row at a time prevents a batch of maximum-size ciphertexts
+/// from being materialized in memory before byte-bounded pages are assembled.
+pub async fn get_next_pending(
     conn: &Connection,
     recipient_id: &str,
-    max_count: usize,
-) -> anyhow::Result<Vec<QueuedRow>> {
+    after_row_id: i64,
+) -> anyhow::Result<Option<QueuedRow>> {
     let recipient_id = recipient_id.to_owned();
 
     conn.call(move |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT message_id, sender_id, envelope, created_at
+        let mut stmt = conn.prepare_cached(
+            "SELECT rowid, message_id, sender_id, envelope, created_at
              FROM message_queue
-             WHERE recipient_id = ?1
-             ORDER BY created_at ASC
-             LIMIT ?2",
+             WHERE recipient_id = ?1 AND rowid > ?2
+             ORDER BY rowid ASC
+             LIMIT 1",
         )?;
-        // usize to i64 for SQLite parameter — safe, max_count is bounded by protocol consts
-        #[allow(clippy::cast_possible_wrap)]
-        let limit = max_count as i64;
-        let rows = stmt
-            .query_map((&recipient_id, limit), |row| {
+        let mut rows = stmt.query((&recipient_id, after_row_id))?;
+        rows.next()?
+            .map(|row| {
                 Ok(QueuedRow {
-                    message_id: row.get(0)?,
-                    sender_id: row.get(1)?,
-                    envelope_json: row.get(2)?,
-                    created_at: row.get(3)?,
+                    row_id: row.get(0)?,
+                    message_id: row.get(1)?,
+                    sender_id: row.get(2)?,
+                    envelope_json: row.get(3)?,
+                    created_at: row.get(4)?,
                 })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+            })
+            .transpose()
     })
     .await
     .map_err(Into::into)
@@ -152,6 +152,7 @@ pub async fn gc_old_messages(conn: &Connection, max_age_days: u32) -> anyhow::Re
 }
 
 pub struct QueuedRow {
+    pub row_id: i64,
     pub message_id: String,
     pub sender_id: String,
     pub envelope_json: String,

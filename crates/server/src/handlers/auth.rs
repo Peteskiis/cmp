@@ -207,78 +207,114 @@ pub async fn deliver_queued_messages(
     tx: &mpsc::Sender<ServerMessage>,
     user_id: &str,
 ) {
-    let queued = match db::queue::get_pending(&state.db, user_id, consts::MAX_QUEUED_MESSAGES).await
-    {
-        Ok(q) if !q.is_empty() => q,
-        Ok(_) => return,
-        Err(e) => {
-            warn!(user_id, "failed to fetch queued messages: {e}");
+    let empty_page_bytes = match serde_json::to_vec(&ServerMessage::QueuedMessages {
+        messages: Vec::new(),
+    }) {
+        Ok(encoded) => encoded.len(),
+        Err(error) => {
+            warn!(user_id, "failed to size queued page: {error}");
             return;
         }
     };
+    let mut cursor = 0;
+    let mut visited = 0;
+    let mut page = Vec::new();
+    let mut page_bytes = empty_page_bytes;
 
-    let messages: Vec<protocol::InboundMessage> = queued
-        .into_iter()
-        .filter_map(|row| {
-            let envelope = match serde_json::from_str(&row.envelope_json) {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(
-                        message_id = row.message_id,
-                        "malformed queued envelope: {e}"
-                    );
-                    return None;
-                }
-            };
-            let sender_id = match protocol::UserId::new(&row.sender_id) {
-                Ok(id) => id,
-                Err(e) => {
-                    warn!(message_id = row.message_id, "invalid sender_id: {e}");
-                    return None;
-                }
-            };
-            let message_id = match uuid::Uuid::parse_str(&row.message_id) {
-                Ok(uuid) => protocol::MessageId::from(uuid),
-                Err(e) => {
-                    warn!(message_id = row.message_id, "invalid message_id: {e}");
-                    return None;
-                }
-            };
-            // Parse SQLite datetime string to unix timestamp
-            let timestamp = parse_sqlite_datetime(&row.created_at);
-            Some(protocol::InboundMessage {
-                message_id,
-                sender_id,
-                envelope,
-                timestamp,
-            })
-        })
-        .collect();
-
-    if !messages.is_empty() {
-        // Group message IDs by sender for delivery receipts
-        let mut delivery_by_sender: std::collections::HashMap<String, Vec<protocol::MessageId>> =
-            std::collections::HashMap::new();
-        for msg in &messages {
-            delivery_by_sender
-                .entry(msg.sender_id.as_str().to_owned())
-                .or_default()
-                .push(msg.message_id.clone());
-        }
-
-        if tx
-            .try_send(ServerMessage::QueuedMessages { messages })
-            .is_ok()
-        {
-            // Server-generated delivery receipts for queued messages — notify original senders
-            for (sender, ids) in delivery_by_sender {
-                state.connections.send_to(
-                    &sender,
-                    ServerMessage::MessageDelivered { message_ids: ids },
-                );
+    while visited < consts::MAX_QUEUED_MESSAGES {
+        let row = match db::queue::get_next_pending(&state.db, user_id, cursor).await {
+            Ok(Some(row)) => row,
+            Ok(None) => break,
+            Err(error) => {
+                warn!(user_id, "failed to fetch queued message: {error}");
+                return;
             }
+        };
+        cursor = row.row_id;
+        visited += 1;
+
+        let message = match queued_row_to_inbound(&row) {
+            Ok(message) => message,
+            Err(error) => {
+                warn!(
+                    message_id = row.message_id,
+                    "invalid queued message: {error}"
+                );
+                continue;
+            }
+        };
+        let item_bytes = match serde_json::to_vec(&message) {
+            Ok(encoded) => encoded.len(),
+            Err(error) => {
+                warn!(user_id, "failed to size queued message: {error}");
+                continue;
+            }
+        };
+        let separator_bytes = usize::from(!page.is_empty());
+        let page_full = page.len() >= consts::MAX_QUEUED_MESSAGES_PER_PAGE
+            || page_bytes + separator_bytes + item_bytes > consts::MAX_QUEUED_PAGE_BYTES;
+
+        if page_full {
+            if page.is_empty() {
+                warn!(user_id, "queued message exceeds WebSocket page limit");
+                return;
+            }
+            if !send_queued_page(state, tx, std::mem::take(&mut page)).await {
+                return;
+            }
+            page_bytes = empty_page_bytes;
         }
+
+        page_bytes += usize::from(!page.is_empty()) + item_bytes;
+        page.push(message);
     }
+
+    if !page.is_empty() {
+        let _ = send_queued_page(state, tx, page).await;
+    }
+}
+
+async fn send_queued_page(
+    state: &AppState,
+    tx: &mpsc::Sender<ServerMessage>,
+    messages: Vec<protocol::InboundMessage>,
+) -> bool {
+    let mut delivery_by_sender: std::collections::HashMap<String, Vec<protocol::MessageId>> =
+        std::collections::HashMap::new();
+    for message in &messages {
+        delivery_by_sender
+            .entry(message.sender_id.as_str().to_owned())
+            .or_default()
+            .push(message.message_id.clone());
+    }
+
+    if tx
+        .send(ServerMessage::QueuedMessages { messages })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    for (sender, ids) in delivery_by_sender {
+        state.connections.send_to(
+            &sender,
+            ServerMessage::MessageDelivered { message_ids: ids },
+        );
+    }
+    true
+}
+
+fn queued_row_to_inbound(row: &db::queue::QueuedRow) -> anyhow::Result<protocol::InboundMessage> {
+    let envelope = serde_json::from_str(&row.envelope_json)?;
+    let sender_id = protocol::UserId::new(&row.sender_id)?;
+    let message_id = protocol::MessageId::from(uuid::Uuid::parse_str(&row.message_id)?);
+    Ok(protocol::InboundMessage {
+        message_id,
+        sender_id,
+        envelope,
+        timestamp: parse_sqlite_datetime(&row.created_at),
+    })
 }
 
 /// Parse `SQLite` `datetime('now')` format (`YYYY-MM-DD HH:MM:SS`) to unix timestamp.

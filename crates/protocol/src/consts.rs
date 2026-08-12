@@ -4,8 +4,16 @@ pub const MAX_PREKEYS_PER_UPLOAD: usize = 200;
 /// Maximum message IDs in a single Ack batch.
 pub const MAX_ACK_BATCH: usize = 1000;
 
-/// Maximum queued messages delivered in a single `QueuedMessages` response.
+/// Maximum queued messages delivered during one authentication cycle.
 pub const MAX_QUEUED_MESSAGES: usize = 1000;
+
+/// Maximum queued messages in one WebSocket response. The byte limit below
+/// will usually produce smaller pages for large ciphertexts.
+pub const MAX_QUEUED_MESSAGES_PER_PAGE: usize = 64;
+
+/// Maximum encoded size of a queued-delivery WebSocket response. This keeps a
+/// full-size ciphertext deliverable while bounding each allocation and frame.
+pub const MAX_QUEUED_PAGE_BYTES: usize = MAX_CIPHERTEXT_BYTES + 16 * 1024;
 
 /// Maximum ciphertext field size in bytes (base64-encoded, accounts for
 /// encryption overhead + base64 expansion).
