@@ -1,4 +1,4 @@
-use protocol::{ClientMessage, EncryptedEnvelope, MessageId, UserId, consts};
+use protocol::{ClientMessage, EncryptedEnvelope, MessageId, OneTimePreKey, UserId, consts};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto_mgr::CryptoError;
@@ -24,6 +24,10 @@ pub(super) enum PendingOutbound {
         ack_id: MessageId,
         receipt_ids: Vec<MessageId>,
     },
+    PreKeyUpload {
+        upload_id: MessageId,
+        prekeys: Vec<OneTimePreKey>,
+    },
 }
 
 impl PendingOutbound {
@@ -33,6 +37,7 @@ impl PendingOutbound {
                 recipient_id,
                 message_id,
                 envelope,
+                ..
             } => ClientMessage::SendMessage {
                 recipient_id: recipient_id.clone(),
                 message_id: message_id.clone(),
@@ -61,6 +66,10 @@ impl PendingOutbound {
                 ack_id: ack_id.clone(),
                 receipt_ids: receipt_ids.clone(),
             },
+            Self::PreKeyUpload { upload_id, prekeys } => ClientMessage::UploadPreKeys {
+                upload_id: upload_id.clone(),
+                prekeys: prekeys.clone(),
+            },
         }
     }
 
@@ -71,6 +80,7 @@ impl PendingOutbound {
             }
             Self::Ack { message_ids, .. } => message_ids.len() * 36,
             Self::ReadReceiptAck { receipt_ids, .. } => receipt_ids.len() * 36,
+            Self::PreKeyUpload { prekeys, .. } => prekeys.len() * 48,
         }
     }
 
@@ -79,6 +89,7 @@ impl PendingOutbound {
             Self::Message { message_id, .. } => message_id.to_string(),
             Self::ReadReceipt { receipt_id, .. } => receipt_id.to_string(),
             Self::Ack { ack_id, .. } | Self::ReadReceiptAck { ack_id, .. } => ack_id.to_string(),
+            Self::PreKeyUpload { upload_id, .. } => upload_id.to_string(),
         }
     }
 }

@@ -48,6 +48,15 @@ fn alice_encrypt_bob_decrypt_prekey() {
 }
 
 #[test]
+fn unused_prekey_session_expires_before_first_encryption() {
+    let (mut alice, _bob, _alice_dir, _bob_dir) = setup_alice_and_bob();
+    alice.sessions.get_mut("bob").unwrap().prekey_expires_at = Some(0);
+
+    assert!(alice.expire_stale_prekey_session("bob").unwrap());
+    assert!(!alice.has_session("bob"));
+}
+
+#[test]
 fn forged_prekey_no_orphan_session_no_opk_consumed() {
     let (_alice, mut bob, _a_dir, _b_dir) = setup_alice_and_bob();
     let opk_count_before = bob.stored_opks.len();
@@ -195,6 +204,11 @@ fn disk_full_during_decrypt_preserves_session_and_opk_for_restart() {
 #[test]
 fn outbound_ciphertext_survives_restart_until_server_confirmation() {
     let (mut alice, mut bob, a_dir, _b_dir) = setup_alice_and_bob();
+    let handshake = alice.encrypt("bob", b"establish session").unwrap();
+    assert_eq!(
+        bob.decrypt("alice", &handshake).unwrap(),
+        b"establish session"
+    );
     let message_id = MessageId::new();
     let second_message_id = MessageId::new();
     let recipient = UserId::new("bob").unwrap();
@@ -235,6 +249,29 @@ fn outbound_ciphertext_survives_restart_until_server_confirmation() {
     drop(restarted);
     let confirmed = CryptoManager::load_or_generate(a_dir.path()).unwrap();
     assert!(confirmed.pending_messages().is_empty());
+}
+
+#[test]
+fn rejected_prekey_message_resets_session_and_durable_outbox() {
+    let (mut alice, _bob, a_dir, _b_dir) = setup_alice_and_bob();
+    let message_id = MessageId::new();
+    let recipient = UserId::new("bob").unwrap();
+    alice
+        .encrypt_message("bob", &recipient, &message_id, b"expired lease")
+        .unwrap();
+    assert!(matches!(
+        alice.encrypt_message("bob", &recipient, &MessageId::new(), b"too early"),
+        Err(CryptoError::AwaitingPrekeyAdmission)
+    ));
+
+    assert_eq!(alice.reject_message(&message_id).unwrap(), Some(recipient));
+    assert!(!alice.has_session("bob"));
+    assert!(alice.pending_messages().is_empty());
+    drop(alice);
+
+    let restarted = CryptoManager::load_or_generate(a_dir.path()).unwrap();
+    assert!(!restarted.has_session("bob"));
+    assert!(restarted.pending_messages().is_empty());
 }
 
 #[test]
@@ -517,4 +554,154 @@ fn corrupt_persisted_state_is_not_silently_discarded() {
     drop(connection);
 
     assert!(CryptoManager::load_or_generate(directory.path()).is_err());
+}
+
+#[test]
+fn prekey_replenishment_is_durable_correlated_and_monotonic() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manager = CryptoManager::load_or_generate(directory.path()).unwrap();
+    let signed_prekey = SignedPreKey::generate(0, manager.identity());
+    let initial = crypto::keys::generate_one_time_prekeys(0, 2).unwrap();
+    manager
+        .persist_registration_keys(&signed_prekey, &initial)
+        .unwrap();
+
+    let upload = manager.queue_prekey_replenishment().unwrap();
+    let ClientMessage::UploadPreKeys { upload_id, prekeys } = upload else {
+        panic!("expected pre-key upload");
+    };
+    assert_eq!(prekeys.len(), protocol::consts::PREKEY_TARGET);
+    assert_eq!(prekeys.first().unwrap().key_id, 1 << 31);
+    assert_eq!(prekeys.last().unwrap().key_id, (1 << 31) + 99);
+    drop(manager);
+
+    let mut restarted = CryptoManager::load_or_generate(directory.path()).unwrap();
+    assert!(matches!(
+        restarted.pending_messages().as_slice(),
+        [ClientMessage::UploadPreKeys { upload_id: pending_id, prekeys: pending }]
+            if pending_id == &upload_id && pending == &prekeys
+    ));
+    assert!(
+        restarted
+            .confirm_prekeys_uploaded(&upload_id, true, 0)
+            .unwrap()
+            .is_some()
+    );
+    let next = restarted.queue_prekey_replenishment().unwrap();
+    let ClientMessage::UploadPreKeys { prekeys: next, .. } = next else {
+        panic!("expected second pre-key upload");
+    };
+    assert_eq!(next.first().unwrap().key_id, (1 << 31) + 100);
+}
+
+#[test]
+fn rejected_prekey_upload_discards_unpublished_private_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manager = CryptoManager::load_or_generate(directory.path()).unwrap();
+    let upload = manager.queue_prekey_replenishment().unwrap();
+    let ClientMessage::UploadPreKeys { upload_id, prekeys } = upload else {
+        panic!("expected pre-key upload");
+    };
+
+    manager
+        .confirm_prekeys_uploaded(&upload_id, false, 200)
+        .unwrap();
+    assert!(
+        prekeys
+            .iter()
+            .all(|prekey| !manager.stored_opks.contains_key(&prekey.key_id))
+    );
+    drop(manager);
+
+    let restarted = CryptoManager::load_or_generate(directory.path()).unwrap();
+    assert!(restarted.pending_messages().is_empty());
+    assert!(
+        prekeys
+            .iter()
+            .all(|prekey| !restarted.stored_opks.contains_key(&prekey.key_id))
+    );
+}
+
+#[test]
+fn replenishment_prunes_private_prekeys_past_queue_retention() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manager = CryptoManager::load_or_generate(directory.path()).unwrap();
+    let signed_prekey = SignedPreKey::generate(0, manager.identity());
+    let initial = crypto::keys::generate_one_time_prekeys(0, 2).unwrap();
+    manager
+        .persist_registration_keys(&signed_prekey, &initial)
+        .unwrap();
+    manager
+        .one_time_prekey_created_at
+        .values_mut()
+        .for_each(|created_at| {
+            *created_at = 0;
+        });
+
+    manager.queue_prekey_replenishment().unwrap();
+    assert_eq!(manager.stored_opks.len(), protocol::consts::PREKEY_TARGET);
+    assert!(!manager.stored_opks.contains_key(&0));
+    assert!(!manager.stored_opks.contains_key(&1));
+    drop(manager);
+
+    let restarted = CryptoManager::load_or_generate(directory.path()).unwrap();
+    assert_eq!(restarted.stored_opks.len(), protocol::consts::PREKEY_TARGET);
+    assert!(!restarted.stored_opks.contains_key(&0));
+    assert!(!restarted.stored_opks.contains_key(&1));
+}
+
+#[test]
+fn legacy_state_uses_disjoint_prekey_id_range() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manager = CryptoManager::load_or_generate(directory.path()).unwrap();
+    let signed_prekey = SignedPreKey::generate(0, manager.identity());
+    let initial = crypto::keys::generate_one_time_prekeys(0, 2).unwrap();
+    manager
+        .persist_registration_keys(&signed_prekey, &initial)
+        .unwrap();
+    drop(manager);
+
+    let connection = rusqlite::Connection::open(directory.path().join("crypto.db")).unwrap();
+    let json: String = connection
+        .query_row("SELECT json FROM core_state WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mut state: serde_json::Value = serde_json::from_str(&json).unwrap();
+    state
+        .as_object_mut()
+        .unwrap()
+        .remove("next_one_time_prekey_id");
+    connection
+        .execute(
+            "UPDATE core_state SET json = ?1 WHERE id = 1",
+            [serde_json::to_string(&state).unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut manager = CryptoManager::load_or_generate(directory.path()).unwrap();
+    let ClientMessage::UploadPreKeys { prekeys, .. } =
+        manager.queue_prekey_replenishment().unwrap()
+    else {
+        panic!("expected pre-key upload");
+    };
+    assert_eq!(prekeys.first().unwrap().key_id, 1 << 31);
+}
+
+#[test]
+fn prekey_replenishment_persistence_failure_restores_ids_and_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manager = CryptoManager::load_or_generate(directory.path()).unwrap();
+    let before_id = manager.next_one_time_prekey_id;
+    let before_keys = manager.stored_opks.len();
+    manager.fail_persistence = true;
+
+    assert!(matches!(
+        manager.queue_prekey_replenishment(),
+        Err(CryptoError::Persistence(_))
+    ));
+    assert_eq!(manager.next_one_time_prekey_id, before_id);
+    assert_eq!(manager.stored_opks.len(), before_keys);
+    assert!(manager.pending_messages().is_empty());
 }

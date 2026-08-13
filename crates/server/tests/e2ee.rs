@@ -141,7 +141,7 @@ fn make_bundle_with_keys(
     Vec<crypto::keys::OneTimePreKey>,
 ) {
     let spk = crypto::keys::SignedPreKey::generate(0, identity);
-    let opks = crypto::keys::generate_one_time_prekeys(0, 5).unwrap();
+    let opks = crypto::keys::generate_one_time_prekeys(0, 20).unwrap();
 
     let bundle = PreKeyBundle {
         identity_key: B64.encode(identity.verifying_key().as_bytes()),

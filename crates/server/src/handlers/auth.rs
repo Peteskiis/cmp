@@ -196,6 +196,7 @@ pub(crate) async fn handle_auth_response(
     let user_id = challenge.user_id;
     session.conn_id = Some(state.connections.insert(user_id.clone(), tx.clone()));
     session.authed_user = Some(user_id.clone());
+    session.deliver_prekey_status = true;
     info!(user_id, "authenticated");
 
     ServerMessage::AuthSuccess
@@ -300,6 +301,59 @@ pub(crate) async fn deliver_queued_receipts(
         }
     }
     deliver_receipt_confirmations(state, tx, user_id).await;
+}
+
+#[allow(clippy::cognitive_complexity)]
+pub(crate) async fn deliver_message_confirmations(
+    state: &AppState,
+    tx: &mpsc::Sender<ServerMessage>,
+    user_id: &str,
+) {
+    let ids = match db::queue::pending_acceptances(&state.db, user_id, consts::MAX_QUEUE_PER_USER)
+        .await
+    {
+        Ok(ids) => ids,
+        Err(error) => {
+            warn!(user_id, "failed to load message confirmations: {error}");
+            return;
+        }
+    };
+    for id in ids {
+        let Ok(message_id) = uuid::Uuid::parse_str(&id) else {
+            continue;
+        };
+        if tx
+            .send(ServerMessage::MessageSent {
+                message_id: message_id.into(),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+pub(crate) async fn deliver_prekey_status(
+    state: &AppState,
+    tx: &mpsc::Sender<ServerMessage>,
+    user_id: &str,
+) {
+    if let Some(remaining) = load_prekey_count(state, user_id).await
+        && remaining < super::prekey::PREKEY_LOW_THRESHOLD
+    {
+        let _ = tx.send(ServerMessage::PreKeyLow { remaining }).await;
+    }
+}
+
+async fn load_prekey_count(state: &AppState, user_id: &str) -> Option<u32> {
+    match db::prekeys::count_prekeys(&state.db, user_id).await {
+        Ok(remaining) => Some(remaining),
+        Err(error) => {
+            warn!(user_id, "failed to fetch prekey inventory: {error}");
+            None
+        }
+    }
 }
 
 async fn deliver_receipt_confirmations(

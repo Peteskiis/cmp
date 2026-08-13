@@ -19,9 +19,17 @@ use crate::crypto_outbox::{PendingOutbound, ensure_capacity};
 use crate::crypto_replay::{ProcessedMessage, now_secs, prune_processed, validate_peer_ids};
 use crate::crypto_store;
 
+const LEGACY_PREKEY_ID_FLOOR: u32 = 1 << 31;
+
 #[path = "crypto_mgr_persistence.rs"]
 mod persistence;
 use persistence::{decode_stored_opks, decode_stored_spk, restore_entry};
+
+#[path = "crypto_mgr_prekeys.rs"]
+mod prekeys;
+
+#[path = "crypto_mgr_outbound.rs"]
+mod outbound;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -42,6 +50,8 @@ pub(crate) enum CryptoError {
     Persistence(#[source] anyhow::Error),
     #[error("durable message queue is full")]
     OutboxFull,
+    #[error("waiting for the server to accept the first message")]
+    AwaitingPrekeyAdmission,
     #[error("processed-message ledger is full")]
     ReplayLedgerFull,
 }
@@ -72,6 +82,8 @@ struct StoredX3dhResult {
 struct PeerSession {
     ratchet: SessionState,
     prekey_header: Option<StoredX3dhResult>,
+    #[serde(default)]
+    prekey_expires_at: Option<u64>,
 }
 
 pub(crate) enum InboundDecrypt {
@@ -85,6 +97,10 @@ struct CoreState {
     signed_prekey: Option<StoredSpk>,
     one_time_prekeys: Vec<StoredOpk>,
     sessions: HashMap<String, PeerSession>,
+    #[serde(default)]
+    next_one_time_prekey_id: Option<u32>,
+    #[serde(default)]
+    one_time_prekey_created_at: HashMap<u32, u64>,
 }
 
 #[derive(Serialize)]
@@ -92,6 +108,8 @@ struct CoreStateRef<'a> {
     signed_prekey: Option<StoredSpk>,
     one_time_prekeys: Vec<StoredOpk>,
     sessions: &'a HashMap<String, PeerSession>,
+    next_one_time_prekey_id: u32,
+    one_time_prekey_created_at: &'a HashMap<u32, u64>,
 }
 
 pub(crate) struct CryptoManager {
@@ -100,6 +118,8 @@ pub(crate) struct CryptoManager {
     pending_inits: HashSet<String>,
     stored_spk: Option<SignedPreKey>,
     stored_opks: HashMap<u32, OneTimePreKey>,
+    next_one_time_prekey_id: u32,
+    one_time_prekey_created_at: HashMap<u32, u64>,
     pending_outbound: Vec<PendingOutbound>,
     processed_messages: HashMap<String, HashMap<String, ProcessedMessage>>,
     store: crypto_store::CryptoStore,
@@ -144,6 +164,23 @@ impl CryptoManager {
         }
         let stored_spk = decode_stored_spk(persisted.signed_prekey)?;
         let stored_opks = decode_stored_opks(persisted.one_time_prekeys);
+        let mut one_time_prekey_created_at = persisted.one_time_prekey_created_at;
+        let loaded_at = now_secs();
+        one_time_prekey_created_at.retain(|key_id, _| stored_opks.contains_key(key_id));
+        for key_id in stored_opks.keys() {
+            one_time_prekey_created_at
+                .entry(*key_id)
+                .or_insert(loaded_at);
+        }
+        let derived_next_id = stored_opks
+            .keys()
+            .max()
+            .map_or(0, |key_id| key_id.saturating_add(1));
+        let next_one_time_prekey_id = persisted
+            .next_one_time_prekey_id
+            .unwrap_or_default()
+            .max(derived_next_id)
+            .max(LEGACY_PREKEY_ID_FLOOR);
         validate_peer_ids(&persisted.sessions)?;
         validate_peer_ids(&processed_messages)?;
         let cutoff = now_secs().saturating_sub(crate::crypto_replay::RETENTION_SECS);
@@ -156,6 +193,8 @@ impl CryptoManager {
             pending_inits: HashSet::new(),
             stored_spk,
             stored_opks,
+            next_one_time_prekey_id,
+            one_time_prekey_created_at,
             pending_outbound,
             processed_messages,
             store,
@@ -181,42 +220,6 @@ impl CryptoManager {
 
     pub(crate) fn pending_peers(&self) -> Vec<String> {
         self.pending_inits.iter().cloned().collect()
-    }
-
-    /// Store SPK and OPK private keys after registration.
-    pub(crate) fn persist_registration_keys(
-        &mut self,
-        spk: &SignedPreKey,
-        opks: &[OneTimePreKey],
-    ) -> anyhow::Result<()> {
-        let new_spk = SignedPreKey::from_parts(
-            spk.key_id(),
-            spk.secret().to_bytes(),
-            spk.public().to_bytes(),
-            *spk.signature(),
-        );
-        let new_opks = opks
-            .iter()
-            .map(|opk| {
-                (
-                    opk.key_id(),
-                    OneTimePreKey::from_parts(
-                        opk.key_id(),
-                        opk.secret().to_bytes(),
-                        opk.public().to_bytes(),
-                    ),
-                )
-            })
-            .collect();
-
-        let previous_spk = self.stored_spk.replace(new_spk);
-        let previous_opks = std::mem::replace(&mut self.stored_opks, new_opks);
-        if let Err(error) = self.persist_state() {
-            self.stored_spk = previous_spk;
-            self.stored_opks = previous_opks;
-            return Err(error);
-        }
-        Ok(())
     }
 
     /// Initialize a session with a peer using their pre-key bundle (Alice's side).
@@ -271,6 +274,9 @@ impl CryptoManager {
             PeerSession {
                 ratchet: session,
                 prekey_header: Some(x3dh_data),
+                prekey_expires_at: Some(
+                    now_secs().saturating_add(protocol::consts::ONE_TIME_PREKEY_RESERVATION_SECS),
+                ),
             },
         );
         if let Err(error) = self.persist_state() {
@@ -302,6 +308,18 @@ impl CryptoManager {
         message_id: &MessageId,
         plaintext: &[u8],
     ) -> Result<ClientMessage, CryptoError> {
+        if self.pending_outbound.iter().any(|pending| {
+            matches!(
+                pending,
+                PendingOutbound::Message {
+                    recipient_id: pending_recipient,
+                    envelope: EncryptedEnvelope { header: MessageHeader::PreKey { .. }, .. },
+                    ..
+                } if pending_recipient == recipient_id
+            )
+        }) {
+            return Err(CryptoError::AwaitingPrekeyAdmission);
+        }
         ensure_capacity(&self.pending_outbound, plaintext.len())?;
         let (original_session, envelope) = self.advance_encryption(peer_id, plaintext)?;
         let pending = PendingOutbound::Message {
@@ -317,31 +335,6 @@ impl CryptoManager {
             return Err(CryptoError::Persistence(error));
         }
         Ok(pending.to_client_message())
-    }
-
-    pub(crate) fn pending_messages(&self) -> Vec<ClientMessage> {
-        self.pending_outbound
-            .iter()
-            .map(PendingOutbound::to_client_message)
-            .collect()
-    }
-
-    pub(crate) fn confirm_message_sent(&mut self, message_id: &MessageId) -> anyhow::Result<()> {
-        let Some(index) = self.pending_outbound.iter().position(|pending| {
-            matches!(
-                pending,
-                PendingOutbound::Message { message_id: pending_id, .. }
-                    if pending_id == message_id
-            )
-        }) else {
-            return Ok(());
-        };
-        let pending = self.pending_outbound.remove(index);
-        if let Err(error) = self.store.delete_outbound(&message_id.to_string()) {
-            self.pending_outbound.insert(index, pending);
-            return Err(error);
-        }
-        Ok(())
     }
 
     pub(crate) fn confirm_read_receipt_sent(
@@ -465,6 +458,7 @@ impl CryptoManager {
             message_number: header.message_number,
         };
         let header = if let Some(x3dh_data) = session.prekey_header.take() {
+            session.prekey_expires_at = None;
             MessageHeader::PreKey {
                 sender_identity_key: B64.encode(self.identity.verifying_key().as_bytes()),
                 sender_ephemeral_key: B64.encode(x3dh_data.ephemeral_public),
@@ -553,17 +547,18 @@ impl CryptoManager {
                 PeerSession {
                     ratchet: session,
                     prekey_header: None,
+                    prekey_expires_at: None,
                 },
             );
             let consumed_opk = recipient_one_time_prekey_id
-                .and_then(|opk_id| self.stored_opks.remove(&opk_id).map(|opk| (opk_id, opk)));
+                .and_then(|opk_id| self.take_one_time_prekey(opk_id).map(|opk| (opk_id, opk)));
             let inserted_marker = processed_message_id
                 .is_some_and(|message_id| self.mark_processed(peer_id, message_id, &plaintext));
 
             if let Err(error) = self.persist_decrypt(peer_id, processed_message_id) {
                 self.sessions.remove(peer_id);
-                if let Some((opk_id, opk)) = consumed_opk {
-                    self.stored_opks.insert(opk_id, opk);
+                if let Some((opk_id, (opk, created_at))) = consumed_opk {
+                    self.restore_one_time_prekey(opk_id, opk, created_at);
                 }
                 if inserted_marker {
                     self.remove_processed(peer_id, processed_message_id.unwrap_or_default());

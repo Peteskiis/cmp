@@ -1,6 +1,15 @@
 /// Maximum one-time pre-keys in a single upload or registration.
 pub const MAX_PREKEYS_PER_UPLOAD: usize = 200;
 
+/// Target number of one-time prekeys generated during registration/replenishment.
+pub const PREKEY_TARGET: usize = 100;
+
+/// Maximum server-side one-time prekey inventory per user.
+pub const MAX_PREKEYS_PER_USER: usize = 200;
+pub const ONE_TIME_PREKEY_PUBLIC_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+pub const ONE_TIME_PREKEY_PRIVATE_RETENTION_SECS: u64 = 61 * 24 * 60 * 60;
+pub const ONE_TIME_PREKEY_RESERVATION_SECS: u64 = 24 * 60 * 60;
+
 /// Maximum message IDs in a single Ack batch.
 pub const MAX_ACK_BATCH: usize = 1000;
 

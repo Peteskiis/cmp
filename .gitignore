@@ -2,6 +2,7 @@
 /target
 dist/*
 !dist/.gitkeep
+.ccp/
 
 # Databases
 *.db

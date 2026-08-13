@@ -58,7 +58,7 @@ fn make_identity() -> crypto::keys::IdentityKeyPair {
 
 fn make_bundle(identity: &crypto::keys::IdentityKeyPair) -> (PreKeyBundle, Vec<OneTimePreKey>) {
     let signed_prekey = crypto::keys::SignedPreKey::generate(0, identity);
-    let one_time_prekeys = crypto::keys::generate_one_time_prekeys(0, 5).unwrap();
+    let one_time_prekeys = crypto::keys::generate_one_time_prekeys(0, 20).unwrap();
     let bundle = PreKeyBundle {
         identity_key: B64.encode(identity.verifying_key().as_bytes()),
         signed_prekey: B64.encode(signed_prekey.public().as_bytes()),

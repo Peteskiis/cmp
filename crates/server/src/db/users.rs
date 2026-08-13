@@ -47,13 +47,24 @@ pub async fn register_atomic(
 
         {
             let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO prekeys (user_id, key_id, public_key)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO prekeys (user_id, key_id, public_key, created_at)
+                 VALUES (?1, ?2, ?3, unixepoch())",
             )?;
             for (key_id, public_key) in &prekeys {
                 stmt.execute((&user_id, key_id, public_key))?;
             }
         }
+
+        let high_water = prekeys
+            .iter()
+            .map(|(key_id, _)| i64::from(*key_id))
+            .max()
+            .unwrap_or(-1)
+            .max((1_i64 << 31) - 1);
+        tx.execute(
+            "INSERT INTO prekey_inventory (user_id, high_water) VALUES (?1, ?2)",
+            (&user_id, high_water),
+        )?;
 
         tx.commit()?;
         Ok(true)

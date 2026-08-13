@@ -25,6 +25,7 @@ pub enum ClientMessage {
 
     /// Max `consts::MAX_PREKEYS_PER_UPLOAD` items.
     UploadPreKeys {
+        upload_id: MessageId,
         prekeys: Vec<OneTimePreKey>,
     },
 
@@ -42,6 +43,10 @@ pub enum ClientMessage {
     /// Max `consts::MAX_ACK_BATCH` items.
     Ack {
         ack_id: MessageId,
+        message_ids: Vec<MessageId>,
+    },
+
+    AckMessageSent {
         message_ids: Vec<MessageId>,
     },
 
@@ -102,6 +107,11 @@ pub enum ServerMessage {
         message_id: MessageId,
     },
 
+    MessageRejected {
+        message_id: MessageId,
+        reason: String,
+    },
+
     AckSuccess {
         ack_id: MessageId,
         message_ids: Vec<MessageId>,
@@ -116,6 +126,12 @@ pub enum ServerMessage {
 
     /// Server alerts that one-time pre-keys are running low.
     PreKeyLow {
+        remaining: u32,
+    },
+
+    PreKeysUploaded {
+        upload_id: MessageId,
+        accepted: bool,
         remaining: u32,
     },
 
@@ -258,6 +274,7 @@ mod tests {
     #[test]
     fn client_upload_prekeys() {
         roundtrip_client(&ClientMessage::UploadPreKeys {
+            upload_id: MessageId::new(),
             prekeys: vec![OneTimePreKey {
                 key_id: 5,
                 public_key: "cGs=".to_owned(),
@@ -376,6 +393,15 @@ mod tests {
     }
 
     #[test]
+    fn server_prekeys_uploaded() {
+        roundtrip_server(&ServerMessage::PreKeysUploaded {
+            upload_id: MessageId::new(),
+            accepted: true,
+            remaining: 100,
+        });
+    }
+
+    #[test]
     fn server_error() {
         roundtrip_server(&ServerMessage::Error {
             code: 429,
@@ -482,6 +508,13 @@ mod tests {
     }
 
     #[test]
+    fn client_ack_message_sent() {
+        roundtrip_client(&ClientMessage::AckMessageSent {
+            message_ids: vec![MessageId::new()],
+        });
+    }
+
+    #[test]
     fn client_send_read_receipt() {
         roundtrip_client(&ClientMessage::SendReadReceipt {
             recipient_id: user("bob"),
@@ -501,6 +534,14 @@ mod tests {
     fn server_message_delivered() {
         roundtrip_server(&ServerMessage::MessageDelivered {
             message_ids: vec![MessageId::new(), MessageId::new()],
+        });
+    }
+
+    #[test]
+    fn server_message_rejected() {
+        roundtrip_server(&ServerMessage::MessageRejected {
+            message_id: MessageId::new(),
+            reason: "expired reservation".to_owned(),
         });
     }
 

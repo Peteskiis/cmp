@@ -11,7 +11,8 @@ CMP is an end-to-end encrypted messaging service built in Rust. Uses Signal Prot
 ## Development Workflow
 
 1. Make changes
-2. `make check` (runs fmt-check + lint + test)
+2. `make check` (runs formatting, type, lint, test, documentation, source-size,
+   and dependency-policy checks)
 
 Or individually:
 1. `make fmt` — format code
@@ -22,7 +23,7 @@ Or individually:
 
 ```sh
 make               # Show help
-make check         # fmt-check + lint + test (CI-safe, no auto-fix)
+make check         # Full CI-safe local gate (no auto-fix)
 make fmt           # Format all code (modifies files)
 make fmt-check     # Verify formatting (no changes)
 make lint          # Run clippy (strict)
@@ -33,6 +34,24 @@ cargo run -p server                # Run server
 cargo run -p client -- --user alice  # Run client (production server is default)
 ```
 
+## Deployment
+
+- CMP deploys as an x86-64 GNU/Linux binary on the Cluster Debian runtime. Build
+  it with `cargo build --release --target x86_64-unknown-linux-gnu -p server`.
+- `cluster.toml` is the committed deployment source of truth: service name
+  `cmp`, Debian runtime, port 3000, always-on, 1 vCPU, and 256 MiB memory.
+- Deploy production to the organization named `Cluster`. Never reuse an
+  organization ID from an obsolete manifest merely because it was previously
+  associated with CMP; resolve the current organization through CCP.
+- Do not add a `[managed]` table to `cluster.toml`. Service, organization, and
+  hostname linkage belongs in the gitignored `.ccp/compute-link.json` file and
+  must never be committed.
+- Staging deploys are routine and pre-authorized. Production deployment requires
+  explicit user confirmation describing the service and live-data impact.
+- After deployment, verify `ccp compute status`, `GET /health`, `GET /`, a valid
+  WebSocket upgrade on `/ws`, and recent `ccp compute logs`. Do not report a
+  deployment successful from the CLI result alone.
+
 ## Code Style & Conventions
 
 - Strict clippy: pedantic + nursery enabled, `unwrap_used` and `expect_used` are **denied**
@@ -41,6 +60,7 @@ cargo run -p client -- --user alice  # Run client (production server is default)
 - Keep functions small and focused (max 100 lines, cognitive complexity < 10)
 - Keep files under 800 lines — split into modules when approaching the limit
 - Handle errors explicitly via `Result` and `thiserror`/`anyhow`
+- Do not derive `Serialize` or `Deserialize` for error types unless they cross the wire
 - All public enums must be `#[non_exhaustive]` for forward compatibility
 - Use `#[serde(try_from = "...")]` on validated newtypes to enforce invariants at the deserialization boundary
 - `cast_possible_truncation` and `cast_sign_loss` are warnings — use targeted `#[allow(...)]` with a safety comment, never silence globally
@@ -62,6 +82,7 @@ cargo run -p client -- --user alice  # Run client (production server is default)
 
 - `protocol` and `crypto` crates must stay platform-agnostic (no TUI, no async runtime in core API)
 - Server never depends on `crypto` — it only routes opaque encrypted blobs
+- Discuss breaking protocol changes before implementation
 - Client TUI uses `ratatui::Viewport::Inline` with `insert_before()` — NOT full-screen alternate screen
 - Terminal is exclusively owned by the UI task; network task communicates via `mpsc` channels
 - `UserId` is ASCII-only to prevent Unicode normalization attacks
@@ -94,6 +115,10 @@ cargo run -p client -- --user alice  # Run client (production server is default)
 - **OPK consumption must happen after AEAD authentication** — consuming an OPK before decrypt lets a forged message permanently degrade future handshakes from 4-DH to 3-DH.
 - **Never store peer identity keys before AEAD authentication** — the identity key in a PreKey header is unauthenticated until decrypt succeeds. Storing it early lets a malicious server poison the trust store, overwrite legitimate keys, and silently clear verification state. TOFU means trusting the *first authenticated* key, not every unauthenticated header.
 - **Status transitions must be monotonic** — use `entry().or_insert()` or explicit ordering guards, never unconditional `insert()`. Server messages can arrive out of order (e.g., `MessageDelivered` before `MessageSent`); an unconditional write regresses the status.
+- **Keep all ratchet-advancing outbound work durable until correlated confirmation** — messages, acknowledgements, and read receipts must remain in the SQLite outbox across disconnects and restarts.
+- **Re-acknowledge authenticated duplicates without decrypting them again** — once plaintext and its replay marker are durably stored, a redelivery must produce another durable ACK rather than an undecryptable-message fallback.
+- **Replay the durable outbox before accepting new ratchet sends after reconnect** — transport reconnection must not let newer ciphertext overtake older persisted ciphertext.
+- **Read-receipt confirmation is a three-party durable handshake** — the server retains an acknowledged receipt tombstone until the original sender confirms `ReadReceiptSent`; losing any response must leave enough durable state to retry idempotently.
 
 ## Reference Implementations
 
@@ -108,18 +133,6 @@ cargo run -p client -- --user alice  # Run client (production server is default)
 - **Use `chat_entry_to_lines` as the single source of truth** for message rendering — both viewport rendering and scrollback flushing use this function. Never duplicate message styling logic.
 - **Always use immediate local echo for sent messages** — never defer display until server confirmation. Deferred display causes messages to vanish on errors and feels laggy.
 
-## Things Claude Should NOT Do
-
-- Don't use `unwrap()` or `expect()` — they are clippy-denied (except in `#[cfg(test)]` with `#[allow]`)
-- Don't add async, I/O, or `unsafe` to the `crypto` crate
-- Don't skip error handling
-- Don't commit without running `make check` first
-- Don't make breaking protocol changes without discussion
-- Don't use full-screen alternate screen for the TUI
-- Don't add `Serialize`/`Deserialize` to error types unless they're sent over the wire
-- Don't accept unbounded user input without checking `protocol::consts` limits
-- Don't allow `cast_possible_truncation` or `cast_sign_loss` without a targeted `#[allow]` + safety comment
-
 ## Self-Improvement
 
-After every correction or mistake, update this CLAUDE.md with a rule to prevent repeating it.
+After every correction or mistake, update this `AGENTS.md` with a rule to prevent repeating it.

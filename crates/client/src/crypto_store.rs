@@ -153,6 +153,26 @@ impl CryptoStore {
         Ok(())
     }
 
+    pub(crate) fn save_core_and_delete_outbound<T: Serialize>(
+        &self,
+        core: &T,
+        correlation_id: &str,
+    ) -> anyhow::Result<()> {
+        let core = serde_json::to_string(core)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO core_state (id, json) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
+            [core],
+        )?;
+        transaction.execute(
+            "DELETE FROM outbox WHERE correlation_id = ?1",
+            [correlation_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn confirm_ack(&self, ack_id: &str, message_ids: &[String]) -> anyhow::Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute("DELETE FROM outbox WHERE correlation_id = ?1", [ack_id])?;
