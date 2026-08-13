@@ -25,6 +25,7 @@ pub enum ClientMessage {
 
     /// Max `consts::MAX_PREKEYS_PER_UPLOAD` items.
     UploadPreKeys {
+        upload_id: MessageId,
         prekeys: Vec<OneTimePreKey>,
     },
 
@@ -116,6 +117,12 @@ pub enum ServerMessage {
 
     /// Server alerts that one-time pre-keys are running low.
     PreKeyLow {
+        remaining: u32,
+    },
+
+    PreKeysUploaded {
+        upload_id: MessageId,
+        accepted: bool,
         remaining: u32,
     },
 
@@ -258,6 +265,7 @@ mod tests {
     #[test]
     fn client_upload_prekeys() {
         roundtrip_client(&ClientMessage::UploadPreKeys {
+            upload_id: MessageId::new(),
             prekeys: vec![OneTimePreKey {
                 key_id: 5,
                 public_key: "cGs=".to_owned(),
@@ -373,6 +381,15 @@ mod tests {
     #[test]
     fn server_prekey_low() {
         roundtrip_server(&ServerMessage::PreKeyLow { remaining: 3 });
+    }
+
+    #[test]
+    fn server_prekeys_uploaded() {
+        roundtrip_server(&ServerMessage::PreKeysUploaded {
+            upload_id: MessageId::new(),
+            accepted: true,
+            remaining: 100,
+        });
     }
 
     #[test]

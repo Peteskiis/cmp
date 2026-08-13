@@ -2,6 +2,8 @@ pub(crate) mod auth;
 pub(crate) mod message;
 pub(crate) mod prekey;
 
+use std::collections::HashSet;
+
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use protocol::{ClientMessage, OneTimePreKey, ServerMessage};
 use tokio::sync::mpsc;
@@ -65,6 +67,13 @@ pub(crate) fn error_404(message: &str) -> ServerMessage {
     }
 }
 
+pub(crate) fn error_429(message: &str) -> ServerMessage {
+    ServerMessage::Error {
+        code: 429,
+        message: message.to_owned(),
+    }
+}
+
 /// Returns a generic 500 error to the client. Callers must log the real error
 /// separately with `tracing` — never send internal details over the wire.
 pub(crate) fn error_500_generic() -> ServerMessage {
@@ -80,9 +89,13 @@ pub(crate) fn error_500_generic() -> ServerMessage {
 pub(crate) fn decode_prekeys(
     prekeys: &[OneTimePreKey],
 ) -> Result<Vec<DecodedPreKey>, ServerMessage> {
+    let mut key_ids = HashSet::with_capacity(prekeys.len());
     let pairs: Vec<DecodedPreKey> = prekeys
         .iter()
         .filter_map(|pk| {
+            if !key_ids.insert(pk.key_id) {
+                return None;
+            }
             let bytes = B64.decode(&pk.public_key).ok()?;
             // X25519 public keys must be exactly 32 bytes
             if bytes.len() != 32 {
@@ -93,7 +106,7 @@ pub(crate) fn decode_prekeys(
         .collect();
     if pairs.len() != prekeys.len() {
         return Err(error_400(
-            "one or more prekeys have invalid base64 or wrong length (must be 32 bytes)",
+            "prekeys must have unique IDs and valid 32-byte base64 public keys",
         ));
     }
     Ok(pairs)
@@ -133,12 +146,13 @@ pub(crate) async fn handle_message(
         ClientMessage::AuthResponse { signature } => {
             Some(auth::handle_auth_response(state, tx, session, signature).await)
         }
-        ClientMessage::UploadPreKeys { prekeys } => {
+        ClientMessage::UploadPreKeys { upload_id, prekeys } => {
             let user_id = session.authed_user.as_ref()?;
-            Some(prekey::handle_upload(state, user_id, prekeys).await)
+            Some(prekey::handle_upload(state, user_id, upload_id, prekeys).await)
         }
         ClientMessage::FetchPreKeyBundle { target_user_id } => {
-            Some(prekey::handle_fetch(state, target_user_id).await)
+            let requester_id = session.authed_user.as_ref()?;
+            Some(prekey::handle_fetch(state, requester_id, target_user_id).await)
         }
         ClientMessage::SendMessage {
             recipient_id,

@@ -183,7 +183,8 @@ pub(crate) async fn register_with_server(
     let (mut sink, mut stream) = ws.split();
 
     let spk = crypto::keys::SignedPreKey::generate(0, identity);
-    let opks = crypto::keys::generate_one_time_prekeys(0, 100)?;
+    let prekey_count = u32::try_from(protocol::consts::PREKEY_TARGET)?;
+    let opks = crypto::keys::generate_one_time_prekeys(0, prekey_count)?;
 
     let bundle = PreKeyBundle {
         identity_key: B64.encode(identity.verifying_key().as_bytes()),

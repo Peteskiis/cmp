@@ -518,3 +518,81 @@ fn corrupt_persisted_state_is_not_silently_discarded() {
 
     assert!(CryptoManager::load_or_generate(directory.path()).is_err());
 }
+
+#[test]
+fn prekey_replenishment_is_durable_correlated_and_monotonic() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manager = CryptoManager::load_or_generate(directory.path()).unwrap();
+    let signed_prekey = SignedPreKey::generate(0, manager.identity());
+    let initial = crypto::keys::generate_one_time_prekeys(0, 2).unwrap();
+    manager
+        .persist_registration_keys(&signed_prekey, &initial)
+        .unwrap();
+
+    let upload = manager.queue_prekey_replenishment().unwrap();
+    let ClientMessage::UploadPreKeys { upload_id, prekeys } = upload else {
+        panic!("expected pre-key upload");
+    };
+    assert_eq!(prekeys.len(), protocol::consts::PREKEY_TARGET);
+    assert_eq!(prekeys.first().unwrap().key_id, 2);
+    assert_eq!(prekeys.last().unwrap().key_id, 101);
+    drop(manager);
+
+    let mut restarted = CryptoManager::load_or_generate(directory.path()).unwrap();
+    assert!(matches!(
+        restarted.pending_messages().as_slice(),
+        [ClientMessage::UploadPreKeys { upload_id: pending_id, prekeys: pending }]
+            if pending_id == &upload_id && pending == &prekeys
+    ));
+    restarted
+        .confirm_prekeys_uploaded(&upload_id, true)
+        .unwrap();
+    let next = restarted.queue_prekey_replenishment().unwrap();
+    let ClientMessage::UploadPreKeys { prekeys: next, .. } = next else {
+        panic!("expected second pre-key upload");
+    };
+    assert_eq!(next.first().unwrap().key_id, 102);
+}
+
+#[test]
+fn rejected_prekey_upload_discards_unpublished_private_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manager = CryptoManager::load_or_generate(directory.path()).unwrap();
+    let upload = manager.queue_prekey_replenishment().unwrap();
+    let ClientMessage::UploadPreKeys { upload_id, prekeys } = upload else {
+        panic!("expected pre-key upload");
+    };
+
+    manager.confirm_prekeys_uploaded(&upload_id, false).unwrap();
+    assert!(
+        prekeys
+            .iter()
+            .all(|prekey| !manager.stored_opks.contains_key(&prekey.key_id))
+    );
+    drop(manager);
+
+    let restarted = CryptoManager::load_or_generate(directory.path()).unwrap();
+    assert!(restarted.pending_messages().is_empty());
+    assert!(
+        prekeys
+            .iter()
+            .all(|prekey| !restarted.stored_opks.contains_key(&prekey.key_id))
+    );
+}
+
+#[test]
+fn prekey_replenishment_persistence_failure_restores_ids_and_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manager = CryptoManager::load_or_generate(directory.path()).unwrap();
+    let before_id = manager.next_one_time_prekey_id;
+    let before_keys = manager.stored_opks.len();
+    manager.fail_persistence = true;
+
+    assert!(matches!(
+        manager.queue_prekey_replenishment(),
+        Err(CryptoError::Persistence(_))
+    ));
+    assert_eq!(manager.next_one_time_prekey_id, before_id);
+    assert_eq!(manager.stored_opks.len(), before_keys);
+    assert!(manager.pending_messages().is_empty());
+}

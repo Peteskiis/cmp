@@ -23,6 +23,9 @@ use crate::crypto_store;
 mod persistence;
 use persistence::{decode_stored_opks, decode_stored_spk, restore_entry};
 
+#[path = "crypto_mgr_prekeys.rs"]
+mod prekeys;
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub(crate) enum CryptoError {
@@ -85,6 +88,8 @@ struct CoreState {
     signed_prekey: Option<StoredSpk>,
     one_time_prekeys: Vec<StoredOpk>,
     sessions: HashMap<String, PeerSession>,
+    #[serde(default)]
+    next_one_time_prekey_id: u32,
 }
 
 #[derive(Serialize)]
@@ -92,6 +97,7 @@ struct CoreStateRef<'a> {
     signed_prekey: Option<StoredSpk>,
     one_time_prekeys: Vec<StoredOpk>,
     sessions: &'a HashMap<String, PeerSession>,
+    next_one_time_prekey_id: u32,
 }
 
 pub(crate) struct CryptoManager {
@@ -100,6 +106,7 @@ pub(crate) struct CryptoManager {
     pending_inits: HashSet<String>,
     stored_spk: Option<SignedPreKey>,
     stored_opks: HashMap<u32, OneTimePreKey>,
+    next_one_time_prekey_id: u32,
     pending_outbound: Vec<PendingOutbound>,
     processed_messages: HashMap<String, HashMap<String, ProcessedMessage>>,
     store: crypto_store::CryptoStore,
@@ -144,6 +151,11 @@ impl CryptoManager {
         }
         let stored_spk = decode_stored_spk(persisted.signed_prekey)?;
         let stored_opks = decode_stored_opks(persisted.one_time_prekeys);
+        let derived_next_id = stored_opks
+            .keys()
+            .max()
+            .map_or(0, |key_id| key_id.saturating_add(1));
+        let next_one_time_prekey_id = persisted.next_one_time_prekey_id.max(derived_next_id);
         validate_peer_ids(&persisted.sessions)?;
         validate_peer_ids(&processed_messages)?;
         let cutoff = now_secs().saturating_sub(crate::crypto_replay::RETENTION_SECS);
@@ -156,6 +168,7 @@ impl CryptoManager {
             pending_inits: HashSet::new(),
             stored_spk,
             stored_opks,
+            next_one_time_prekey_id,
             pending_outbound,
             processed_messages,
             store,
@@ -181,42 +194,6 @@ impl CryptoManager {
 
     pub(crate) fn pending_peers(&self) -> Vec<String> {
         self.pending_inits.iter().cloned().collect()
-    }
-
-    /// Store SPK and OPK private keys after registration.
-    pub(crate) fn persist_registration_keys(
-        &mut self,
-        spk: &SignedPreKey,
-        opks: &[OneTimePreKey],
-    ) -> anyhow::Result<()> {
-        let new_spk = SignedPreKey::from_parts(
-            spk.key_id(),
-            spk.secret().to_bytes(),
-            spk.public().to_bytes(),
-            *spk.signature(),
-        );
-        let new_opks = opks
-            .iter()
-            .map(|opk| {
-                (
-                    opk.key_id(),
-                    OneTimePreKey::from_parts(
-                        opk.key_id(),
-                        opk.secret().to_bytes(),
-                        opk.public().to_bytes(),
-                    ),
-                )
-            })
-            .collect();
-
-        let previous_spk = self.stored_spk.replace(new_spk);
-        let previous_opks = std::mem::replace(&mut self.stored_opks, new_opks);
-        if let Err(error) = self.persist_state() {
-            self.stored_spk = previous_spk;
-            self.stored_opks = previous_opks;
-            return Err(error);
-        }
-        Ok(())
     }
 
     /// Initialize a session with a peer using their pre-key bundle (Alice's side).

@@ -42,7 +42,7 @@ impl CryptoManager {
         )
     }
 
-    fn core_state(&self) -> CoreStateRef<'_> {
+    pub(super) fn core_state(&self) -> CoreStateRef<'_> {
         let signed_prekey = self.stored_spk.as_ref().map(|spk| StoredSpk {
             key_id: spk.key_id(),
             secret_bytes: spk.secret().to_bytes(),
@@ -62,6 +62,7 @@ impl CryptoManager {
             signed_prekey,
             one_time_prekeys,
             sessions: &self.sessions,
+            next_one_time_prekey_id: self.next_one_time_prekey_id,
         }
     }
 

@@ -715,8 +715,33 @@ fn handle_server_message(
                 InboundDecrypt::Failed => {}
             }
         }
-        ServerMessage::PreKeyLow { remaining } => {
-            app.status(&format!("warning: only {remaining} pre-keys remaining"));
+        ServerMessage::PreKeyLow { remaining } => match app.crypto.queue_prekey_replenishment() {
+            Ok(upload) => {
+                let _ = outgoing_tx.send(upload);
+                app.status(&format!(
+                    "replenishing one-time pre-keys ({remaining} remaining)"
+                ));
+            }
+            Err(error) => {
+                app.status(&format!("pre-key replenishment failed: {error}"));
+            }
+        },
+        ServerMessage::PreKeysUploaded {
+            upload_id,
+            accepted,
+            remaining,
+        } => {
+            if let Err(error) = app.crypto.confirm_prekeys_uploaded(&upload_id, accepted) {
+                tracing::warn!("failed to confirm durable pre-key upload: {error}");
+            } else if accepted {
+                app.status(&format!(
+                    "one-time pre-keys replenished ({remaining} available)"
+                ));
+            } else {
+                app.status(&format!(
+                    "pre-key upload rejected ({remaining} already available)"
+                ));
+            }
         }
         ServerMessage::Error { message, .. } => {
             app.status(&format!("server error: {message}"));
