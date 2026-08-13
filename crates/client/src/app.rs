@@ -681,10 +681,9 @@ fn handle_server_message(
             }
         }
         ServerMessage::MessageRejected { message_id, reason } => {
-            if let Err(error) = app.crypto.confirm_message_sent(&message_id) {
-                tracing::warn!("failed to retire rejected outbound message: {error}");
-            }
-            app.status(&format!("message rejected: {reason}"));
+            prekeys::handle_message_rejected(app, outgoing_tx, &message_id);
+            app.pending_msg_ids.retain(|id| id != &message_id);
+            app.status(&format!("message rejected; refreshing session: {reason}"));
         }
         ServerMessage::AckSuccess {
             ack_id,

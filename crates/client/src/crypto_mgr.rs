@@ -28,6 +28,9 @@ use persistence::{decode_stored_opks, decode_stored_spk, restore_entry};
 #[path = "crypto_mgr_prekeys.rs"]
 mod prekeys;
 
+#[path = "crypto_mgr_outbound.rs"]
+mod outbound;
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub(crate) enum CryptoError {
@@ -47,6 +50,8 @@ pub(crate) enum CryptoError {
     Persistence(#[source] anyhow::Error),
     #[error("durable message queue is full")]
     OutboxFull,
+    #[error("waiting for the server to accept the first message")]
+    AwaitingPrekeyAdmission,
     #[error("processed-message ledger is full")]
     ReplayLedgerFull,
 }
@@ -182,7 +187,7 @@ impl CryptoManager {
         store.prune_processed(cutoff)?;
         prune_processed(&mut processed_messages, now_secs());
 
-        Ok(Self {
+        let mut manager = Self {
             identity,
             sessions: persisted.sessions,
             pending_inits: HashSet::new(),
@@ -194,7 +199,9 @@ impl CryptoManager {
             processed_messages,
             store,
             fail_persistence: false,
-        })
+        };
+        manager.retire_stale_prekey_outbox()?;
+        Ok(manager)
     }
 
     pub(crate) const fn needs_registration(&self) -> bool {
@@ -303,12 +310,28 @@ impl CryptoManager {
         message_id: &MessageId,
         plaintext: &[u8],
     ) -> Result<ClientMessage, CryptoError> {
+        if self.pending_outbound.iter().any(|pending| {
+            matches!(
+                pending,
+                PendingOutbound::Message {
+                    recipient_id: pending_recipient,
+                    envelope: EncryptedEnvelope { header: MessageHeader::PreKey { .. }, .. },
+                    ..
+                } if pending_recipient == recipient_id
+            )
+        }) {
+            return Err(CryptoError::AwaitingPrekeyAdmission);
+        }
         ensure_capacity(&self.pending_outbound, plaintext.len())?;
         let (original_session, envelope) = self.advance_encryption(peer_id, plaintext)?;
+        let prekey_expires_at = matches!(envelope.header, MessageHeader::PreKey { .. })
+            .then_some(original_session.prekey_expires_at)
+            .flatten();
         let pending = PendingOutbound::Message {
             recipient_id: recipient_id.clone(),
             message_id: message_id.clone(),
             envelope,
+            prekey_expires_at,
         };
         self.pending_outbound.push(pending.clone());
 
@@ -318,31 +341,6 @@ impl CryptoManager {
             return Err(CryptoError::Persistence(error));
         }
         Ok(pending.to_client_message())
-    }
-
-    pub(crate) fn pending_messages(&self) -> Vec<ClientMessage> {
-        self.pending_outbound
-            .iter()
-            .map(PendingOutbound::to_client_message)
-            .collect()
-    }
-
-    pub(crate) fn confirm_message_sent(&mut self, message_id: &MessageId) -> anyhow::Result<()> {
-        let Some(index) = self.pending_outbound.iter().position(|pending| {
-            matches!(
-                pending,
-                PendingOutbound::Message { message_id: pending_id, .. }
-                    if pending_id == message_id
-            )
-        }) else {
-            return Ok(());
-        };
-        let pending = self.pending_outbound.remove(index);
-        if let Err(error) = self.store.delete_outbound(&message_id.to_string()) {
-            self.pending_outbound.insert(index, pending);
-            return Err(error);
-        }
-        Ok(())
     }
 
     pub(crate) fn confirm_read_receipt_sent(

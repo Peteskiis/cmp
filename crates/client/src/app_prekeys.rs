@@ -24,3 +24,20 @@ pub(super) fn refresh_expired_session(
         }
     }
 }
+
+pub(super) fn handle_message_rejected(
+    app: &mut App,
+    outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
+    message_id: &protocol::MessageId,
+) {
+    match app.crypto.reject_message(message_id) {
+        Ok(Some(recipient_id)) => {
+            app.crypto.add_pending(recipient_id.as_str());
+            let _ = outgoing_tx.send(ClientMessage::FetchPreKeyBundle {
+                target_user_id: recipient_id,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!("failed to retire rejected outbound message: {error}"),
+    }
+}

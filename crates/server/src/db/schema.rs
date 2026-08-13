@@ -170,6 +170,7 @@ fn migrate_v7(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
             target_id TEXT NOT NULL,
             key_id INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
+            message_id TEXT,
             PRIMARY KEY (requester_id, target_id, key_id)
         );
         CREATE INDEX idx_prekey_reservation_expiry

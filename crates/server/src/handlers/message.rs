@@ -6,7 +6,7 @@ use protocol::{
 
 use super::{error_400, error_500_generic, now_secs};
 use crate::db;
-use crate::db::queue::EnqueueResult;
+use crate::db::queue::{EnqueueRequest, EnqueueResult};
 use crate::state::AppState;
 
 #[allow(clippy::cognitive_complexity)]
@@ -23,17 +23,7 @@ pub(crate) async fn handle_send(
 
     let msg_id_str = message_id.to_string();
     let recipient_str = recipient_id.as_str();
-    if let Some(response) = validate_prekey_reservation(
-        state,
-        sender_id,
-        recipient_str,
-        &message_id,
-        &envelope.header,
-    )
-    .await
-    {
-        return response;
-    }
+    let prekey_id = envelope_prekey_id(&envelope.header);
 
     let Ok(sender_user_id) = UserId::new(sender_id) else {
         return error_500_generic();
@@ -59,11 +49,15 @@ pub(crate) async fn handle_send(
 
     match db::queue::enqueue(
         &state.db,
-        &msg_id_str,
-        recipient_str,
-        sender_id,
-        envelope_json,
-        consts::MAX_QUEUE_PER_USER,
+        EnqueueRequest {
+            message_id: msg_id_str,
+            recipient_id: recipient_str.to_owned(),
+            sender_id: sender_id.to_owned(),
+            envelope_json,
+            max_queue_per_user: consts::MAX_QUEUE_PER_USER,
+            prekey_id,
+            now: now_secs(),
+        },
     )
     .await
     {
@@ -74,13 +68,21 @@ pub(crate) async fn handle_send(
         Ok(EnqueueResult::RecipientNotFound) => {
             return super::error_404("not found");
         }
+        Ok(EnqueueResult::PrekeyReservationInvalid) => {
+            return ServerMessage::MessageRejected {
+                message_id,
+                reason: "one-time pre-key reservation expired".to_owned(),
+            };
+        }
+        Ok(EnqueueResult::MessageIdConflict) => {
+            return error_400("message ID already used with different content");
+        }
         Err(e) => {
             tracing::error!("failed to queue message: {e}");
             return error_500_generic();
         }
     }
 
-    // Push to recipient if online
     let pushed = state
         .connections
         .send_to(recipient_str, ServerMessage::IncomingMessage(inbound));
@@ -99,32 +101,13 @@ pub(crate) async fn handle_send(
     ServerMessage::MessageSent { message_id }
 }
 
-async fn validate_prekey_reservation(
-    state: &AppState,
-    sender_id: &str,
-    recipient_id: &str,
-    message_id: &MessageId,
-    header: &MessageHeader,
-) -> Option<ServerMessage> {
-    let MessageHeader::PreKey {
-        recipient_one_time_prekey_id: Some(key_id),
-        ..
-    } = header
-    else {
-        return None;
-    };
-    match db::prekeys::reservation_is_valid(&state.db, sender_id, recipient_id, *key_id, now_secs())
-        .await
-    {
-        Ok(true) => None,
-        Ok(false) => Some(ServerMessage::MessageRejected {
-            message_id: message_id.clone(),
-            reason: "one-time pre-key reservation expired".to_owned(),
-        }),
-        Err(error) => {
-            tracing::error!("failed to validate pre-key reservation: {error}");
-            Some(error_500_generic())
-        }
+const fn envelope_prekey_id(header: &MessageHeader) -> Option<u32> {
+    match header {
+        MessageHeader::PreKey {
+            recipient_one_time_prekey_id,
+            ..
+        } => *recipient_one_time_prekey_id,
+        _ => None,
     }
 }
 

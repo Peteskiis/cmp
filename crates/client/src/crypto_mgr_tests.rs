@@ -204,6 +204,11 @@ fn disk_full_during_decrypt_preserves_session_and_opk_for_restart() {
 #[test]
 fn outbound_ciphertext_survives_restart_until_server_confirmation() {
     let (mut alice, mut bob, a_dir, _b_dir) = setup_alice_and_bob();
+    let handshake = alice.encrypt("bob", b"establish session").unwrap();
+    assert_eq!(
+        bob.decrypt("alice", &handshake).unwrap(),
+        b"establish session"
+    );
     let message_id = MessageId::new();
     let second_message_id = MessageId::new();
     let recipient = UserId::new("bob").unwrap();
@@ -244,6 +249,29 @@ fn outbound_ciphertext_survives_restart_until_server_confirmation() {
     drop(restarted);
     let confirmed = CryptoManager::load_or_generate(a_dir.path()).unwrap();
     assert!(confirmed.pending_messages().is_empty());
+}
+
+#[test]
+fn rejected_prekey_message_resets_session_and_durable_outbox() {
+    let (mut alice, _bob, a_dir, _b_dir) = setup_alice_and_bob();
+    let message_id = MessageId::new();
+    let recipient = UserId::new("bob").unwrap();
+    alice
+        .encrypt_message("bob", &recipient, &message_id, b"expired lease")
+        .unwrap();
+    assert!(matches!(
+        alice.encrypt_message("bob", &recipient, &MessageId::new(), b"too early"),
+        Err(CryptoError::AwaitingPrekeyAdmission)
+    ));
+
+    assert_eq!(alice.reject_message(&message_id).unwrap(), Some(recipient));
+    assert!(!alice.has_session("bob"));
+    assert!(alice.pending_messages().is_empty());
+    drop(alice);
+
+    let restarted = CryptoManager::load_or_generate(a_dir.path()).unwrap();
+    assert!(!restarted.has_session("bob"));
+    assert!(restarted.pending_messages().is_empty());
 }
 
 #[test]
@@ -353,6 +381,7 @@ fn durable_outbox_rejects_new_items_at_capacity_before_ratchet_advances() {
             recipient_id: recipient.clone(),
             message_id: MessageId::new(),
             envelope: envelope.clone(),
+            prekey_expires_at: None,
         })
         .collect();
 

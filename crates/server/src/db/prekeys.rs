@@ -93,6 +93,10 @@ pub async fn fetch_for_requester(
     let target_id = target_id.to_owned();
     conn.call(move |conn| {
         let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM prekey_reservations WHERE expires_at < ?1",
+            [now],
+        )?;
         let cutoff = now.saturating_sub(limits.window_secs);
         let prekey_cutoff = now.saturating_sub(PUBLIC_PREKEY_RETENTION_SECS);
         tx.execute(
@@ -153,29 +157,6 @@ pub async fn fetch_for_requester(
         Ok(prekey.map_or(FetchResult::Empty, |(key_id, public_key)| {
             FetchResult::Fetched { key_id, public_key }
         }))
-    })
-    .await
-    .map_err(Into::into)
-}
-
-pub async fn reservation_is_valid(
-    conn: &Connection,
-    requester_id: &str,
-    target_id: &str,
-    key_id: u32,
-    now: u64,
-) -> anyhow::Result<bool> {
-    let requester_id = requester_id.to_owned();
-    let target_id = target_id.to_owned();
-    conn.call(move |conn| {
-        let valid: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM prekey_reservations
-             WHERE requester_id = ?1 AND target_id = ?2 AND key_id = ?3
-             AND expires_at >= ?4)",
-            (&requester_id, &target_id, key_id, now),
-            |row| row.get(0),
-        )?;
-        Ok(valid)
     })
     .await
     .map_err(Into::into)
@@ -432,7 +413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reservation_is_bound_to_requester_target_key_and_expiry() {
+    async fn fetch_creates_bound_reservation() {
         let conn = test_db().await;
         add_user(&conn, "target").await;
         upload_prekeys(&conn, "target", &[(0, vec![0_u8; 32])], 10)
@@ -447,26 +428,32 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(fetched, FetchResult::Fetched { key_id: 0, .. }));
-        assert!(
-            reservation_is_valid(&conn, "alice", "target", 0, 100)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !reservation_is_valid(&conn, "bob", "target", 0, 100)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !reservation_is_valid(
-                &conn,
-                "alice",
-                "target",
-                0,
-                100 + protocol::consts::ONE_TIME_PREKEY_RESERVATION_SECS + 1,
-            )
-            .await
-            .unwrap()
-        );
+        conn.call(|conn| {
+            let reservation: (String, String, u32, u64, Option<String>) = conn.query_row(
+                "SELECT requester_id, target_id, key_id, expires_at, message_id
+                 FROM prekey_reservations",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+            assert_eq!(reservation.0, "alice");
+            assert_eq!(reservation.1, "target");
+            assert_eq!(reservation.2, 0);
+            assert_eq!(
+                reservation.3,
+                100 + protocol::consts::ONE_TIME_PREKEY_RESERVATION_SECS
+            );
+            assert!(reservation.4.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

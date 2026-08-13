@@ -527,6 +527,14 @@ mod tests {
     }
 
     #[test]
+    fn server_message_rejected() {
+        roundtrip_server(&ServerMessage::MessageRejected {
+            message_id: MessageId::new(),
+            reason: "expired reservation".to_owned(),
+        });
+    }
+
+    #[test]
     fn server_incoming_read_receipt() {
         roundtrip_server(&ServerMessage::IncomingReadReceipt {
             sender_id: user("alice"),
