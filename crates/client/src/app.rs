@@ -731,16 +731,27 @@ fn handle_server_message(
             accepted,
             remaining,
         } => {
-            if let Err(error) = app.crypto.confirm_prekeys_uploaded(&upload_id, accepted) {
-                tracing::warn!("failed to confirm durable pre-key upload: {error}");
-            } else if accepted {
-                app.status(&format!(
-                    "one-time pre-keys replenished ({remaining} available)"
-                ));
-            } else {
-                app.status(&format!(
-                    "pre-key upload rejected ({remaining} already available)"
-                ));
+            match app
+                .crypto
+                .confirm_prekeys_uploaded(&upload_id, accepted, remaining)
+            {
+                Ok(replacement) => {
+                    if let Some(upload) = replacement {
+                        let _ = outgoing_tx.send(upload);
+                    }
+                    if accepted {
+                        app.status(&format!(
+                            "one-time pre-keys replenished ({remaining} available)"
+                        ));
+                    } else {
+                        app.status(&format!(
+                            "pre-key upload rejected ({remaining} already available)"
+                        ));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("failed to confirm durable pre-key upload: {error}");
+                }
             }
         }
         ServerMessage::Error { message, .. } => {

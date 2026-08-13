@@ -59,7 +59,8 @@ pub async fn register_atomic(
             .iter()
             .map(|(key_id, _)| i64::from(*key_id))
             .max()
-            .unwrap_or(-1);
+            .unwrap_or(-1)
+            .max((1_i64 << 31) - 1);
         tx.execute(
             "INSERT INTO prekey_inventory (user_id, high_water) VALUES (?1, ?2)",
             (&user_id, high_water),

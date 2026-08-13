@@ -64,6 +64,7 @@ impl CryptoManager {
             .map(OneTimePreKey::key_id)
             .max()
             .map_or(previous_next_id, |key_id| key_id.saturating_add(1));
+        self.next_one_time_prekey_id = self.next_one_time_prekey_id.max(previous_next_id);
         if let Err(error) = self.persist_state() {
             self.stored_spk = previous_spk;
             self.stored_opks = previous_opks;
@@ -78,7 +79,8 @@ impl CryptoManager {
         &mut self,
         upload_id: &MessageId,
         accepted: bool,
-    ) -> anyhow::Result<()> {
+        remaining: u32,
+    ) -> anyhow::Result<Option<ClientMessage>> {
         let Some(index) = self.pending_outbound.iter().position(|pending| {
             matches!(
                 pending,
@@ -86,14 +88,14 @@ impl CryptoManager {
                     if pending_id == upload_id
             )
         }) else {
-            return Ok(());
+            return Ok(None);
         };
         let pending = self.pending_outbound.remove(index);
         let removed_keys: Vec<_> = if accepted {
             Vec::new()
         } else {
             let PendingOutbound::PreKeyUpload { prekeys, .. } = &pending else {
-                return Ok(());
+                return Ok(None);
             };
             prekeys
                 .iter()
@@ -112,6 +114,19 @@ impl CryptoManager {
                     .map(|created_at| (*key_id, created_at))
             })
             .collect();
+        let replacement = if accepted
+            && remaining < u32::try_from(protocol::consts::PREKEY_TARGET).unwrap_or(u32::MAX)
+        {
+            match self.queue_prekey_replenishment() {
+                Ok(upload) => Some(upload),
+                Err(error) => {
+                    self.pending_outbound.insert(index, pending);
+                    return Err(anyhow::anyhow!(error));
+                }
+            }
+        } else {
+            None
+        };
         let result = if accepted {
             self.store.delete_outbound(&upload_id.to_string())
         } else {
@@ -124,7 +139,7 @@ impl CryptoManager {
             self.pending_outbound.insert(index, pending);
             return Err(error);
         }
-        Ok(())
+        Ok(replacement)
     }
 
     pub(crate) fn queue_prekey_replenishment(&mut self) -> Result<ClientMessage, CryptoError> {
@@ -150,8 +165,8 @@ impl CryptoManager {
             .collect();
         ensure_capacity(&self.pending_outbound, prekeys.len() * 48)?;
 
-        let cutoff =
-            crate::crypto_replay::now_secs().saturating_sub(crate::crypto_replay::RETENTION_SECS);
+        let cutoff = crate::crypto_replay::now_secs()
+            .saturating_sub(protocol::consts::ONE_TIME_PREKEY_PRIVATE_RETENTION_SECS);
         let stale_ids: Vec<_> = self
             .one_time_prekey_created_at
             .iter()

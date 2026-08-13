@@ -1,6 +1,6 @@
 use tokio_rusqlite::Connection;
 
-const CURRENT_VERSION: u32 = 5;
+const CURRENT_VERSION: u32 = 6;
 
 /// Initialize the database schema, pragmas, and migrations.
 pub async fn initialize(conn: &Connection) -> anyhow::Result<()> {
@@ -75,6 +75,10 @@ pub async fn initialize(conn: &Connection) -> anyhow::Result<()> {
             migrate_v5(conn)?;
         }
 
+        if version < 6 {
+            migrate_v6(conn)?;
+        }
+
         Ok(())
     })
     .await?;
@@ -139,6 +143,17 @@ fn migrate_v5(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
     tx.execute_batch(
         "ALTER TABLE prekeys ADD COLUMN created_at INTEGER;
          UPDATE prekeys SET created_at = unixepoch() WHERE created_at IS NULL;",
+    )?;
+    tx.pragma_update(None, "user_version", 5)?;
+    tx.commit()
+}
+
+fn migrate_v6(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    const LEGACY_HIGH_WATER: i64 = (1_i64 << 31) - 1;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE prekey_inventory SET high_water = MAX(high_water, ?1)",
+        [LEGACY_HIGH_WATER],
     )?;
     tx.pragma_update(None, "user_version", CURRENT_VERSION)?;
     tx.commit()

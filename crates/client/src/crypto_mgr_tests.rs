@@ -534,8 +534,8 @@ fn prekey_replenishment_is_durable_correlated_and_monotonic() {
         panic!("expected pre-key upload");
     };
     assert_eq!(prekeys.len(), protocol::consts::PREKEY_TARGET);
-    assert_eq!(prekeys.first().unwrap().key_id, 2);
-    assert_eq!(prekeys.last().unwrap().key_id, 101);
+    assert_eq!(prekeys.first().unwrap().key_id, 1 << 31);
+    assert_eq!(prekeys.last().unwrap().key_id, (1 << 31) + 99);
     drop(manager);
 
     let mut restarted = CryptoManager::load_or_generate(directory.path()).unwrap();
@@ -544,14 +544,17 @@ fn prekey_replenishment_is_durable_correlated_and_monotonic() {
         [ClientMessage::UploadPreKeys { upload_id: pending_id, prekeys: pending }]
             if pending_id == &upload_id && pending == &prekeys
     ));
-    restarted
-        .confirm_prekeys_uploaded(&upload_id, true)
-        .unwrap();
+    assert!(
+        restarted
+            .confirm_prekeys_uploaded(&upload_id, true, 0)
+            .unwrap()
+            .is_some()
+    );
     let next = restarted.queue_prekey_replenishment().unwrap();
     let ClientMessage::UploadPreKeys { prekeys: next, .. } = next else {
         panic!("expected second pre-key upload");
     };
-    assert_eq!(next.first().unwrap().key_id, 102);
+    assert_eq!(next.first().unwrap().key_id, (1 << 31) + 100);
 }
 
 #[test]
@@ -563,7 +566,9 @@ fn rejected_prekey_upload_discards_unpublished_private_keys() {
         panic!("expected pre-key upload");
     };
 
-    manager.confirm_prekeys_uploaded(&upload_id, false).unwrap();
+    manager
+        .confirm_prekeys_uploaded(&upload_id, false, 200)
+        .unwrap();
     assert!(
         prekeys
             .iter()

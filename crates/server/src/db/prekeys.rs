@@ -1,7 +1,7 @@
 use rusqlite::OptionalExtension;
 use tokio_rusqlite::Connection;
 
-const PUBLIC_PREKEY_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+const PUBLIC_PREKEY_RETENTION_SECS: u64 = protocol::consts::ONE_TIME_PREKEY_PUBLIC_RETENTION_SECS;
 
 /// Upload a batch of one-time pre-keys for a user.
 pub async fn upload_prekeys(
@@ -294,6 +294,29 @@ mod tests {
                 .unwrap(),
             UploadResult::Accepted(1)
         ));
+    }
+
+    #[tokio::test]
+    async fn legacy_upload_below_reserved_floor_is_terminal_without_reinsertion() {
+        let conn = test_db().await;
+        add_user(&conn, "alice").await;
+        conn.call(|conn| {
+            conn.execute(
+                "UPDATE prekey_inventory SET high_water = ?2 WHERE user_id = ?1",
+                ("alice", (1_i64 << 31) - 1),
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            upload_prekeys(&conn, "alice", &[(100, vec![0_u8; 32])], 10)
+                .await
+                .unwrap(),
+            UploadResult::Accepted(0)
+        ));
+        assert_eq!(count_prekeys(&conn, "alice").await.unwrap(), 0);
     }
 
     #[tokio::test]

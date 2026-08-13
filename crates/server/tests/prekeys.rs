@@ -152,7 +152,7 @@ async fn prekey_upload_is_correlated_capped_and_idempotent() {
     register(&mut sink, &mut stream, "alice").await;
 
     let make_prekeys = |count: u32| {
-        (1_000..1_000 + count)
+        ((1 << 31)..(1 << 31) + count)
             .map(|key_id| OneTimePreKey {
                 key_id,
                 public_key: B64.encode([7_u8; 32]),

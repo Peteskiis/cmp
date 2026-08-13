@@ -171,9 +171,9 @@ impl CryptoManager {
             .map_or(0, |key_id| key_id.saturating_add(1));
         let next_one_time_prekey_id = persisted
             .next_one_time_prekey_id
-            .map_or(LEGACY_PREKEY_ID_FLOOR, |next_id| {
-                next_id.max(derived_next_id)
-            });
+            .unwrap_or_default()
+            .max(derived_next_id)
+            .max(LEGACY_PREKEY_ID_FLOOR);
         validate_peer_ids(&persisted.sessions)?;
         validate_peer_ids(&processed_messages)?;
         let cutoff = now_secs().saturating_sub(crate::crypto_replay::RETENTION_SECS);
