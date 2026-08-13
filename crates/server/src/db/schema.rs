@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use tokio_rusqlite::Connection;
 
 const CURRENT_VERSION: u32 = 8;
@@ -189,14 +190,54 @@ fn migrate_v8(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
             message_id TEXT PRIMARY KEY,
             recipient_id TEXT NOT NULL,
             sender_id TEXT NOT NULL,
-            envelope TEXT NOT NULL,
+            envelope_digest BLOB NOT NULL,
             accepted_at INTEGER NOT NULL
         );
-        CREATE INDEX idx_message_acceptance_time ON message_acceptances(accepted_at);
-        INSERT INTO message_acceptances
-            (message_id, recipient_id, sender_id, envelope, accepted_at)
-        SELECT message_id, recipient_id, sender_id, envelope, unixepoch(created_at)
-        FROM message_queue;",
+        CREATE INDEX idx_message_acceptance_sender_time
+            ON message_acceptances(sender_id, accepted_at);
+        CREATE TABLE message_acceptance_stats (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            item_count INTEGER NOT NULL
+        );
+        INSERT INTO message_acceptance_stats (id, item_count) VALUES (1, 0);",
+    )?;
+    let queued = {
+        let mut statement = tx.prepare(
+            "SELECT message_id, recipient_id, sender_id, envelope, unixepoch(created_at)
+             FROM message_queue",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut insert = tx.prepare(
+        "INSERT INTO message_acceptances
+            (message_id, recipient_id, sender_id, envelope_digest, accepted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    let queued_count = queued.len();
+    for (message_id, recipient_id, sender_id, envelope, accepted_at) in queued {
+        let digest = Sha256::digest(envelope.as_bytes());
+        insert.execute((
+            message_id,
+            recipient_id,
+            sender_id,
+            digest.as_slice(),
+            accepted_at,
+        ))?;
+    }
+    drop(insert);
+    tx.execute(
+        "UPDATE message_acceptance_stats SET item_count = ?1 WHERE id = 1",
+        [i64::try_from(queued_count).unwrap_or(i64::MAX)],
     )?;
     tx.pragma_update(None, "user_version", CURRENT_VERSION)?;
     tx.commit()
@@ -216,6 +257,7 @@ mod tests {
                  DROP TABLE prekey_inventory;
                  DROP TABLE prekey_reservations;
                  DROP TABLE message_acceptances;
+                 DROP TABLE message_acceptance_stats;
                  ALTER TABLE prekeys DROP COLUMN created_at;",
             )?;
             conn.pragma_update(None, "user_version", 2)?;
@@ -259,6 +301,7 @@ mod tests {
         initialize(&conn).await.unwrap();
         conn.call(|conn| {
             conn.execute("DROP TABLE message_acceptances", [])?;
+            conn.execute("DROP TABLE message_acceptance_stats", [])?;
             conn.execute(
                 "INSERT INTO users (user_id, identity_key) VALUES ('bob', X'00')",
                 [],

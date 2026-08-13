@@ -1,4 +1,5 @@
 use rusqlite::OptionalExtension;
+use sha2::{Digest, Sha256};
 use tokio_rusqlite::Connection;
 
 /// Enqueue an encrypted message for delivery.
@@ -9,8 +10,9 @@ pub async fn enqueue(conn: &Connection, request: EnqueueRequest) -> anyhow::Resu
     conn.call(move |conn| {
         // Wrap in transaction to prevent TOCTOU between COUNT and INSERT
         let tx = conn.transaction()?;
+        let envelope_digest = Sha256::digest(request.envelope_json.as_bytes());
 
-        if let Some(result) = classify_existing(&tx, &request)? {
+        if let Some(result) = classify_existing(&tx, &request, envelope_digest.as_slice())? {
             tx.rollback()?;
             return Ok(result);
         }
@@ -55,13 +57,13 @@ pub async fn enqueue(conn: &Connection, request: EnqueueRequest) -> anyhow::Resu
         )?;
         tx.execute(
             "INSERT INTO message_acceptances
-                (message_id, recipient_id, sender_id, envelope, accepted_at)
+                (message_id, recipient_id, sender_id, envelope_digest, accepted_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             (
                 &request.message_id,
                 &request.recipient_id,
                 &request.sender_id,
-                &request.envelope_json,
+                envelope_digest.as_slice(),
                 request.now,
             ),
         )?;
@@ -81,12 +83,23 @@ fn claim_prekey_reservation(
     tx: &rusqlite::Transaction<'_>,
     request: &EnqueueRequest,
 ) -> rusqlite::Result<Option<EnqueueResult>> {
+    const MAX_GLOBAL_ACCEPTANCES: i64 = 1_000_000;
     let acceptance_count: i64 = tx.query_row(
         "SELECT COUNT(*) FROM message_acceptances WHERE sender_id = ?1",
         [&request.sender_id],
         |row| row.get(0),
     )?;
-    if acceptance_count >= i64::try_from(request.max_queue_per_user).unwrap_or(i64::MAX) {
+    if acceptance_count
+        >= i64::try_from(protocol::consts::MAX_PENDING_OUTBOUND_ITEMS).unwrap_or(i64::MAX)
+    {
+        return Ok(Some(EnqueueResult::AcceptanceLedgerFull));
+    }
+    let reserved = tx.execute(
+        "UPDATE message_acceptance_stats SET item_count = item_count + 1
+         WHERE id = 1 AND item_count < ?1",
+        [MAX_GLOBAL_ACCEPTANCES],
+    )?;
+    if reserved == 0 {
         return Ok(Some(EnqueueResult::AcceptanceLedgerFull));
     }
     tx.execute(
@@ -122,17 +135,18 @@ pub struct EnqueueRequest {
 fn classify_existing(
     tx: &rusqlite::Transaction<'_>,
     request: &EnqueueRequest,
+    envelope_digest: &[u8],
 ) -> rusqlite::Result<Option<EnqueueResult>> {
     let existing = tx
         .query_row(
-            "SELECT recipient_id, sender_id, envelope
+            "SELECT recipient_id, sender_id, envelope_digest
              FROM message_acceptances WHERE message_id = ?1",
             [&request.message_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(2)?,
                 ))
             },
         )
@@ -140,7 +154,7 @@ fn classify_existing(
     Ok(existing.map(|(recipient, sender, envelope)| {
         if recipient == request.recipient_id
             && sender == request.sender_id
-            && envelope == request.envelope_json
+            && envelope == envelope_digest
         {
             EnqueueResult::Duplicate
         } else {
@@ -193,10 +207,16 @@ pub async fn confirm_acceptances(
         let tx = conn.transaction()?;
         let mut statement =
             tx.prepare("DELETE FROM message_acceptances WHERE sender_id = ?1 AND message_id = ?2")?;
+        let mut deleted = 0usize;
         for message_id in &message_ids {
-            statement.execute((&sender_id, message_id))?;
+            deleted = deleted.saturating_add(statement.execute((&sender_id, message_id))?);
         }
         drop(statement);
+        tx.execute(
+            "UPDATE message_acceptance_stats
+             SET item_count = MAX(0, item_count - ?1) WHERE id = 1",
+            [i64::try_from(deleted).unwrap_or(i64::MAX)],
+        )?;
         tx.commit()?;
         Ok(())
     })
