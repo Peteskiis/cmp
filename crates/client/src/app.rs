@@ -557,6 +557,7 @@ fn handle_app_event(
             app.authenticated = true;
             app.status_bar
                 .set_connection(ConnectionStatus::Authenticated(Instant::now()));
+            prekeys::queue_signed_prekey_rotation(app);
             for pending in app.crypto.pending_messages() {
                 let _ = outgoing_tx.send(pending);
             }
@@ -729,45 +730,18 @@ fn handle_server_message(
                 InboundDecrypt::Failed => {}
             }
         }
-        ServerMessage::PreKeyLow { remaining } => match app.crypto.queue_prekey_replenishment() {
-            Ok(upload) => {
-                let _ = outgoing_tx.send(upload);
-                app.status(&format!(
-                    "replenishing one-time pre-keys ({remaining} remaining)"
-                ));
-            }
-            Err(error) => {
-                app.status(&format!("pre-key replenishment failed: {error}"));
-            }
-        },
+        ServerMessage::PreKeyLow { remaining } => {
+            prekeys::handle_prekey_low(app, outgoing_tx, remaining);
+        }
         ServerMessage::PreKeysUploaded {
             upload_id,
             accepted,
             remaining,
-        } => {
-            match app
-                .crypto
-                .confirm_prekeys_uploaded(&upload_id, accepted, remaining)
-            {
-                Ok(replacement) => {
-                    if let Some(upload) = replacement {
-                        let _ = outgoing_tx.send(upload);
-                    }
-                    if accepted {
-                        app.status(&format!(
-                            "one-time pre-keys replenished ({remaining} available)"
-                        ));
-                    } else {
-                        app.status(&format!(
-                            "pre-key upload rejected ({remaining} already available)"
-                        ));
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!("failed to confirm durable pre-key upload: {error}");
-                }
-            }
-        }
+        } => prekeys::handle_prekeys_uploaded(app, outgoing_tx, &upload_id, accepted, remaining),
+        ServerMessage::SignedPreKeyRotated {
+            rotation_id,
+            accepted,
+        } => prekeys::handle_signed_prekey_rotated(app, &rotation_id, accepted),
         ServerMessage::Error { message, .. } => {
             app.status(&format!("server error: {message}"));
         }

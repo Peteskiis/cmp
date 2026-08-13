@@ -57,6 +57,76 @@ fn unused_prekey_session_expires_before_first_encryption() {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)]
+fn signed_prekey_rotation_is_durable_and_bounded() {
+    let (_alice, mut bob, _alice_dir, bob_dir) = setup_alice_and_bob();
+    bob.signed_prekey_rotated_at = 0;
+
+    let rotation = bob.queue_signed_prekey_rotation().unwrap().unwrap();
+    let rotation_id = match rotation {
+        ClientMessage::RotateSignedPreKey {
+            rotation_id,
+            key_id,
+            ..
+        } => {
+            assert_eq!(key_id, 1);
+            rotation_id
+        }
+        _ => panic!("expected signed prekey rotation"),
+    };
+    drop(bob);
+
+    let mut bob = CryptoManager::load_or_generate(bob_dir.path()).unwrap();
+    assert_eq!(bob.stored_spk.as_ref().unwrap().key_id(), 1);
+    assert_eq!(bob.previous_spks[0].key_id(), 0);
+    assert!(
+        bob.confirm_signed_prekey_rotated(&rotation_id, true)
+            .unwrap()
+    );
+
+    for expected_id in 2..=5 {
+        bob.signed_prekey_rotated_at = 0;
+        let rotation = bob.queue_signed_prekey_rotation().unwrap().unwrap();
+        let rotation_id = match rotation {
+            ClientMessage::RotateSignedPreKey {
+                rotation_id,
+                key_id,
+                ..
+            } => {
+                assert_eq!(key_id, expected_id);
+                rotation_id
+            }
+            _ => panic!("expected signed prekey rotation"),
+        };
+        assert!(
+            bob.confirm_signed_prekey_rotated(&rotation_id, true)
+                .unwrap()
+        );
+    }
+    assert_eq!(bob.stored_spk.as_ref().unwrap().key_id(), 5);
+    assert_eq!(
+        bob.previous_spks
+            .iter()
+            .map(SignedPreKey::key_id)
+            .collect::<Vec<_>>(),
+        vec![4, 3, 2]
+    );
+}
+
+#[test]
+fn first_message_decrypts_with_previous_signed_prekey() {
+    let (mut alice, mut bob, _alice_dir, _bob_dir) = setup_alice_and_bob();
+    bob.signed_prekey_rotated_at = 0;
+    bob.queue_signed_prekey_rotation().unwrap().unwrap();
+
+    let envelope = alice.encrypt("bob", b"delayed first message").unwrap();
+    assert_eq!(
+        bob.decrypt("alice", &envelope).unwrap(),
+        b"delayed first message"
+    );
+}
+
+#[test]
 fn forged_prekey_no_orphan_session_no_opk_consumed() {
     let (_alice, mut bob, _a_dir, _b_dir) = setup_alice_and_bob();
     let opk_count_before = bob.stored_opks.len();

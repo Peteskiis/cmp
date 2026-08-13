@@ -106,7 +106,19 @@ fn claim_prekey_reservation(
         "DELETE FROM prekey_reservations WHERE expires_at < ?1",
         [request.now],
     )?;
-    let Some(key_id) = request.prekey_id else {
+    if let Some(key_id) = request.signed_prekey_id {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM signed_prekeys WHERE user_id = ?1 AND key_id = ?2
+             )",
+            (&request.recipient_id, key_id),
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(Some(EnqueueResult::SignedPrekeyExpired));
+        }
+    }
+    let Some(key_id) = request.one_time_prekey_id else {
         return Ok(None);
     };
     let claimed = tx.execute(
@@ -128,7 +140,8 @@ pub struct EnqueueRequest {
     pub sender_id: String,
     pub envelope_json: String,
     pub max_queue_per_user: usize,
-    pub prekey_id: Option<u32>,
+    pub signed_prekey_id: Option<u32>,
+    pub one_time_prekey_id: Option<u32>,
     pub now: u64,
 }
 
@@ -171,6 +184,7 @@ pub enum EnqueueResult {
     QueueFull,
     RecipientNotFound,
     PrekeyReservationInvalid,
+    SignedPrekeyExpired,
     MessageIdConflict,
     AcceptanceLedgerFull,
 }
@@ -369,7 +383,8 @@ mod tests {
             sender_id: "alice".to_owned(),
             envelope_json: envelope.to_owned(),
             max_queue_per_user: 10,
-            prekey_id,
+            signed_prekey_id: None,
+            one_time_prekey_id: prekey_id,
             now,
         }
     }
@@ -397,6 +412,35 @@ mod tests {
                 .await
                 .unwrap(),
             EnqueueResult::PrekeyReservationInvalid
+        ));
+    }
+
+    #[tokio::test]
+    async fn new_prekey_message_requires_retained_signed_prekey() {
+        let conn = test_db().await;
+        conn.call(|conn| {
+            conn.execute(
+                "INSERT INTO signed_prekeys (user_id, key_id, public_key, signature)
+                 VALUES ('bob', 1, X'00', X'00')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let mut stale = request("stale", "ciphertext", None, 100);
+        stale.signed_prekey_id = Some(0);
+        assert!(matches!(
+            enqueue(&conn, stale).await.unwrap(),
+            EnqueueResult::SignedPrekeyExpired
+        ));
+
+        let mut current = request("current", "ciphertext", None, 100);
+        current.signed_prekey_id = Some(1);
+        assert!(matches!(
+            enqueue(&conn, current).await.unwrap(),
+            EnqueueResult::Inserted
         ));
     }
 

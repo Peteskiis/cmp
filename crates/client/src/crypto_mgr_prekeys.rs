@@ -4,6 +4,8 @@ use protocol::{ClientMessage, MessageId};
 
 use super::{B64, CryptoError, CryptoManager, PendingOutbound, ensure_capacity};
 
+const SIGNED_PREKEY_PRIVATE_HISTORY: usize = 3;
+
 impl CryptoManager {
     pub(crate) fn expire_stale_prekey_session(
         &mut self,
@@ -76,6 +78,9 @@ impl CryptoManager {
             .collect();
 
         let previous_spk = self.stored_spk.replace(new_spk);
+        let previous_previous_spks = std::mem::take(&mut self.previous_spks);
+        let previous_rotated_at = self.signed_prekey_rotated_at;
+        self.signed_prekey_rotated_at = crate::crypto_replay::now_secs();
         let previous_opks = std::mem::replace(&mut self.stored_opks, new_opks);
         let previous_next_id = self.next_one_time_prekey_id;
         let previous_created_at = std::mem::take(&mut self.one_time_prekey_created_at);
@@ -90,12 +95,94 @@ impl CryptoManager {
         self.next_one_time_prekey_id = self.next_one_time_prekey_id.max(previous_next_id);
         if let Err(error) = self.persist_state() {
             self.stored_spk = previous_spk;
+            self.previous_spks = previous_previous_spks;
+            self.signed_prekey_rotated_at = previous_rotated_at;
             self.stored_opks = previous_opks;
             self.next_one_time_prekey_id = previous_next_id;
             self.one_time_prekey_created_at = previous_created_at;
             return Err(error);
         }
         Ok(())
+    }
+
+    pub(crate) fn queue_signed_prekey_rotation(
+        &mut self,
+    ) -> Result<Option<ClientMessage>, CryptoError> {
+        if let Some(pending) = self
+            .pending_outbound
+            .iter()
+            .find(|pending| matches!(pending, PendingOutbound::SignedPreKeyRotation { .. }))
+        {
+            return Ok(Some(pending.to_client_message()));
+        }
+        let now = crate::crypto_replay::now_secs();
+        if self.signed_prekey_rotated_at != 0
+            && now.saturating_sub(self.signed_prekey_rotated_at)
+                < protocol::consts::SIGNED_PREKEY_ROTATION_SECS
+        {
+            return Ok(None);
+        }
+        let current_id = self
+            .stored_spk
+            .as_ref()
+            .ok_or(CryptoError::NoSession)?
+            .key_id();
+        let key_id = current_id
+            .checked_add(1)
+            .ok_or(CryptoError::RatchetFailed)?;
+        ensure_capacity(&self.pending_outbound, 96)?;
+        let new_spk = SignedPreKey::generate(key_id, &self.identity);
+        let pending = PendingOutbound::SignedPreKeyRotation {
+            rotation_id: MessageId::new(),
+            key_id,
+            public_key: B64.encode(new_spk.public().as_bytes()),
+            signature: B64.encode(new_spk.signature().to_bytes()),
+        };
+
+        let previous_current = self.stored_spk.replace(new_spk);
+        if let Some(previous) = previous_current {
+            self.previous_spks.insert(0, previous);
+        }
+        let dropped = (self.previous_spks.len() > SIGNED_PREKEY_PRIVATE_HISTORY)
+            .then(|| self.previous_spks.pop())
+            .flatten();
+        let previous_rotated_at = self.signed_prekey_rotated_at;
+        self.signed_prekey_rotated_at = now;
+        self.pending_outbound.push(pending.clone());
+        if let Err(error) = self.persist_outbound(&pending) {
+            self.pending_outbound.pop();
+            self.stored_spk = if self.previous_spks.is_empty() {
+                None
+            } else {
+                Some(self.previous_spks.remove(0))
+            };
+            self.previous_spks.extend(dropped);
+            self.signed_prekey_rotated_at = previous_rotated_at;
+            return Err(CryptoError::Persistence(error));
+        }
+        Ok(Some(pending.to_client_message()))
+    }
+
+    pub(crate) fn confirm_signed_prekey_rotated(
+        &mut self,
+        rotation_id: &MessageId,
+        accepted: bool,
+    ) -> anyhow::Result<bool> {
+        let Some(index) = self.pending_outbound.iter().position(|pending| {
+            matches!(
+                pending,
+                PendingOutbound::SignedPreKeyRotation { rotation_id: pending_id, .. }
+                    if pending_id == rotation_id
+            )
+        }) else {
+            return Ok(false);
+        };
+        if !accepted {
+            return Ok(false);
+        }
+        self.store.delete_outbound(&rotation_id.to_string())?;
+        self.pending_outbound.remove(index);
+        Ok(true)
     }
 
     pub(crate) fn confirm_prekeys_uploaded(

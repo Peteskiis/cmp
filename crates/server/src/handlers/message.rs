@@ -23,7 +23,7 @@ pub(crate) async fn handle_send(
 
     let msg_id_str = message_id.to_string();
     let recipient_str = recipient_id.as_str();
-    let prekey_id = envelope_prekey_id(&envelope.header);
+    let (signed_prekey_id, one_time_prekey_id) = envelope_prekey_ids(&envelope.header);
 
     let Ok(sender_user_id) = UserId::new(sender_id) else {
         return error_500_generic();
@@ -47,7 +47,7 @@ pub(crate) async fn handle_send(
         return error_400("invalid envelope");
     };
 
-    match db::queue::enqueue(
+    let enqueue_result = db::queue::enqueue(
         &state.db,
         EnqueueRequest {
             message_id: msg_id_str,
@@ -55,35 +55,14 @@ pub(crate) async fn handle_send(
             sender_id: sender_id.to_owned(),
             envelope_json,
             max_queue_per_user: consts::MAX_QUEUE_PER_USER,
-            prekey_id,
+            signed_prekey_id,
+            one_time_prekey_id,
             now: now_secs(),
         },
     )
-    .await
-    {
-        Ok(EnqueueResult::Inserted | EnqueueResult::Duplicate) => {}
-        Ok(EnqueueResult::QueueFull) => {
-            return error_400("recipient's message queue is full");
-        }
-        Ok(EnqueueResult::RecipientNotFound) => {
-            return super::error_404("not found");
-        }
-        Ok(EnqueueResult::PrekeyReservationInvalid) => {
-            return ServerMessage::MessageRejected {
-                message_id,
-                reason: "one-time pre-key reservation expired".to_owned(),
-            };
-        }
-        Ok(EnqueueResult::MessageIdConflict) => {
-            return error_400("message ID already used with different content");
-        }
-        Ok(EnqueueResult::AcceptanceLedgerFull) => {
-            return error_400("too many unconfirmed sent messages");
-        }
-        Err(e) => {
-            tracing::error!("failed to queue message: {e}");
-            return error_500_generic();
-        }
+    .await;
+    if let Err(response) = validate_enqueue_result(enqueue_result, &message_id) {
+        return response;
     }
 
     let pushed = state
@@ -104,6 +83,36 @@ pub(crate) async fn handle_send(
     ServerMessage::MessageSent { message_id }
 }
 
+#[allow(clippy::result_large_err)]
+fn validate_enqueue_result(
+    result: anyhow::Result<EnqueueResult>,
+    message_id: &MessageId,
+) -> Result<(), ServerMessage> {
+    match result {
+        Ok(EnqueueResult::Inserted | EnqueueResult::Duplicate) => Ok(()),
+        Ok(EnqueueResult::QueueFull) => Err(error_400("recipient's message queue is full")),
+        Ok(EnqueueResult::RecipientNotFound) => Err(super::error_404("not found")),
+        Ok(EnqueueResult::PrekeyReservationInvalid) => Err(ServerMessage::MessageRejected {
+            message_id: message_id.clone(),
+            reason: "one-time pre-key reservation expired".to_owned(),
+        }),
+        Ok(EnqueueResult::SignedPrekeyExpired) => Err(ServerMessage::MessageRejected {
+            message_id: message_id.clone(),
+            reason: "signed pre-key expired".to_owned(),
+        }),
+        Ok(EnqueueResult::MessageIdConflict) => {
+            Err(error_400("message ID already used with different content"))
+        }
+        Ok(EnqueueResult::AcceptanceLedgerFull) => {
+            Err(error_400("too many unconfirmed sent messages"))
+        }
+        Err(error) => {
+            tracing::error!("failed to queue message: {error}");
+            Err(error_500_generic())
+        }
+    }
+}
+
 pub(crate) async fn handle_message_sent_ack(
     state: &AppState,
     sender_id: &str,
@@ -120,13 +129,17 @@ pub(crate) async fn handle_message_sent_ack(
     None
 }
 
-const fn envelope_prekey_id(header: &MessageHeader) -> Option<u32> {
+const fn envelope_prekey_ids(header: &MessageHeader) -> (Option<u32>, Option<u32>) {
     match header {
         MessageHeader::PreKey {
+            recipient_signed_prekey_id,
             recipient_one_time_prekey_id,
             ..
-        } => *recipient_one_time_prekey_id,
-        _ => None,
+        } => (
+            Some(*recipient_signed_prekey_id),
+            *recipient_one_time_prekey_id,
+        ),
+        _ => (None, None),
     }
 }
 

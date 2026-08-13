@@ -95,6 +95,10 @@ pub(crate) enum InboundDecrypt {
 #[derive(Default, Deserialize)]
 struct CoreState {
     signed_prekey: Option<StoredSpk>,
+    #[serde(default)]
+    previous_signed_prekeys: Vec<StoredSpk>,
+    #[serde(default)]
+    signed_prekey_rotated_at: u64,
     one_time_prekeys: Vec<StoredOpk>,
     sessions: HashMap<String, PeerSession>,
     #[serde(default)]
@@ -103,20 +107,13 @@ struct CoreState {
     one_time_prekey_created_at: HashMap<u32, u64>,
 }
 
-#[derive(Serialize)]
-struct CoreStateRef<'a> {
-    signed_prekey: Option<StoredSpk>,
-    one_time_prekeys: Vec<StoredOpk>,
-    sessions: &'a HashMap<String, PeerSession>,
-    next_one_time_prekey_id: u32,
-    one_time_prekey_created_at: &'a HashMap<u32, u64>,
-}
-
 pub(crate) struct CryptoManager {
     identity: IdentityKeyPair,
     sessions: HashMap<String, PeerSession>,
     pending_inits: HashSet<String>,
     stored_spk: Option<SignedPreKey>,
+    previous_spks: Vec<SignedPreKey>,
+    signed_prekey_rotated_at: u64,
     stored_opks: HashMap<u32, OneTimePreKey>,
     next_one_time_prekey_id: u32,
     one_time_prekey_created_at: HashMap<u32, u64>,
@@ -163,6 +160,14 @@ impl CryptoManager {
             );
         }
         let stored_spk = decode_stored_spk(persisted.signed_prekey)?;
+        let previous_spks = persisted
+            .previous_signed_prekeys
+            .into_iter()
+            .map(|stored| {
+                decode_stored_spk(Some(stored))?
+                    .ok_or_else(|| anyhow::anyhow!("corrupt previous signed prekey"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let stored_opks = decode_stored_opks(persisted.one_time_prekeys);
         let mut one_time_prekey_created_at = persisted.one_time_prekey_created_at;
         let loaded_at = now_secs();
@@ -192,6 +197,8 @@ impl CryptoManager {
             sessions: persisted.sessions,
             pending_inits: HashSet::new(),
             stored_spk,
+            previous_spks,
+            signed_prekey_rotated_at: persisted.signed_prekey_rotated_at,
             stored_opks,
             next_one_time_prekey_id,
             one_time_prekey_created_at,
@@ -591,11 +598,12 @@ impl CryptoManager {
         expected_spk_id: u32,
         opk_id: Option<u32>,
     ) -> Result<SessionState, CryptoError> {
-        let spk = self.stored_spk.as_ref().ok_or(CryptoError::NoSession)?;
-        // Validate the sender used the SPK we actually have
-        if spk.key_id() != expected_spk_id {
-            return Err(CryptoError::BadEnvelope);
-        }
+        let spk = self
+            .stored_spk
+            .iter()
+            .chain(&self.previous_spks)
+            .find(|spk| spk.key_id() == expected_spk_id)
+            .ok_or(CryptoError::BadEnvelope)?;
 
         let ik_bytes = b64_decode_fixed::<32>(sender_identity_key_b64, CryptoError::BadEnvelope)?;
         let peer_vk = VerifyingKey::from_bytes(&ik_bytes).map_err(|_| CryptoError::BadEnvelope)?;

@@ -152,6 +152,25 @@ pub(crate) async fn handle_message(
             let user_id = session.authed_user.as_ref()?;
             Some(prekey::handle_upload(state, user_id, upload_id, prekeys).await)
         }
+        ClientMessage::RotateSignedPreKey {
+            rotation_id,
+            key_id,
+            public_key,
+            signature,
+        } => {
+            let user_id = session.authed_user.as_ref()?;
+            Some(
+                prekey::handle_signed_prekey_rotation(
+                    state,
+                    user_id,
+                    rotation_id,
+                    key_id,
+                    public_key,
+                    signature,
+                )
+                .await,
+            )
+        }
         ClientMessage::FetchPreKeyBundle { target_user_id } => {
             let requester_id = session.authed_user.as_ref()?;
             Some(prekey::handle_fetch(state, requester_id, target_user_id).await)

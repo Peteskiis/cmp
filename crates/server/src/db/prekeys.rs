@@ -82,6 +82,72 @@ pub enum UploadResult {
     InvalidSequence,
 }
 
+#[non_exhaustive]
+pub enum SignedPreKeyRotationResult {
+    Accepted,
+    InvalidSequence,
+    Conflict,
+}
+
+pub async fn rotate_signed_prekey(
+    conn: &Connection,
+    user_id: &str,
+    key_id: u32,
+    public_key: &[u8],
+    signature: &[u8],
+) -> anyhow::Result<SignedPreKeyRotationResult> {
+    let user_id = user_id.to_owned();
+    let public_key = public_key.to_vec();
+    let signature = signature.to_vec();
+    conn.call(move |conn| {
+        let tx = conn.transaction()?;
+        let existing = tx
+            .query_row(
+                "SELECT public_key, signature FROM signed_prekeys
+                 WHERE user_id = ?1 AND key_id = ?2",
+                (&user_id, key_id),
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        if let Some((existing_key, existing_signature)) = existing {
+            tx.rollback()?;
+            return Ok(
+                if existing_key == public_key && existing_signature == signature {
+                    SignedPreKeyRotationResult::Accepted
+                } else {
+                    SignedPreKeyRotationResult::Conflict
+                },
+            );
+        }
+        let current_id: u32 = tx.query_row(
+            "SELECT key_id FROM signed_prekeys WHERE user_id = ?1
+             ORDER BY key_id DESC LIMIT 1",
+            [&user_id],
+            |row| row.get(0),
+        )?;
+        if current_id.checked_add(1) != Some(key_id) {
+            tx.rollback()?;
+            return Ok(SignedPreKeyRotationResult::InvalidSequence);
+        }
+        tx.execute(
+            "INSERT INTO signed_prekeys (user_id, key_id, public_key, signature)
+             VALUES (?1, ?2, ?3, ?4)",
+            (&user_id, key_id, &public_key, &signature),
+        )?;
+        tx.execute(
+            "DELETE FROM signed_prekeys WHERE user_id = ?1 AND key_id NOT IN (
+                SELECT key_id FROM signed_prekeys WHERE user_id = ?1
+                ORDER BY key_id DESC LIMIT 2
+             )",
+            [&user_id],
+        )?;
+        tx.commit()?;
+        Ok(SignedPreKeyRotationResult::Accepted)
+    })
+    .await
+    .map_err(Into::into)
+}
+
 pub async fn fetch_for_requester(
     conn: &Connection,
     requester_id: &str,
@@ -245,6 +311,62 @@ mod tests {
                 "INSERT INTO prekey_inventory (user_id, high_water) VALUES (?1, -1)",
                 [&user_id],
             )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn add_signed_prekey(conn: &Connection, user_id: &str, key_id: u32) {
+        let user_id = user_id.to_owned();
+        let key_byte = u8::try_from(key_id).unwrap();
+        conn.call(move |conn| {
+            conn.execute(
+                "INSERT INTO signed_prekeys (user_id, key_id, public_key, signature)
+                 VALUES (?1, ?2, ?3, ?4)",
+                (&user_id, key_id, vec![key_byte; 32], vec![key_byte; 64]),
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn signed_prekey_rotation_is_idempotent_and_retains_two_public_keys() {
+        let conn = test_db().await;
+        add_user(&conn, "alice").await;
+        add_signed_prekey(&conn, "alice", 0).await;
+
+        for key_id in 1..=3 {
+            let key_byte = u8::try_from(key_id).unwrap();
+            let public_key = vec![key_byte; 32];
+            let signature = vec![key_byte; 64];
+            assert!(matches!(
+                rotate_signed_prekey(&conn, "alice", key_id, &public_key, &signature)
+                    .await
+                    .unwrap(),
+                SignedPreKeyRotationResult::Accepted
+            ));
+            assert!(matches!(
+                rotate_signed_prekey(&conn, "alice", key_id, &public_key, &signature)
+                    .await
+                    .unwrap(),
+                SignedPreKeyRotationResult::Accepted
+            ));
+        }
+
+        let current = get_signed_prekey(&conn, "alice").await.unwrap().unwrap();
+        assert_eq!(current.0, 3);
+        conn.call(|conn| {
+            let ids = conn
+                .prepare(
+                    "SELECT key_id FROM signed_prekeys WHERE user_id = 'alice'
+                     ORDER BY key_id DESC",
+                )?
+                .query_map([], |row| row.get::<_, u32>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(ids, vec![3, 2]);
             Ok(())
         })
         .await

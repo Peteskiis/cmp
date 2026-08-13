@@ -29,6 +29,13 @@ pub enum ClientMessage {
         prekeys: Vec<OneTimePreKey>,
     },
 
+    RotateSignedPreKey {
+        rotation_id: MessageId,
+        key_id: u32,
+        public_key: String,
+        signature: String,
+    },
+
     FetchPreKeyBundle {
         target_user_id: UserId,
     },
@@ -133,6 +140,11 @@ pub enum ServerMessage {
         upload_id: MessageId,
         accepted: bool,
         remaining: u32,
+    },
+
+    SignedPreKeyRotated {
+        rotation_id: MessageId,
+        accepted: bool,
     },
 
     Error {
@@ -283,6 +295,16 @@ mod tests {
     }
 
     #[test]
+    fn client_rotate_signed_prekey() {
+        roundtrip_client(&ClientMessage::RotateSignedPreKey {
+            rotation_id: MessageId::new(),
+            key_id: 2,
+            public_key: "cGs=".to_owned(),
+            signature: "c2ln".to_owned(),
+        });
+    }
+
+    #[test]
     fn client_fetch_prekey_bundle() {
         roundtrip_client(&ClientMessage::FetchPreKeyBundle {
             target_user_id: user("carol"),
@@ -398,6 +420,14 @@ mod tests {
             upload_id: MessageId::new(),
             accepted: true,
             remaining: 100,
+        });
+    }
+
+    #[test]
+    fn server_signed_prekey_rotated() {
+        roundtrip_server(&ServerMessage::SignedPreKeyRotated {
+            rotation_id: MessageId::new(),
+            accepted: true,
         });
     }
 
