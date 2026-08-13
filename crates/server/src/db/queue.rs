@@ -38,27 +38,9 @@ pub async fn enqueue(conn: &Connection, request: EnqueueRequest) -> anyhow::Resu
             return Ok(EnqueueResult::QueueFull);
         }
 
-        tx.execute(
-            "DELETE FROM prekey_reservations WHERE expires_at < ?1",
-            [request.now],
-        )?;
-        if let Some(key_id) = request.prekey_id {
-            let claimed = tx.execute(
-                "UPDATE prekey_reservations SET message_id = ?4
-                 WHERE requester_id = ?1 AND target_id = ?2 AND key_id = ?3
-                 AND expires_at >= ?5 AND message_id IS NULL",
-                (
-                    &request.sender_id,
-                    &request.recipient_id,
-                    key_id,
-                    &request.message_id,
-                    request.now,
-                ),
-            )?;
-            if claimed == 0 {
-                tx.rollback()?;
-                return Ok(EnqueueResult::PrekeyReservationInvalid);
-            }
+        if let Some(result) = claim_prekey_reservation(&tx, &request)? {
+            tx.rollback()?;
+            return Ok(result);
         }
 
         let changed = tx.execute(
@@ -71,6 +53,18 @@ pub async fn enqueue(conn: &Connection, request: EnqueueRequest) -> anyhow::Resu
                 &request.envelope_json,
             ),
         )?;
+        tx.execute(
+            "INSERT INTO message_acceptances
+                (message_id, recipient_id, sender_id, envelope, accepted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                &request.message_id,
+                &request.recipient_id,
+                &request.sender_id,
+                &request.envelope_json,
+                request.now,
+            ),
+        )?;
         tx.commit()?;
 
         if changed > 0 {
@@ -81,6 +75,38 @@ pub async fn enqueue(conn: &Connection, request: EnqueueRequest) -> anyhow::Resu
     })
     .await
     .map_err(Into::into)
+}
+
+fn claim_prekey_reservation(
+    tx: &rusqlite::Transaction<'_>,
+    request: &EnqueueRequest,
+) -> rusqlite::Result<Option<EnqueueResult>> {
+    let acceptance_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM message_acceptances WHERE sender_id = ?1",
+        [&request.sender_id],
+        |row| row.get(0),
+    )?;
+    if acceptance_count >= i64::try_from(request.max_queue_per_user).unwrap_or(i64::MAX) {
+        return Ok(Some(EnqueueResult::AcceptanceLedgerFull));
+    }
+    tx.execute(
+        "DELETE FROM prekey_reservations WHERE expires_at < ?1",
+        [request.now],
+    )?;
+    let Some(key_id) = request.prekey_id else {
+        return Ok(None);
+    };
+    let claimed = tx.execute(
+        "DELETE FROM prekey_reservations
+         WHERE requester_id = ?1 AND target_id = ?2 AND key_id = ?3 AND expires_at >= ?4",
+        (
+            &request.sender_id,
+            &request.recipient_id,
+            key_id,
+            request.now,
+        ),
+    )?;
+    Ok((claimed == 0).then_some(EnqueueResult::PrekeyReservationInvalid))
 }
 
 pub struct EnqueueRequest {
@@ -99,7 +125,8 @@ fn classify_existing(
 ) -> rusqlite::Result<Option<EnqueueResult>> {
     let existing = tx
         .query_row(
-            "SELECT recipient_id, sender_id, envelope FROM message_queue WHERE message_id = ?1",
+            "SELECT recipient_id, sender_id, envelope
+             FROM message_acceptances WHERE message_id = ?1",
             [&request.message_id],
             |row| {
                 Ok((
@@ -131,6 +158,50 @@ pub enum EnqueueResult {
     RecipientNotFound,
     PrekeyReservationInvalid,
     MessageIdConflict,
+    AcceptanceLedgerFull,
+}
+
+pub async fn pending_acceptances(
+    conn: &Connection,
+    sender_id: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<String>> {
+    let sender_id = sender_id.to_owned();
+    conn.call(move |conn| {
+        let mut statement = conn.prepare(
+            "SELECT message_id FROM message_acceptances
+             WHERE sender_id = ?1 ORDER BY accepted_at LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            (&sender_id, i64::try_from(limit).unwrap_or(i64::MAX)),
+            |row| row.get(0),
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+    .map_err(Into::into)
+}
+
+pub async fn confirm_acceptances(
+    conn: &Connection,
+    sender_id: &str,
+    message_ids: &[String],
+) -> anyhow::Result<()> {
+    let sender_id = sender_id.to_owned();
+    let message_ids = message_ids.to_vec();
+    conn.call(move |conn| {
+        let tx = conn.transaction()?;
+        let mut statement =
+            tx.prepare("DELETE FROM message_acceptances WHERE sender_id = ?1 AND message_id = ?2")?;
+        for message_id in &message_ids {
+            statement.execute((&sender_id, message_id))?;
+        }
+        drop(statement);
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+    .map_err(Into::into)
 }
 
 /// Retrieve the next queued message after `after_row_id`.
@@ -292,6 +363,9 @@ mod tests {
                 .unwrap(),
             EnqueueResult::Inserted
         ));
+        delete_messages(&conn, "bob", &["message-1".to_owned()])
+            .await
+            .unwrap();
         assert!(matches!(
             enqueue(&conn, request("message-1", "ciphertext", Some(7), 201))
                 .await

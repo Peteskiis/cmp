@@ -303,6 +303,37 @@ pub(crate) async fn deliver_queued_receipts(
     deliver_receipt_confirmations(state, tx, user_id).await;
 }
 
+#[allow(clippy::cognitive_complexity)]
+pub(crate) async fn deliver_message_confirmations(
+    state: &AppState,
+    tx: &mpsc::Sender<ServerMessage>,
+    user_id: &str,
+) {
+    let ids = match db::queue::pending_acceptances(&state.db, user_id, consts::MAX_QUEUE_PER_USER)
+        .await
+    {
+        Ok(ids) => ids,
+        Err(error) => {
+            warn!(user_id, "failed to load message confirmations: {error}");
+            return;
+        }
+    };
+    for id in ids {
+        let Ok(message_id) = uuid::Uuid::parse_str(&id) else {
+            continue;
+        };
+        if tx
+            .send(ServerMessage::MessageSent {
+                message_id: message_id.into(),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 pub(crate) async fn deliver_prekey_status(
     state: &AppState,
     tx: &mpsc::Sender<ServerMessage>,

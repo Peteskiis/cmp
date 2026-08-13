@@ -1,6 +1,6 @@
 use tokio_rusqlite::Connection;
 
-const CURRENT_VERSION: u32 = 7;
+const CURRENT_VERSION: u32 = 8;
 
 /// Initialize the database schema, pragmas, and migrations.
 pub async fn initialize(conn: &Connection) -> anyhow::Result<()> {
@@ -80,6 +80,9 @@ pub async fn initialize(conn: &Connection) -> anyhow::Result<()> {
         }
         if version < 7 {
             migrate_v7(conn)?;
+        }
+        if version < 8 {
+            migrate_v8(conn)?;
         }
 
         Ok(())
@@ -170,11 +173,30 @@ fn migrate_v7(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
             target_id TEXT NOT NULL,
             key_id INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
-            message_id TEXT,
             PRIMARY KEY (requester_id, target_id, key_id)
         );
         CREATE INDEX idx_prekey_reservation_expiry
             ON prekey_reservations(expires_at);",
+    )?;
+    tx.pragma_update(None, "user_version", 7)?;
+    tx.commit()
+}
+
+fn migrate_v8(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE message_acceptances (
+            message_id TEXT PRIMARY KEY,
+            recipient_id TEXT NOT NULL,
+            sender_id TEXT NOT NULL,
+            envelope TEXT NOT NULL,
+            accepted_at INTEGER NOT NULL
+        );
+        CREATE INDEX idx_message_acceptance_time ON message_acceptances(accepted_at);
+        INSERT INTO message_acceptances
+            (message_id, recipient_id, sender_id, envelope, accepted_at)
+        SELECT message_id, recipient_id, sender_id, envelope, unixepoch(created_at)
+        FROM message_queue;",
     )?;
     tx.pragma_update(None, "user_version", CURRENT_VERSION)?;
     tx.commit()
@@ -193,6 +215,7 @@ mod tests {
                 "DROP TABLE prekey_fetch_events;
                  DROP TABLE prekey_inventory;
                  DROP TABLE prekey_reservations;
+                 DROP TABLE message_acceptances;
                  ALTER TABLE prekeys DROP COLUMN created_at;",
             )?;
             conn.pragma_update(None, "user_version", 2)?;
@@ -224,6 +247,41 @@ mod tests {
                 |row| row.get(0),
             )?;
             assert!(inventory_exists);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_seven_database_gains_acceptance_ledger_and_backfill() {
+        let conn = Connection::open_in_memory().await.unwrap();
+        initialize(&conn).await.unwrap();
+        conn.call(|conn| {
+            conn.execute("DROP TABLE message_acceptances", [])?;
+            conn.execute(
+                "INSERT INTO users (user_id, identity_key) VALUES ('bob', X'00')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO message_queue (message_id, recipient_id, sender_id, envelope)
+                 VALUES ('pending', 'bob', 'alice', 'ciphertext')",
+                [],
+            )?;
+            conn.pragma_update(None, "user_version", 7)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        initialize(&conn).await.unwrap();
+        conn.call(|conn| {
+            let accepted: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM message_acceptances WHERE message_id = 'pending')",
+                [],
+                |row| row.get(0),
+            )?;
+            assert!(accepted);
             Ok(())
         })
         .await

@@ -77,6 +77,9 @@ pub(crate) async fn handle_send(
         Ok(EnqueueResult::MessageIdConflict) => {
             return error_400("message ID already used with different content");
         }
+        Ok(EnqueueResult::AcceptanceLedgerFull) => {
+            return error_400("too many unconfirmed sent messages");
+        }
         Err(e) => {
             tracing::error!("failed to queue message: {e}");
             return error_500_generic();
@@ -99,6 +102,22 @@ pub(crate) async fn handle_send(
     }
 
     ServerMessage::MessageSent { message_id }
+}
+
+pub(crate) async fn handle_message_sent_ack(
+    state: &AppState,
+    sender_id: &str,
+    message_ids: Vec<MessageId>,
+) -> Option<ServerMessage> {
+    if message_ids.len() > consts::MAX_ACK_BATCH {
+        return Some(error_400("ack batch exceeds maximum size"));
+    }
+    let ids: Vec<String> = message_ids.iter().map(ToString::to_string).collect();
+    if let Err(error) = db::queue::confirm_acceptances(&state.db, sender_id, &ids).await {
+        tracing::error!("failed to confirm message acceptance: {error}");
+        return Some(error_500_generic());
+    }
+    None
 }
 
 const fn envelope_prekey_id(header: &MessageHeader) -> Option<u32> {

@@ -10,8 +10,6 @@ pub(super) enum PendingOutbound {
         recipient_id: UserId,
         message_id: MessageId,
         envelope: EncryptedEnvelope,
-        #[serde(default)]
-        prekey_expires_at: Option<u64>,
     },
     ReadReceipt {
         recipient_id: UserId,

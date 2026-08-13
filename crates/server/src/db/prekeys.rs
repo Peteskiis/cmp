@@ -429,19 +429,11 @@ mod tests {
             .unwrap();
         assert!(matches!(fetched, FetchResult::Fetched { key_id: 0, .. }));
         conn.call(|conn| {
-            let reservation: (String, String, u32, u64, Option<String>) = conn.query_row(
-                "SELECT requester_id, target_id, key_id, expires_at, message_id
+            let reservation: (String, String, u32, u64) = conn.query_row(
+                "SELECT requester_id, target_id, key_id, expires_at
                  FROM prekey_reservations",
                 [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
             assert_eq!(reservation.0, "alice");
             assert_eq!(reservation.1, "target");
@@ -450,7 +442,6 @@ mod tests {
                 reservation.3,
                 100 + protocol::consts::ONE_TIME_PREKEY_RESERVATION_SECS
             );
-            assert!(reservation.4.is_none());
             Ok(())
         })
         .await

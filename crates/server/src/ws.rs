@@ -81,6 +81,7 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
         // Deliver queued messages after AuthSuccess is on the wire
         if !was_authed && let Some(ref uid) = session.authed_user {
             handlers::auth::deliver_queued_messages(&state, &tx, uid).await;
+            handlers::auth::deliver_message_confirmations(&state, &tx, uid).await;
             handlers::auth::deliver_queued_receipts(&state, &tx, uid).await;
             if session.deliver_prekey_status {
                 handlers::auth::deliver_prekey_status(&state, &tx, uid).await;

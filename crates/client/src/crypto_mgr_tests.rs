@@ -381,7 +381,6 @@ fn durable_outbox_rejects_new_items_at_capacity_before_ratchet_advances() {
             recipient_id: recipient.clone(),
             message_id: MessageId::new(),
             envelope: envelope.clone(),
-            prekey_expires_at: None,
         })
         .collect();
 

@@ -46,6 +46,10 @@ pub enum ClientMessage {
         message_ids: Vec<MessageId>,
     },
 
+    AckMessageSent {
+        message_ids: Vec<MessageId>,
+    },
+
     /// Ephemeral typing indicator — relayed to online recipient only, never queued.
     Typing {
         recipient_id: UserId,
@@ -500,6 +504,13 @@ mod tests {
     fn client_typing() {
         roundtrip_client(&ClientMessage::Typing {
             recipient_id: user("bob"),
+        });
+    }
+
+    #[test]
+    fn client_ack_message_sent() {
+        roundtrip_client(&ClientMessage::AckMessageSent {
+            message_ids: vec![MessageId::new()],
         });
     }
 

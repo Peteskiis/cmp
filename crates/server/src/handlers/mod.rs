@@ -115,7 +115,7 @@ pub(crate) fn decode_prekeys(
 }
 
 /// Route a client message to the appropriate handler.
-#[allow(clippy::cognitive_complexity)] // Inherent in a message router.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)] // Inherent in a message router.
 pub(crate) async fn handle_message(
     state: &AppState,
     tx: &mpsc::Sender<ServerMessage>,
@@ -170,6 +170,10 @@ pub(crate) async fn handle_message(
         } => {
             let user_id = session.authed_user.as_ref()?;
             message::handle_ack(state, user_id, ack_id, message_ids).await
+        }
+        ClientMessage::AckMessageSent { message_ids } => {
+            let user_id = session.authed_user.as_ref()?;
+            message::handle_message_sent_ack(state, user_id, message_ids).await
         }
         ClientMessage::Typing { recipient_id } => {
             let sender_id = session.authed_user.as_ref()?;

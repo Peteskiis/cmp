@@ -187,7 +187,7 @@ impl CryptoManager {
         store.prune_processed(cutoff)?;
         prune_processed(&mut processed_messages, now_secs());
 
-        let mut manager = Self {
+        Ok(Self {
             identity,
             sessions: persisted.sessions,
             pending_inits: HashSet::new(),
@@ -199,9 +199,7 @@ impl CryptoManager {
             processed_messages,
             store,
             fail_persistence: false,
-        };
-        manager.retire_stale_prekey_outbox()?;
-        Ok(manager)
+        })
     }
 
     pub(crate) const fn needs_registration(&self) -> bool {
@@ -324,14 +322,10 @@ impl CryptoManager {
         }
         ensure_capacity(&self.pending_outbound, plaintext.len())?;
         let (original_session, envelope) = self.advance_encryption(peer_id, plaintext)?;
-        let prekey_expires_at = matches!(envelope.header, MessageHeader::PreKey { .. })
-            .then_some(original_session.prekey_expires_at)
-            .flatten();
         let pending = PendingOutbound::Message {
             recipient_id: recipient_id.clone(),
             message_id: message_id.clone(),
             envelope,
-            prekey_expires_at,
         };
         self.pending_outbound.push(pending.clone());
 

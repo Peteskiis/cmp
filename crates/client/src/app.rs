@@ -678,6 +678,10 @@ fn handle_server_message(
         ServerMessage::MessageSent { message_id } => {
             if let Err(error) = app.crypto.confirm_message_sent(&message_id) {
                 tracing::warn!("failed to confirm durable outbound message: {error}");
+            } else {
+                let _ = outgoing_tx.send(ClientMessage::AckMessageSent {
+                    message_ids: vec![message_id],
+                });
             }
         }
         ServerMessage::MessageRejected { message_id, reason } => {
