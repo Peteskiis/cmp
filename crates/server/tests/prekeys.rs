@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use ed25519_dalek::Signer;
 use futures::{SinkExt, StreamExt};
 use protocol::{ClientMessage, MessageId, OneTimePreKey, PreKeyBundle, ServerMessage, UserId};
 use tokio::net::TcpListener;
@@ -38,6 +39,14 @@ async fn recv(stream: &mut WsStream) -> ServerMessage {
 }
 
 async fn register(sink: &mut WsSink, stream: &mut WsStream, user: &str) {
+    let _ = register_identity(sink, stream, user).await;
+}
+
+async fn register_identity(
+    sink: &mut WsSink,
+    stream: &mut WsStream,
+    user: &str,
+) -> crypto::keys::IdentityKeyPair {
     let identity = crypto::keys::IdentityKeyPair::generate();
     let signed_prekey = crypto::keys::SignedPreKey::generate(0, &identity);
     let private_prekeys = crypto::keys::generate_one_time_prekeys(0, 5).unwrap();
@@ -65,6 +74,41 @@ async fn register(sink: &mut WsSink, stream: &mut WsStream, user: &str) {
     )
     .await;
     assert!(matches!(recv(stream).await, ServerMessage::AuthSuccess));
+    identity
+}
+
+async fn authenticate(
+    sink: &mut WsSink,
+    stream: &mut WsStream,
+    user: &str,
+    identity: &crypto::keys::IdentityKeyPair,
+) {
+    send(
+        sink,
+        &ClientMessage::AuthChallenge {
+            user_id: UserId::new(user).unwrap(),
+        },
+    )
+    .await;
+    let ServerMessage::Challenge {
+        nonce,
+        timestamp,
+        server_id,
+    } = recv(stream).await
+    else {
+        panic!("expected challenge");
+    };
+    let mut signed_data = B64.decode(nonce).unwrap();
+    signed_data.extend_from_slice(&timestamp.to_be_bytes());
+    signed_data.extend_from_slice(server_id.as_bytes());
+    send(
+        sink,
+        &ClientMessage::AuthResponse {
+            signature: B64.encode(identity.signing_key().sign(&signed_data).to_bytes()),
+        },
+    )
+    .await;
+    assert!(matches!(recv(stream).await, ServerMessage::AuthSuccess));
 }
 
 #[tokio::test]
@@ -83,6 +127,21 @@ async fn prekey_bundle_self_fetch_is_rejected() {
     assert!(matches!(
         recv(&mut stream).await,
         ServerMessage::Error { code: 400, .. }
+    ));
+}
+
+#[tokio::test]
+async fn authentication_reports_low_prekey_inventory() {
+    let (url, _handle) = start_test_server().await;
+    let (mut sink, mut stream) = connect(&url).await;
+    let identity = register_identity(&mut sink, &mut stream, "alice").await;
+    drop((sink, stream));
+
+    let (mut sink, mut stream) = connect(&url).await;
+    authenticate(&mut sink, &mut stream, "alice", &identity).await;
+    assert!(matches!(
+        recv(&mut stream).await,
+        ServerMessage::PreKeyLow { remaining: 5 }
     ));
 }
 
@@ -138,4 +197,34 @@ async fn prekey_upload_is_correlated_capped_and_idempotent() {
             } if upload_id == accepted_id
         ));
     }
+
+    let (mut bob_sink, mut bob_stream) = connect(&url).await;
+    register(&mut bob_sink, &mut bob_stream, "bob").await;
+    send(
+        &mut bob_sink,
+        &ClientMessage::FetchPreKeyBundle {
+            target_user_id: UserId::new("alice").unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut bob_stream).await,
+        ServerMessage::PreKeyBundleResponse { .. }
+    ));
+    send(
+        &mut sink,
+        &ClientMessage::UploadPreKeys {
+            upload_id: accepted_id.clone(),
+            prekeys: accepted_prekeys,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut stream).await,
+        ServerMessage::PreKeysUploaded {
+            upload_id,
+            accepted: true,
+            remaining: 199,
+        } if upload_id == accepted_id
+    ));
 }

@@ -1,6 +1,8 @@
 use rusqlite::OptionalExtension;
 use tokio_rusqlite::Connection;
 
+const PUBLIC_PREKEY_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Upload a batch of one-time pre-keys for a user.
 pub async fn upload_prekeys(
     conn: &Connection,
@@ -13,22 +15,34 @@ pub async fn upload_prekeys(
 
     conn.call(move |conn| {
         let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM prekeys WHERE user_id = ?1
+             AND created_at < unixepoch() - ?2",
+            (&user_id, PUBLIC_PREKEY_RETENTION_SECS),
+        )?;
+        let high_water: i64 = tx.query_row(
+            "SELECT high_water FROM prekey_inventory WHERE user_id = ?1",
+            [&user_id],
+            |row| row.get(0),
+        )?;
+        let minimum = prekeys.iter().map(|(key_id, _)| i64::from(*key_id)).min();
+        let maximum_id = prekeys.iter().map(|(key_id, _)| i64::from(*key_id)).max();
         let existing: i64 = tx.query_row(
             "SELECT COUNT(*) FROM prekeys WHERE user_id = ?1",
             [&user_id],
             |row| row.get(0),
         )?;
-        let mut new_count = 0_i64;
-        for (key_id, _) in &prekeys {
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM prekeys WHERE user_id = ?1 AND key_id = ?2)",
-                (&user_id, key_id),
-                |row| row.get(0),
-            )?;
-            if !exists {
-                new_count += 1;
-            }
+        if maximum_id.is_some_and(|maximum| maximum <= high_water) {
+            tx.rollback()?;
+            return Ok(UploadResult::Accepted(
+                u32::try_from(existing).unwrap_or(u32::MAX),
+            ));
         }
+        if minimum.is_none_or(|minimum| minimum <= high_water) {
+            tx.rollback()?;
+            return Ok(UploadResult::InvalidSequence);
+        }
+        let new_count = i64::try_from(prekeys.len()).unwrap_or(i64::MAX);
         let maximum = i64::try_from(max_prekeys_per_user).unwrap_or(i64::MAX);
         if existing.saturating_add(new_count) > maximum {
             tx.rollback()?;
@@ -38,13 +52,17 @@ pub async fn upload_prekeys(
         }
         {
             let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO prekeys (user_id, key_id, public_key)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO prekeys (user_id, key_id, public_key, created_at)
+                 VALUES (?1, ?2, ?3, unixepoch())",
             )?;
             for (key_id, public_key) in &prekeys {
                 stmt.execute((&user_id, key_id, public_key))?;
             }
         }
+        tx.execute(
+            "UPDATE prekey_inventory SET high_water = ?2 WHERE user_id = ?1",
+            (&user_id, maximum_id.unwrap_or(high_water)),
+        )?;
         let remaining: u32 = tx.query_row(
             "SELECT COUNT(*) FROM prekeys WHERE user_id = ?1",
             [&user_id],
@@ -61,6 +79,7 @@ pub async fn upload_prekeys(
 pub enum UploadResult {
     Accepted(u32),
     InventoryFull(u32),
+    InvalidSequence,
 }
 
 pub async fn fetch_for_requester(
@@ -75,6 +94,11 @@ pub async fn fetch_for_requester(
     conn.call(move |conn| {
         let tx = conn.transaction()?;
         let cutoff = now.saturating_sub(limits.window_secs);
+        let prekey_cutoff = now.saturating_sub(PUBLIC_PREKEY_RETENTION_SECS);
+        tx.execute(
+            "DELETE FROM prekeys WHERE user_id = ?1 AND created_at < ?2",
+            (&target_id, prekey_cutoff),
+        )?;
         tx.execute(
             "DELETE FROM prekey_fetch_events WHERE created_at < ?1",
             [cutoff],
@@ -91,15 +115,14 @@ pub async fn fetch_for_requester(
             (&target_id, cutoff),
             |row| row.get(0),
         )?;
-        if requester_count >= limits.per_requester || target_count >= limits.per_target {
+        if requester_count >= limits.per_requester {
             tx.rollback()?;
             return Ok(FetchResult::RateLimited);
         }
-        tx.execute(
-            "INSERT INTO prekey_fetch_events (requester_id, target_id, created_at)
-             VALUES (?1, ?2, ?3)",
-            (&requester_id, &target_id, now),
-        )?;
+        if target_count >= limits.per_target {
+            tx.rollback()?;
+            return Ok(FetchResult::TargetDepleted);
+        }
         let prekey = tx
             .query_row(
                 "DELETE FROM prekeys WHERE rowid = (
@@ -109,6 +132,13 @@ pub async fn fetch_for_requester(
                 |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?)),
             )
             .optional()?;
+        if prekey.is_some() {
+            tx.execute(
+                "INSERT INTO prekey_fetch_events (requester_id, target_id, created_at)
+                 VALUES (?1, ?2, ?3)",
+                (&requester_id, &target_id, now),
+            )?;
+        }
         tx.commit()?;
         Ok(prekey.map_or(FetchResult::Empty, |(key_id, public_key)| {
             FetchResult::Fetched { key_id, public_key }
@@ -129,6 +159,7 @@ pub struct FetchLimits {
 pub enum FetchResult {
     Fetched { key_id: u32, public_key: Vec<u8> },
     Empty,
+    TargetDepleted,
     RateLimited,
 }
 
@@ -166,8 +197,9 @@ pub async fn count_prekeys(conn: &Connection, user_id: &str) -> anyhow::Result<u
 
     conn.call(move |conn| {
         let count: u32 = conn.query_row(
-            "SELECT COUNT(*) FROM prekeys WHERE user_id = ?1",
-            (&user_id,),
+            "SELECT COUNT(*) FROM prekeys WHERE user_id = ?1
+             AND created_at >= unixepoch() - ?2",
+            (&user_id, PUBLIC_PREKEY_RETENTION_SECS),
             |row| row.get(0),
         )?;
         Ok(count)
@@ -195,6 +227,10 @@ mod tests {
                 "INSERT INTO users (user_id, identity_key) VALUES (?1, ?2)",
                 (&user_id, vec![0_u8; 32]),
             )?;
+            conn.execute(
+                "INSERT INTO prekey_inventory (user_id, high_water) VALUES (?1, -1)",
+                [&user_id],
+            )?;
             Ok(())
         })
         .await
@@ -211,15 +247,52 @@ mod tests {
             upload_prekeys(&conn, "alice", &prekeys, 3).await.unwrap(),
             UploadResult::Accepted(3)
         ));
+        let consumed = fetch_for_requester(
+            &conn,
+            "bob",
+            "alice",
+            100,
+            FetchLimits {
+                window_secs: 3_600,
+                per_requester: 10,
+                per_target: 10,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(consumed, FetchResult::Fetched { .. }));
         assert!(matches!(
             upload_prekeys(&conn, "alice", &prekeys, 3).await.unwrap(),
-            UploadResult::Accepted(3)
+            UploadResult::Accepted(2)
         ));
         assert!(matches!(
-            upload_prekeys(&conn, "alice", &[(3, vec![3; 32])], 3)
+            upload_prekeys(&conn, "alice", &[(3, vec![3; 32]), (4, vec![4; 32])], 3,)
                 .await
                 .unwrap(),
-            UploadResult::InventoryFull(3)
+            UploadResult::InventoryFull(2)
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_public_prekeys_do_not_count_toward_inventory() {
+        let conn = test_db().await;
+        add_user(&conn, "alice").await;
+        upload_prekeys(&conn, "alice", &[(0, vec![0_u8; 32])], 1)
+            .await
+            .unwrap();
+        conn.call(|conn| {
+            conn.execute("UPDATE prekeys SET created_at = 0", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(count_prekeys(&conn, "alice").await.unwrap(), 0);
+        assert!(matches!(
+            upload_prekeys(&conn, "alice", &[(1, vec![1_u8; 32])], 1)
+                .await
+                .unwrap(),
+            UploadResult::Accepted(1)
         ));
     }
 
@@ -259,7 +332,7 @@ mod tests {
             fetch_for_requester(&conn, "carol", "target", 100, limits)
                 .await
                 .unwrap(),
-            FetchResult::RateLimited
+            FetchResult::TargetDepleted
         ));
     }
 

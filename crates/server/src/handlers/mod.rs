@@ -18,6 +18,7 @@ pub(crate) struct Session {
     pub authed_user: Option<String>,
     pub conn_id: Option<u64>,
     pub pending_challenge: Option<auth::PendingChallenge>,
+    pub deliver_prekey_status: bool,
 }
 
 impl Default for Session {
@@ -32,6 +33,7 @@ impl Session {
             authed_user: None,
             conn_id: None,
             pending_challenge: None,
+            deliver_prekey_status: false,
         }
     }
 }

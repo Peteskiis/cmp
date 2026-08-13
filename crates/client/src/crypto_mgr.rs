@@ -19,6 +19,8 @@ use crate::crypto_outbox::{PendingOutbound, ensure_capacity};
 use crate::crypto_replay::{ProcessedMessage, now_secs, prune_processed, validate_peer_ids};
 use crate::crypto_store;
 
+const LEGACY_PREKEY_ID_FLOOR: u32 = 1 << 31;
+
 #[path = "crypto_mgr_persistence.rs"]
 mod persistence;
 use persistence::{decode_stored_opks, decode_stored_spk, restore_entry};
@@ -89,7 +91,9 @@ struct CoreState {
     one_time_prekeys: Vec<StoredOpk>,
     sessions: HashMap<String, PeerSession>,
     #[serde(default)]
-    next_one_time_prekey_id: u32,
+    next_one_time_prekey_id: Option<u32>,
+    #[serde(default)]
+    one_time_prekey_created_at: HashMap<u32, u64>,
 }
 
 #[derive(Serialize)]
@@ -98,6 +102,7 @@ struct CoreStateRef<'a> {
     one_time_prekeys: Vec<StoredOpk>,
     sessions: &'a HashMap<String, PeerSession>,
     next_one_time_prekey_id: u32,
+    one_time_prekey_created_at: &'a HashMap<u32, u64>,
 }
 
 pub(crate) struct CryptoManager {
@@ -107,6 +112,7 @@ pub(crate) struct CryptoManager {
     stored_spk: Option<SignedPreKey>,
     stored_opks: HashMap<u32, OneTimePreKey>,
     next_one_time_prekey_id: u32,
+    one_time_prekey_created_at: HashMap<u32, u64>,
     pending_outbound: Vec<PendingOutbound>,
     processed_messages: HashMap<String, HashMap<String, ProcessedMessage>>,
     store: crypto_store::CryptoStore,
@@ -151,11 +157,23 @@ impl CryptoManager {
         }
         let stored_spk = decode_stored_spk(persisted.signed_prekey)?;
         let stored_opks = decode_stored_opks(persisted.one_time_prekeys);
+        let mut one_time_prekey_created_at = persisted.one_time_prekey_created_at;
+        let loaded_at = now_secs();
+        one_time_prekey_created_at.retain(|key_id, _| stored_opks.contains_key(key_id));
+        for key_id in stored_opks.keys() {
+            one_time_prekey_created_at
+                .entry(*key_id)
+                .or_insert(loaded_at);
+        }
         let derived_next_id = stored_opks
             .keys()
             .max()
             .map_or(0, |key_id| key_id.saturating_add(1));
-        let next_one_time_prekey_id = persisted.next_one_time_prekey_id.max(derived_next_id);
+        let next_one_time_prekey_id = persisted
+            .next_one_time_prekey_id
+            .map_or(LEGACY_PREKEY_ID_FLOOR, |next_id| {
+                next_id.max(derived_next_id)
+            });
         validate_peer_ids(&persisted.sessions)?;
         validate_peer_ids(&processed_messages)?;
         let cutoff = now_secs().saturating_sub(crate::crypto_replay::RETENTION_SECS);
@@ -169,6 +187,7 @@ impl CryptoManager {
             stored_spk,
             stored_opks,
             next_one_time_prekey_id,
+            one_time_prekey_created_at,
             pending_outbound,
             processed_messages,
             store,
@@ -533,14 +552,14 @@ impl CryptoManager {
                 },
             );
             let consumed_opk = recipient_one_time_prekey_id
-                .and_then(|opk_id| self.stored_opks.remove(&opk_id).map(|opk| (opk_id, opk)));
+                .and_then(|opk_id| self.take_one_time_prekey(opk_id).map(|opk| (opk_id, opk)));
             let inserted_marker = processed_message_id
                 .is_some_and(|message_id| self.mark_processed(peer_id, message_id, &plaintext));
 
             if let Err(error) = self.persist_decrypt(peer_id, processed_message_id) {
                 self.sessions.remove(peer_id);
-                if let Some((opk_id, opk)) = consumed_opk {
-                    self.stored_opks.insert(opk_id, opk);
+                if let Some((opk_id, (opk, created_at))) = consumed_opk {
+                    self.restore_one_time_prekey(opk_id, opk, created_at);
                 }
                 if inserted_marker {
                     self.remove_processed(peer_id, processed_message_id.unwrap_or_default());

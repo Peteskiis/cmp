@@ -1,6 +1,6 @@
 use tokio_rusqlite::Connection;
 
-const CURRENT_VERSION: u32 = 3;
+const CURRENT_VERSION: u32 = 5;
 
 /// Initialize the database schema, pragmas, and migrations.
 pub async fn initialize(conn: &Connection) -> anyhow::Result<()> {
@@ -67,6 +67,14 @@ pub async fn initialize(conn: &Connection) -> anyhow::Result<()> {
             migrate_v3(conn)?;
         }
 
+        if version < 4 {
+            migrate_v4(conn)?;
+        }
+
+        if version < 5 {
+            migrate_v5(conn)?;
+        }
+
         Ok(())
     })
     .await?;
@@ -106,6 +114,32 @@ fn migrate_v3(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_prekey_fetch_target
             ON prekey_fetch_events(target_id, created_at);",
     )?;
+    tx.pragma_update(None, "user_version", 3)?;
+    tx.commit()
+}
+
+fn migrate_v4(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS prekey_inventory (
+            user_id TEXT PRIMARY KEY REFERENCES users(user_id),
+            high_water INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO prekey_inventory (user_id, high_water)
+        SELECT users.user_id, COALESCE(MAX(prekeys.key_id), -1)
+        FROM users LEFT JOIN prekeys ON prekeys.user_id = users.user_id
+        GROUP BY users.user_id;",
+    )?;
+    tx.pragma_update(None, "user_version", 4)?;
+    tx.commit()
+}
+
+fn migrate_v5(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE prekeys ADD COLUMN created_at INTEGER;
+         UPDATE prekeys SET created_at = unixepoch() WHERE created_at IS NULL;",
+    )?;
     tx.pragma_update(None, "user_version", CURRENT_VERSION)?;
     tx.commit()
 }
@@ -115,9 +149,15 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn version_two_database_runs_version_three_migration() {
+    async fn older_database_runs_all_later_migrations() {
         let conn = Connection::open_in_memory().await.unwrap();
+        initialize(&conn).await.unwrap();
         conn.call(|conn| {
+            conn.execute_batch(
+                "DROP TABLE prekey_fetch_events;
+                 DROP TABLE prekey_inventory;
+                 ALTER TABLE prekeys DROP COLUMN created_at;",
+            )?;
             conn.pragma_update(None, "user_version", 2)?;
             Ok(())
         })
@@ -138,6 +178,15 @@ mod tests {
             )?;
             assert_eq!(version, CURRENT_VERSION);
             assert!(table_exists);
+            let inventory_exists: bool = conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'prekey_inventory'
+                )",
+                [],
+                |row| row.get(0),
+            )?;
+            assert!(inventory_exists);
             Ok(())
         })
         .await

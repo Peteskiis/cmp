@@ -63,6 +63,7 @@ impl CryptoManager {
             one_time_prekeys,
             sessions: &self.sessions,
             next_one_time_prekey_id: self.next_one_time_prekey_id,
+            one_time_prekey_created_at: &self.one_time_prekey_created_at,
         }
     }
 

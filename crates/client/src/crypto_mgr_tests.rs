@@ -581,6 +581,73 @@ fn rejected_prekey_upload_discards_unpublished_private_keys() {
 }
 
 #[test]
+fn replenishment_prunes_private_prekeys_past_queue_retention() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manager = CryptoManager::load_or_generate(directory.path()).unwrap();
+    let signed_prekey = SignedPreKey::generate(0, manager.identity());
+    let initial = crypto::keys::generate_one_time_prekeys(0, 2).unwrap();
+    manager
+        .persist_registration_keys(&signed_prekey, &initial)
+        .unwrap();
+    manager
+        .one_time_prekey_created_at
+        .values_mut()
+        .for_each(|created_at| {
+            *created_at = 0;
+        });
+
+    manager.queue_prekey_replenishment().unwrap();
+    assert_eq!(manager.stored_opks.len(), protocol::consts::PREKEY_TARGET);
+    assert!(!manager.stored_opks.contains_key(&0));
+    assert!(!manager.stored_opks.contains_key(&1));
+    drop(manager);
+
+    let restarted = CryptoManager::load_or_generate(directory.path()).unwrap();
+    assert_eq!(restarted.stored_opks.len(), protocol::consts::PREKEY_TARGET);
+    assert!(!restarted.stored_opks.contains_key(&0));
+    assert!(!restarted.stored_opks.contains_key(&1));
+}
+
+#[test]
+fn legacy_state_uses_disjoint_prekey_id_range() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manager = CryptoManager::load_or_generate(directory.path()).unwrap();
+    let signed_prekey = SignedPreKey::generate(0, manager.identity());
+    let initial = crypto::keys::generate_one_time_prekeys(0, 2).unwrap();
+    manager
+        .persist_registration_keys(&signed_prekey, &initial)
+        .unwrap();
+    drop(manager);
+
+    let connection = rusqlite::Connection::open(directory.path().join("crypto.db")).unwrap();
+    let json: String = connection
+        .query_row("SELECT json FROM core_state WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mut state: serde_json::Value = serde_json::from_str(&json).unwrap();
+    state
+        .as_object_mut()
+        .unwrap()
+        .remove("next_one_time_prekey_id");
+    connection
+        .execute(
+            "UPDATE core_state SET json = ?1 WHERE id = 1",
+            [serde_json::to_string(&state).unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut manager = CryptoManager::load_or_generate(directory.path()).unwrap();
+    let ClientMessage::UploadPreKeys { prekeys, .. } =
+        manager.queue_prekey_replenishment().unwrap()
+    else {
+        panic!("expected pre-key upload");
+    };
+    assert_eq!(prekeys.first().unwrap().key_id, 1 << 31);
+}
+
+#[test]
 fn prekey_replenishment_persistence_failure_restores_ids_and_keys() {
     let directory = tempfile::tempdir().unwrap();
     let mut manager = CryptoManager::load_or_generate(directory.path()).unwrap();

@@ -5,9 +5,9 @@ use super::{decode_prekeys, error_400, error_404, error_429, error_500_generic, 
 use crate::db;
 use crate::state::AppState;
 
-const PREKEY_LOW_THRESHOLD: u32 = 10;
+pub(super) const PREKEY_LOW_THRESHOLD: u32 = 10;
 const FETCH_WINDOW_SECS: u64 = 60 * 60;
-const FETCHES_PER_REQUESTER: u32 = 30;
+const FETCHES_PER_REQUESTER: u32 = 10;
 const FETCHES_PER_TARGET: u32 = 20;
 
 #[allow(clippy::cognitive_complexity)]
@@ -63,7 +63,7 @@ pub(crate) async fn handle_fetch(
                 public_key: B64.encode(public_key),
             })
         }
-        Ok(db::prekeys::FetchResult::Empty) => None,
+        Ok(db::prekeys::FetchResult::Empty | db::prekeys::FetchResult::TargetDepleted) => None,
         Ok(db::prekeys::FetchResult::RateLimited) => {
             return error_429("pre-key fetch rate limit exceeded");
         }
@@ -107,6 +107,9 @@ pub(crate) async fn handle_upload(
     if prekeys.len() > consts::MAX_PREKEYS_PER_UPLOAD {
         return error_400("too many prekeys");
     }
+    if prekeys.is_empty() {
+        return error_400("prekey upload cannot be empty");
+    }
 
     let pairs = match decode_prekeys(&prekeys) {
         Ok(p) => p,
@@ -126,6 +129,9 @@ pub(crate) async fn handle_upload(
             accepted: false,
             remaining,
         },
+        Ok(db::prekeys::UploadResult::InvalidSequence) => {
+            error_400("prekey IDs must increase monotonically")
+        }
         Err(e) => {
             tracing::error!("failed to store prekeys: {e}");
             error_500_generic()
