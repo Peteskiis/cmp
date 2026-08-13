@@ -201,30 +201,27 @@ fn migrate_v8(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
         );
         INSERT INTO message_acceptance_stats (id, item_count) VALUES (1, 0);",
     )?;
-    let queued = {
-        let mut statement = tx.prepare(
-            "SELECT message_id, recipient_id, sender_id, envelope, unixepoch(created_at)
-             FROM message_queue",
-        )?;
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, u64>(4)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
+    let mut select = tx.prepare(
+        "SELECT message_id, recipient_id, sender_id, envelope, unixepoch(created_at)
+         FROM message_queue",
+    )?;
     let mut insert = tx.prepare(
         "INSERT INTO message_acceptances
             (message_id, recipient_id, sender_id, envelope_digest, accepted_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
-    let queued_count = queued.len();
-    for (message_id, recipient_id, sender_id, envelope, accepted_at) in queued {
+    let queued = select.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, u64>(4)?,
+        ))
+    })?;
+    let mut queued_count = 0_i64;
+    for queued_row in queued {
+        let (message_id, recipient_id, sender_id, envelope, accepted_at) = queued_row?;
         let digest = Sha256::digest(envelope.as_bytes());
         insert.execute((
             message_id,
@@ -233,11 +230,15 @@ fn migrate_v8(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
             digest.as_slice(),
             accepted_at,
         ))?;
+        queued_count = queued_count
+            .checked_add(1)
+            .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, i64::MAX))?;
     }
     drop(insert);
+    drop(select);
     tx.execute(
         "UPDATE message_acceptance_stats SET item_count = ?1 WHERE id = 1",
-        [i64::try_from(queued_count).unwrap_or(i64::MAX)],
+        [queued_count],
     )?;
     tx.pragma_update(None, "user_version", CURRENT_VERSION)?;
     tx.commit()
