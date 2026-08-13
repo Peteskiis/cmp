@@ -103,6 +103,11 @@ pub enum ServerMessage {
         message_id: MessageId,
     },
 
+    MessageRejected {
+        message_id: MessageId,
+        reason: String,
+    },
+
     AckSuccess {
         ack_id: MessageId,
         message_ids: Vec<MessageId>,

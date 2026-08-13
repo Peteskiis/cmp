@@ -23,6 +23,17 @@ pub(crate) async fn handle_send(
 
     let msg_id_str = message_id.to_string();
     let recipient_str = recipient_id.as_str();
+    if let Some(response) = validate_prekey_reservation(
+        state,
+        sender_id,
+        recipient_str,
+        &message_id,
+        &envelope.header,
+    )
+    .await
+    {
+        return response;
+    }
 
     let Ok(sender_user_id) = UserId::new(sender_id) else {
         return error_500_generic();
@@ -86,6 +97,35 @@ pub(crate) async fn handle_send(
     }
 
     ServerMessage::MessageSent { message_id }
+}
+
+async fn validate_prekey_reservation(
+    state: &AppState,
+    sender_id: &str,
+    recipient_id: &str,
+    message_id: &MessageId,
+    header: &MessageHeader,
+) -> Option<ServerMessage> {
+    let MessageHeader::PreKey {
+        recipient_one_time_prekey_id: Some(key_id),
+        ..
+    } = header
+    else {
+        return None;
+    };
+    match db::prekeys::reservation_is_valid(&state.db, sender_id, recipient_id, *key_id, now_secs())
+        .await
+    {
+        Ok(true) => None,
+        Ok(false) => Some(ServerMessage::MessageRejected {
+            message_id: message_id.clone(),
+            reason: "one-time pre-key reservation expired".to_owned(),
+        }),
+        Err(error) => {
+            tracing::error!("failed to validate pre-key reservation: {error}");
+            Some(error_500_generic())
+        }
+    }
 }
 
 /// Delete acknowledged messages — scoped to the authenticated user's own queue.

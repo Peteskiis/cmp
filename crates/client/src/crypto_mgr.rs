@@ -77,6 +77,8 @@ struct StoredX3dhResult {
 struct PeerSession {
     ratchet: SessionState,
     prekey_header: Option<StoredX3dhResult>,
+    #[serde(default)]
+    prekey_expires_at: Option<u64>,
 }
 
 pub(crate) enum InboundDecrypt {
@@ -267,6 +269,9 @@ impl CryptoManager {
             PeerSession {
                 ratchet: session,
                 prekey_header: Some(x3dh_data),
+                prekey_expires_at: Some(
+                    now_secs().saturating_add(protocol::consts::ONE_TIME_PREKEY_RESERVATION_SECS),
+                ),
             },
         );
         if let Err(error) = self.persist_state() {
@@ -461,6 +466,7 @@ impl CryptoManager {
             message_number: header.message_number,
         };
         let header = if let Some(x3dh_data) = session.prekey_header.take() {
+            session.prekey_expires_at = None;
             MessageHeader::PreKey {
                 sender_identity_key: B64.encode(self.identity.verifying_key().as_bytes()),
                 sender_ephemeral_key: B64.encode(x3dh_data.ephemeral_public),
@@ -549,6 +555,7 @@ impl CryptoManager {
                 PeerSession {
                     ratchet: session,
                     prekey_header: None,
+                    prekey_expires_at: None,
                 },
             );
             let consumed_opk = recipient_one_time_prekey_id

@@ -48,6 +48,15 @@ fn alice_encrypt_bob_decrypt_prekey() {
 }
 
 #[test]
+fn unused_prekey_session_expires_before_first_encryption() {
+    let (mut alice, _bob, _alice_dir, _bob_dir) = setup_alice_and_bob();
+    alice.sessions.get_mut("bob").unwrap().prekey_expires_at = Some(0);
+
+    assert!(alice.expire_stale_prekey_session("bob").unwrap());
+    assert!(!alice.has_session("bob"));
+}
+
+#[test]
 fn forged_prekey_no_orphan_session_no_opk_consumed() {
     let (_alice, mut bob, _a_dir, _b_dir) = setup_alice_and_bob();
     let opk_count_before = bob.stored_opks.len();

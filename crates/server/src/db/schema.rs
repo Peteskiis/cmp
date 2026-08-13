@@ -1,6 +1,6 @@
 use tokio_rusqlite::Connection;
 
-const CURRENT_VERSION: u32 = 6;
+const CURRENT_VERSION: u32 = 7;
 
 /// Initialize the database schema, pragmas, and migrations.
 pub async fn initialize(conn: &Connection) -> anyhow::Result<()> {
@@ -77,6 +77,9 @@ pub async fn initialize(conn: &Connection) -> anyhow::Result<()> {
 
         if version < 6 {
             migrate_v6(conn)?;
+        }
+        if version < 7 {
+            migrate_v7(conn)?;
         }
 
         Ok(())
@@ -155,6 +158,23 @@ fn migrate_v6(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
         "UPDATE prekey_inventory SET high_water = MAX(high_water, ?1)",
         [LEGACY_HIGH_WATER],
     )?;
+    tx.pragma_update(None, "user_version", 6)?;
+    tx.commit()
+}
+
+fn migrate_v7(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE prekey_reservations (
+            requester_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            key_id INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (requester_id, target_id, key_id)
+        );
+        CREATE INDEX idx_prekey_reservation_expiry
+            ON prekey_reservations(expires_at);",
+    )?;
     tx.pragma_update(None, "user_version", CURRENT_VERSION)?;
     tx.commit()
 }
@@ -171,6 +191,7 @@ mod tests {
             conn.execute_batch(
                 "DROP TABLE prekey_fetch_events;
                  DROP TABLE prekey_inventory;
+                 DROP TABLE prekey_reservations;
                  ALTER TABLE prekeys DROP COLUMN created_at;",
             )?;
             conn.pragma_update(None, "user_version", 2)?;

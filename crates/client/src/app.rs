@@ -11,6 +11,8 @@ use crate::crypto_mgr::{CryptoManager, InboundDecrypt};
 
 #[path = "app_inbound.rs"]
 mod inbound;
+#[path = "app_prekeys.rs"]
+mod prekeys;
 use crate::status_bar::{ConnectionStatus, StatusBar};
 use crate::{net, ui};
 use inbound::{
@@ -337,7 +339,7 @@ pub(crate) fn handle_enter(
         return handle_command(app, outgoing_tx, &text);
     }
 
-    let Some(ref target) = app.target_user else {
+    let Some(target) = app.target_user.clone() else {
         app.status("use /chat <username> first");
         app.clear_input();
         return Ok(());
@@ -369,6 +371,9 @@ pub(crate) fn handle_enter(
         app.status("waiting for server connection...");
         return Ok(());
     }
+    if prekeys::refresh_expired_session(app, outgoing_tx, &target) {
+        return Ok(());
+    }
 
     // Check plaintext size BEFORE encrypting to avoid ratchet desync
     let estimated_b64_len = (text.len() + 18) / 3 * 4;
@@ -381,7 +386,7 @@ pub(crate) fn handle_enter(
     let msg_id = MessageId::new();
     let outbound = match app
         .crypto
-        .encrypt_message(target_str, target, &msg_id, text.as_bytes())
+        .encrypt_message(target_str, &target, &msg_id, text.as_bytes())
     {
         Ok(message) => message,
         Err(e) => {
@@ -674,6 +679,12 @@ fn handle_server_message(
             if let Err(error) = app.crypto.confirm_message_sent(&message_id) {
                 tracing::warn!("failed to confirm durable outbound message: {error}");
             }
+        }
+        ServerMessage::MessageRejected { message_id, reason } => {
+            if let Err(error) = app.crypto.confirm_message_sent(&message_id) {
+                tracing::warn!("failed to retire rejected outbound message: {error}");
+            }
+            app.status(&format!("message rejected: {reason}"));
         }
         ServerMessage::AckSuccess {
             ack_id,

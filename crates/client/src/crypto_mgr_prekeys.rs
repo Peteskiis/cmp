@@ -5,6 +5,29 @@ use protocol::{ClientMessage, MessageId};
 use super::{B64, CryptoError, CryptoManager, PendingOutbound, ensure_capacity};
 
 impl CryptoManager {
+    pub(crate) fn expire_stale_prekey_session(
+        &mut self,
+        peer_id: &str,
+    ) -> Result<bool, CryptoError> {
+        let stale = self.sessions.get(peer_id).is_some_and(|session| {
+            session.prekey_header.is_some()
+                && session
+                    .prekey_expires_at
+                    .is_some_and(|expires_at| expires_at < crate::crypto_replay::now_secs())
+        });
+        if !stale {
+            return Ok(false);
+        }
+        let previous = self.sessions.remove(peer_id);
+        if let Err(error) = self.persist_state() {
+            if let Some(session) = previous {
+                self.sessions.insert(peer_id.to_owned(), session);
+            }
+            return Err(CryptoError::Persistence(error));
+        }
+        Ok(true)
+    }
+
     pub(super) fn take_one_time_prekey(
         &mut self,
         key_id: u32,

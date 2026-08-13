@@ -138,11 +138,44 @@ pub async fn fetch_for_requester(
                  VALUES (?1, ?2, ?3)",
                 (&requester_id, &target_id, now),
             )?;
+            if let Some((key_id, _)) = &prekey {
+                let expires_at =
+                    now.saturating_add(protocol::consts::ONE_TIME_PREKEY_RESERVATION_SECS);
+                tx.execute(
+                    "INSERT INTO prekey_reservations
+                        (requester_id, target_id, key_id, expires_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    (&requester_id, &target_id, key_id, expires_at),
+                )?;
+            }
         }
         tx.commit()?;
         Ok(prekey.map_or(FetchResult::Empty, |(key_id, public_key)| {
             FetchResult::Fetched { key_id, public_key }
         }))
+    })
+    .await
+    .map_err(Into::into)
+}
+
+pub async fn reservation_is_valid(
+    conn: &Connection,
+    requester_id: &str,
+    target_id: &str,
+    key_id: u32,
+    now: u64,
+) -> anyhow::Result<bool> {
+    let requester_id = requester_id.to_owned();
+    let target_id = target_id.to_owned();
+    conn.call(move |conn| {
+        let valid: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM prekey_reservations
+             WHERE requester_id = ?1 AND target_id = ?2 AND key_id = ?3
+             AND expires_at >= ?4)",
+            (&requester_id, &target_id, key_id, now),
+            |row| row.get(0),
+        )?;
+        Ok(valid)
     })
     .await
     .map_err(Into::into)
@@ -396,5 +429,44 @@ mod tests {
         }
         assert_eq!(key_ids.len(), 10);
         assert_eq!(count_prekeys(&conn, "target").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn reservation_is_bound_to_requester_target_key_and_expiry() {
+        let conn = test_db().await;
+        add_user(&conn, "target").await;
+        upload_prekeys(&conn, "target", &[(0, vec![0_u8; 32])], 10)
+            .await
+            .unwrap();
+        let limits = FetchLimits {
+            window_secs: 3_600,
+            per_requester: 10,
+            per_target: 10,
+        };
+        let fetched = fetch_for_requester(&conn, "alice", "target", 100, limits)
+            .await
+            .unwrap();
+        assert!(matches!(fetched, FetchResult::Fetched { key_id: 0, .. }));
+        assert!(
+            reservation_is_valid(&conn, "alice", "target", 0, 100)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !reservation_is_valid(&conn, "bob", "target", 0, 100)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !reservation_is_valid(
+                &conn,
+                "alice",
+                "target",
+                0,
+                100 + protocol::consts::ONE_TIME_PREKEY_RESERVATION_SECS + 1,
+            )
+            .await
+            .unwrap()
+        );
     }
 }
