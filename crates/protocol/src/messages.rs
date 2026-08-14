@@ -145,6 +145,7 @@ pub enum ServerMessage {
     SignedPreKeyRotated {
         rotation_id: MessageId,
         accepted: bool,
+        current_key_id: u32,
     },
 
     Error {
@@ -428,6 +429,7 @@ mod tests {
         roundtrip_server(&ServerMessage::SignedPreKeyRotated {
             rotation_id: MessageId::new(),
             accepted: true,
+            current_key_id: 2,
         });
     }
 

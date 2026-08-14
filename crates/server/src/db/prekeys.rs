@@ -84,9 +84,9 @@ pub enum UploadResult {
 
 #[non_exhaustive]
 pub enum SignedPreKeyRotationResult {
-    Accepted,
-    InvalidSequence,
-    Conflict,
+    Accepted { current_key_id: u32 },
+    InvalidSequence { current_key_id: u32 },
+    Conflict { current_key_id: u32 },
 }
 
 pub async fn rotate_signed_prekey(
@@ -101,6 +101,12 @@ pub async fn rotate_signed_prekey(
     let signature = signature.to_vec();
     conn.call(move |conn| {
         let tx = conn.transaction()?;
+        let current_id: u32 = tx.query_row(
+            "SELECT key_id FROM signed_prekeys WHERE user_id = ?1
+             ORDER BY key_id DESC LIMIT 1",
+            [&user_id],
+            |row| row.get(0),
+        )?;
         let existing = tx
             .query_row(
                 "SELECT public_key, signature FROM signed_prekeys
@@ -113,21 +119,21 @@ pub async fn rotate_signed_prekey(
             tx.rollback()?;
             return Ok(
                 if existing_key == public_key && existing_signature == signature {
-                    SignedPreKeyRotationResult::Accepted
+                    SignedPreKeyRotationResult::Accepted {
+                        current_key_id: current_id,
+                    }
                 } else {
-                    SignedPreKeyRotationResult::Conflict
+                    SignedPreKeyRotationResult::Conflict {
+                        current_key_id: current_id,
+                    }
                 },
             );
         }
-        let current_id: u32 = tx.query_row(
-            "SELECT key_id FROM signed_prekeys WHERE user_id = ?1
-             ORDER BY key_id DESC LIMIT 1",
-            [&user_id],
-            |row| row.get(0),
-        )?;
         if current_id.checked_add(1) != Some(key_id) {
             tx.rollback()?;
-            return Ok(SignedPreKeyRotationResult::InvalidSequence);
+            return Ok(SignedPreKeyRotationResult::InvalidSequence {
+                current_key_id: current_id,
+            });
         }
         tx.execute(
             "INSERT INTO signed_prekeys (user_id, key_id, public_key, signature)
@@ -142,7 +148,9 @@ pub async fn rotate_signed_prekey(
             [&user_id],
         )?;
         tx.commit()?;
-        Ok(SignedPreKeyRotationResult::Accepted)
+        Ok(SignedPreKeyRotationResult::Accepted {
+            current_key_id: key_id,
+        })
     })
     .await
     .map_err(Into::into)
@@ -346,13 +354,13 @@ mod tests {
                 rotate_signed_prekey(&conn, "alice", key_id, &public_key, &signature)
                     .await
                     .unwrap(),
-                SignedPreKeyRotationResult::Accepted
+                SignedPreKeyRotationResult::Accepted { .. }
             ));
             assert!(matches!(
                 rotate_signed_prekey(&conn, "alice", key_id, &public_key, &signature)
                     .await
                     .unwrap(),
-                SignedPreKeyRotationResult::Accepted
+                SignedPreKeyRotationResult::Accepted { .. }
             ));
         }
 

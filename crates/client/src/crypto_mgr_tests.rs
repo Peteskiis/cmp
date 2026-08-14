@@ -30,6 +30,21 @@ fn setup_alice_and_bob() -> (CryptoManager, CryptoManager, TempDir, TempDir) {
     (alice, bob, alice_dir, bob_dir)
 }
 
+fn queued_signed_prekey_rotation(manager: &CryptoManager) -> (MessageId, u32) {
+    manager
+        .pending_messages()
+        .into_iter()
+        .find_map(|message| match message {
+            ClientMessage::RotateSignedPreKey {
+                rotation_id,
+                key_id,
+                ..
+            } => Some((rotation_id, key_id)),
+            _ => None,
+        })
+        .expect("signed prekey rotation queued")
+}
+
 #[test]
 fn alice_encrypt_bob_decrypt_prekey() {
     let (mut alice, mut bob, _a_dir, _b_dir) = setup_alice_and_bob();
@@ -62,45 +77,29 @@ fn signed_prekey_rotation_is_durable_and_bounded() {
     let (_alice, mut bob, _alice_dir, bob_dir) = setup_alice_and_bob();
     bob.signed_prekey_rotated_at = 0;
 
-    let rotation = bob.queue_signed_prekey_rotation().unwrap().unwrap();
-    let rotation_id = match rotation {
-        ClientMessage::RotateSignedPreKey {
-            rotation_id,
-            key_id,
-            ..
-        } => {
-            assert_eq!(key_id, 1);
-            rotation_id
-        }
-        _ => panic!("expected signed prekey rotation"),
-    };
+    bob.queue_signed_prekey_rotation().unwrap();
+    let (rotation_id, key_id) = queued_signed_prekey_rotation(&bob);
+    assert_eq!(key_id, 1);
     drop(bob);
 
     let mut bob = CryptoManager::load_or_generate(bob_dir.path()).unwrap();
     assert_eq!(bob.stored_spk.as_ref().unwrap().key_id(), 1);
     assert_eq!(bob.previous_spks[0].key_id(), 0);
     assert!(
-        bob.confirm_signed_prekey_rotated(&rotation_id, true)
+        bob.confirm_signed_prekey_rotated(&rotation_id, true, 1)
             .unwrap()
+            .is_none()
     );
 
     for expected_id in 2..=5 {
         bob.signed_prekey_rotated_at = 0;
-        let rotation = bob.queue_signed_prekey_rotation().unwrap().unwrap();
-        let rotation_id = match rotation {
-            ClientMessage::RotateSignedPreKey {
-                rotation_id,
-                key_id,
-                ..
-            } => {
-                assert_eq!(key_id, expected_id);
-                rotation_id
-            }
-            _ => panic!("expected signed prekey rotation"),
-        };
+        bob.queue_signed_prekey_rotation().unwrap();
+        let (rotation_id, key_id) = queued_signed_prekey_rotation(&bob);
+        assert_eq!(key_id, expected_id);
         assert!(
-            bob.confirm_signed_prekey_rotated(&rotation_id, true)
+            bob.confirm_signed_prekey_rotated(&rotation_id, true, expected_id)
                 .unwrap()
+                .is_none()
         );
     }
     assert_eq!(bob.stored_spk.as_ref().unwrap().key_id(), 5);
@@ -117,13 +116,74 @@ fn signed_prekey_rotation_is_durable_and_bounded() {
 fn first_message_decrypts_with_previous_signed_prekey() {
     let (mut alice, mut bob, _alice_dir, _bob_dir) = setup_alice_and_bob();
     bob.signed_prekey_rotated_at = 0;
-    bob.queue_signed_prekey_rotation().unwrap().unwrap();
+    bob.queue_signed_prekey_rotation().unwrap();
 
     let envelope = alice.encrypt("bob", b"delayed first message").unwrap();
     assert_eq!(
         bob.decrypt("alice", &envelope).unwrap(),
         b"delayed first message"
     );
+}
+
+#[test]
+fn rejected_signed_prekey_rotation_reconciles_and_survives_restart() {
+    let (_alice, mut bob, _alice_dir, bob_dir) = setup_alice_and_bob();
+    bob.signed_prekey_rotated_at = 0;
+    bob.queue_signed_prekey_rotation().unwrap();
+    let (rejected_id, rejected_key_id) = queued_signed_prekey_rotation(&bob);
+    assert_eq!(rejected_key_id, 1);
+
+    let replacement = bob
+        .confirm_signed_prekey_rotated(&rejected_id, false, 5)
+        .unwrap()
+        .expect("replacement rotation");
+    assert!(matches!(
+        replacement,
+        ClientMessage::RotateSignedPreKey { key_id: 6, .. }
+    ));
+    drop(bob);
+
+    let mut bob = CryptoManager::load_or_generate(bob_dir.path()).unwrap();
+    let (replacement_id, replacement_key_id) = queued_signed_prekey_rotation(&bob);
+    assert_eq!(replacement_key_id, 6);
+    assert_ne!(replacement_id, rejected_id);
+    assert_eq!(bob.stored_spk.as_ref().unwrap().key_id(), 6);
+    assert!(
+        bob.confirm_signed_prekey_rotated(&replacement_id, true, 6)
+            .unwrap()
+            .is_none()
+    );
+    assert!(bob.pending_messages().is_empty());
+}
+
+#[test]
+fn rejected_signed_prekey_reconciliation_is_atomic_on_failure() {
+    let (_alice, mut bob, _alice_dir, bob_dir) = setup_alice_and_bob();
+    bob.signed_prekey_rotated_at = 0;
+    bob.queue_signed_prekey_rotation().unwrap();
+    let (rejected_id, rejected_key_id) = queued_signed_prekey_rotation(&bob);
+    assert_eq!(rejected_key_id, 1);
+    bob.store.inject_replace_outbound_failure();
+
+    assert!(
+        bob.confirm_signed_prekey_rotated(&rejected_id, false, 5)
+            .is_err()
+    );
+    assert_eq!(bob.stored_spk.as_ref().unwrap().key_id(), 1);
+    assert_eq!(queued_signed_prekey_rotation(&bob).0, rejected_id);
+    drop(bob);
+
+    let mut bob = CryptoManager::load_or_generate(bob_dir.path()).unwrap();
+    assert_eq!(bob.stored_spk.as_ref().unwrap().key_id(), 1);
+    assert_eq!(queued_signed_prekey_rotation(&bob).0, rejected_id);
+    let replacement = bob
+        .confirm_signed_prekey_rotated(&rejected_id, false, 5)
+        .unwrap()
+        .expect("replacement rotation");
+    assert!(matches!(
+        replacement,
+        ClientMessage::RotateSignedPreKey { key_id: 6, .. }
+    ));
 }
 
 #[test]

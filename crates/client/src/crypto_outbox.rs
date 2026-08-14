@@ -33,6 +33,7 @@ pub(super) enum PendingOutbound {
         key_id: u32,
         public_key: String,
         signature: String,
+        previous_rotated_at: u64,
     },
 }
 
@@ -81,6 +82,7 @@ impl PendingOutbound {
                 key_id,
                 public_key,
                 signature,
+                ..
             } => ClientMessage::RotateSignedPreKey {
                 rotation_id: rotation_id.clone(),
                 key_id: *key_id,

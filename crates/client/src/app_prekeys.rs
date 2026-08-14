@@ -64,15 +64,21 @@ fn prekey_upload_status(accepted: bool, remaining: u32) -> String {
 
 pub(super) fn handle_signed_prekey_rotated(
     app: &mut App,
+    outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
     rotation_id: &protocol::MessageId,
     accepted: bool,
+    current_key_id: u32,
 ) {
     match app
         .crypto
-        .confirm_signed_prekey_rotated(rotation_id, accepted)
+        .confirm_signed_prekey_rotated(rotation_id, accepted, current_key_id)
     {
-        Ok(true) => app.status("signed pre-key rotated"),
-        Ok(false) => app.status("signed pre-key rotation rejected"),
+        Ok(Some(replacement)) => {
+            let _ = outgoing_tx.send(replacement);
+            app.status("signed pre-key rotation reconciled; retrying");
+        }
+        Ok(None) if accepted => app.status("signed pre-key rotated"),
+        Ok(None) => app.status("signed pre-key rotation rejected"),
         Err(error) => tracing::warn!("failed to confirm signed prekey rotation: {error}"),
     }
 }

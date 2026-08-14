@@ -23,7 +23,7 @@ const LEGACY_PREKEY_ID_FLOOR: u32 = 1 << 31;
 
 #[path = "crypto_mgr_persistence.rs"]
 mod persistence;
-use persistence::{decode_stored_opks, decode_stored_spk, restore_entry};
+use persistence::{decode_stored_opks, decode_stored_spks, restore_entry};
 
 #[path = "crypto_mgr_prekeys.rs"]
 mod prekeys;
@@ -99,6 +99,8 @@ struct CoreState {
     previous_signed_prekeys: Vec<StoredSpk>,
     #[serde(default)]
     signed_prekey_rotated_at: u64,
+    #[serde(default)]
+    next_signed_prekey_id: Option<u32>,
     one_time_prekeys: Vec<StoredOpk>,
     sessions: HashMap<String, PeerSession>,
     #[serde(default)]
@@ -114,6 +116,7 @@ pub(crate) struct CryptoManager {
     stored_spk: Option<SignedPreKey>,
     previous_spks: Vec<SignedPreKey>,
     signed_prekey_rotated_at: u64,
+    next_signed_prekey_id: u32,
     stored_opks: HashMap<u32, OneTimePreKey>,
     next_one_time_prekey_id: u32,
     one_time_prekey_created_at: HashMap<u32, u64>,
@@ -159,15 +162,8 @@ impl CryptoManager {
                 },
             );
         }
-        let stored_spk = decode_stored_spk(persisted.signed_prekey)?;
-        let previous_spks = persisted
-            .previous_signed_prekeys
-            .into_iter()
-            .map(|stored| {
-                decode_stored_spk(Some(stored))?
-                    .ok_or_else(|| anyhow::anyhow!("corrupt previous signed prekey"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let (stored_spk, previous_spks, derived_next_signed_prekey_id) =
+            decode_stored_spks(persisted.signed_prekey, persisted.previous_signed_prekeys)?;
         let stored_opks = decode_stored_opks(persisted.one_time_prekeys);
         let mut one_time_prekey_created_at = persisted.one_time_prekey_created_at;
         let loaded_at = now_secs();
@@ -199,6 +195,10 @@ impl CryptoManager {
             stored_spk,
             previous_spks,
             signed_prekey_rotated_at: persisted.signed_prekey_rotated_at,
+            next_signed_prekey_id: persisted
+                .next_signed_prekey_id
+                .unwrap_or_default()
+                .max(derived_next_signed_prekey_id),
             stored_opks,
             next_one_time_prekey_id,
             one_time_prekey_created_at,

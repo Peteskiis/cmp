@@ -249,6 +249,7 @@ async fn signed_prekey_rotation_is_authenticated_idempotent_and_published() {
             ServerMessage::SignedPreKeyRotated {
                 rotation_id: response_id,
                 accepted: true,
+                current_key_id: 1,
             } if response_id == rotation_id
         ));
     }
