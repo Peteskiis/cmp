@@ -238,7 +238,14 @@ pub(crate) async fn deliver_queued_messages(
 
         let message = match queued_row_to_inbound(&row) {
             Ok(message) => message,
-            Err(error) => {
+            Err(QueuedEnvelopeError::UnsupportedVersion(version)) => {
+                warn!(
+                    message_id = row.message_id,
+                    version, "preserving queued message with unsupported protocol version"
+                );
+                return;
+            }
+            Err(QueuedEnvelopeError::Invalid(error)) => {
                 warn!(
                     message_id = row.message_id,
                     "invalid queued message: {error}"
@@ -283,6 +290,7 @@ pub(crate) async fn deliver_queued_messages(
     }
 }
 
+#[allow(clippy::cognitive_complexity)]
 pub(crate) async fn deliver_queued_receipts(
     state: &AppState,
     tx: &mpsc::Sender<ServerMessage>,
@@ -292,8 +300,23 @@ pub(crate) async fn deliver_queued_receipts(
         .await
         .unwrap_or_default();
     for receipt in receipts {
-        let Some(message) = queued_receipt_to_message(&receipt) else {
+        let action = queued_receipt_action(&receipt);
+        if let QueuedReceiptAction::Preserve(version) = &action {
+            warn!(
+                receipt_id = receipt.receipt_id,
+                version, "preserving queued receipt with unsupported protocol version"
+            );
+            continue;
+        }
+        if let QueuedReceiptAction::DeleteInvalid(error) = &action {
+            warn!(
+                receipt_id = receipt.receipt_id,
+                "invalid queued receipt: {error}"
+            );
             remove_invalid_receipt(state, user_id, &receipt.receipt_id).await;
+            continue;
+        }
+        let QueuedReceiptAction::Deliver(message) = action else {
             continue;
         };
         if tx.send(message).await.is_err() {
@@ -301,6 +324,22 @@ pub(crate) async fn deliver_queued_receipts(
         }
     }
     deliver_receipt_confirmations(state, tx, user_id).await;
+}
+
+enum QueuedReceiptAction {
+    Deliver(ServerMessage),
+    Preserve(u32),
+    DeleteInvalid(anyhow::Error),
+}
+
+fn queued_receipt_action(receipt: &db::receipts::QueuedReceipt) -> QueuedReceiptAction {
+    match queued_receipt_to_message(receipt) {
+        Ok(message) => QueuedReceiptAction::Deliver(message),
+        Err(QueuedEnvelopeError::UnsupportedVersion(version)) => {
+            QueuedReceiptAction::Preserve(version)
+        }
+        Err(QueuedEnvelopeError::Invalid(error)) => QueuedReceiptAction::DeleteInvalid(error),
+    }
 }
 
 #[allow(clippy::cognitive_complexity)]
@@ -406,12 +445,17 @@ async fn load_queued_receipts(
     }
 }
 
-fn queued_receipt_to_message(receipt: &db::receipts::QueuedReceipt) -> Option<ServerMessage> {
-    let receipt_id = uuid::Uuid::parse_str(&receipt.receipt_id).ok()?;
-    let sender_id = protocol::UserId::new(&receipt.sender_id).ok()?;
-    let envelope = serde_json::from_str(&receipt.envelope).ok()?;
-    super::message::validate_envelope(&envelope).ok()?;
-    Some(ServerMessage::IncomingReadReceipt {
+fn queued_receipt_to_message(
+    receipt: &db::receipts::QueuedReceipt,
+) -> Result<ServerMessage, QueuedEnvelopeError> {
+    let receipt_id = uuid::Uuid::parse_str(&receipt.receipt_id)
+        .map_err(|error| QueuedEnvelopeError::Invalid(error.into()))?;
+    let sender_id = protocol::UserId::new(&receipt.sender_id)
+        .map_err(|error| QueuedEnvelopeError::Invalid(error.into()))?;
+    let envelope = serde_json::from_str(&receipt.envelope)
+        .map_err(|error| QueuedEnvelopeError::Invalid(error.into()))?;
+    validate_queued_envelope(&envelope)?;
+    Ok(ServerMessage::IncomingReadReceipt {
         sender_id,
         receipt_id: receipt_id.into(),
         envelope,
@@ -467,11 +511,32 @@ async fn send_queued_page(
     true
 }
 
-fn queued_row_to_inbound(row: &db::queue::QueuedRow) -> anyhow::Result<protocol::InboundMessage> {
-    let envelope = serde_json::from_str(&row.envelope_json)?;
-    super::message::validate_envelope(&envelope).map_err(anyhow::Error::msg)?;
-    let sender_id = protocol::UserId::new(&row.sender_id)?;
-    let message_id = protocol::MessageId::from(uuid::Uuid::parse_str(&row.message_id)?);
+enum QueuedEnvelopeError {
+    UnsupportedVersion(u32),
+    Invalid(anyhow::Error),
+}
+
+fn validate_queued_envelope(
+    envelope: &protocol::EncryptedEnvelope,
+) -> Result<(), QueuedEnvelopeError> {
+    if envelope.version != protocol::consts::PROTOCOL_VERSION {
+        return Err(QueuedEnvelopeError::UnsupportedVersion(envelope.version));
+    }
+    super::message::validate_envelope(envelope)
+        .map_err(|error| QueuedEnvelopeError::Invalid(anyhow::Error::msg(error)))
+}
+
+fn queued_row_to_inbound(
+    row: &db::queue::QueuedRow,
+) -> Result<protocol::InboundMessage, QueuedEnvelopeError> {
+    let envelope = serde_json::from_str(&row.envelope_json)
+        .map_err(|error| QueuedEnvelopeError::Invalid(error.into()))?;
+    validate_queued_envelope(&envelope)?;
+    let sender_id = protocol::UserId::new(&row.sender_id)
+        .map_err(|error| QueuedEnvelopeError::Invalid(error.into()))?;
+    let message_id = uuid::Uuid::parse_str(&row.message_id)
+        .map(protocol::MessageId::from)
+        .map_err(|error| QueuedEnvelopeError::Invalid(error.into()))?;
     Ok(protocol::InboundMessage {
         message_id,
         sender_id,
@@ -554,5 +619,37 @@ mod tests {
         };
 
         assert!(queued_row_to_inbound(&row).is_err());
+    }
+
+    #[test]
+    fn unsupported_queued_envelope_is_distinct_from_invalid_data() {
+        let envelope = protocol::EncryptedEnvelope {
+            version: protocol::consts::PROTOCOL_VERSION - 1,
+            header: protocol::types::MessageHeader::Ratchet(protocol::types::RatchetHeader {
+                ratchet_key: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    [0_u8; 32],
+                ),
+                previous_chain_length: 0,
+                message_number: 0,
+            }),
+            ciphertext: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                b"opaque",
+            ),
+        };
+        let row = db::queue::QueuedRow {
+            row_id: 1,
+            message_id: uuid::Uuid::new_v4().to_string(),
+            sender_id: "alice".to_owned(),
+            envelope_json: serde_json::to_string(&envelope).unwrap(),
+            created_at: "2026-08-12 00:00:00".to_owned(),
+        };
+
+        assert!(matches!(
+            queued_row_to_inbound(&row),
+            Err(QueuedEnvelopeError::UnsupportedVersion(version))
+                if version == protocol::consts::PROTOCOL_VERSION - 1
+        ));
     }
 }

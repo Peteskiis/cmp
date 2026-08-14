@@ -156,6 +156,7 @@ impl CryptoManager {
         let store = crypto_store::CryptoStore::open(&data_dir.join("crypto.db"))?;
         let persisted: CoreState = store.load_core()?;
         let pending_outbound = store.load_outbox()?;
+        validate_pending_protocol_versions(&pending_outbound)?;
         let mut processed_messages: HashMap<String, HashMap<String, ProcessedMessage>> =
             HashMap::new();
         for row in store.load_processed()? {
@@ -609,6 +610,25 @@ impl CryptoManager {
         }
         Ok(pending.to_client_message())
     }
+}
+
+fn validate_pending_protocol_versions(pending: &[PendingOutbound]) -> anyhow::Result<()> {
+    let unsupported = pending.iter().find_map(|item| match item {
+        PendingOutbound::Message { envelope, .. }
+        | PendingOutbound::ReadReceipt { envelope, .. }
+            if envelope.version != consts::PROTOCOL_VERSION =>
+        {
+            Some(envelope.version)
+        }
+        _ => None,
+    });
+    if let Some(version) = unsupported {
+        anyhow::bail!(
+            "pending ciphertext uses protocol version {version}; reset or drain it before using protocol version {}",
+            consts::PROTOCOL_VERSION
+        );
+    }
+    Ok(())
 }
 #[cfg(test)]
 #[path = "crypto_mgr_signed_prekey_tests.rs"]

@@ -50,6 +50,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn canonical_context_encoding_is_stable() {
+        let mut ratchet_expected = b"CMP_ENVELOPE_AAD".to_vec();
+        ratchet_expected.extend_from_slice(&2_u32.to_be_bytes());
+        ratchet_expected.push(2);
+        assert_eq!(ratchet(2), ratchet_expected);
+
+        let mut prekey_expected = b"CMP_ENVELOPE_AAD".to_vec();
+        prekey_expected.extend_from_slice(&2_u32.to_be_bytes());
+        prekey_expected.push(1);
+        prekey_expected.extend_from_slice(&[1; 32]);
+        prekey_expected.extend_from_slice(&[2; 32]);
+        prekey_expected.extend_from_slice(&0x0102_0304_u32.to_be_bytes());
+        prekey_expected.push(1);
+        prekey_expected.extend_from_slice(&0x0506_0708_u32.to_be_bytes());
+        assert_eq!(
+            prekey(2, &[1; 32], &[2; 32], 0x0102_0304, Some(0x0506_0708)),
+            prekey_expected
+        );
+
+        let none_offset = prekey_expected.len() - 5;
+        prekey_expected[none_offset..].copy_from_slice(&[0; 5]);
+        assert_eq!(
+            prekey(2, &[1; 32], &[2; 32], 0x0102_0304, None),
+            prekey_expected
+        );
+    }
+
+    #[test]
     fn every_semantic_field_changes_prekey_context() {
         let baseline = prekey(1, &[1; 32], &[2; 32], 3, Some(4));
         assert_ne!(baseline, prekey(2, &[1; 32], &[2; 32], 3, Some(4)));

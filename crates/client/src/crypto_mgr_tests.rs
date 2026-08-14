@@ -598,6 +598,36 @@ fn corrupt_persisted_state_is_not_silently_discarded() {
 }
 
 #[test]
+fn pending_ciphertext_from_an_unsupported_protocol_fails_load() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = CryptoManager::load_or_generate(directory.path()).unwrap();
+    let pending = PendingOutbound::Message {
+        recipient_id: UserId::new("bob").unwrap(),
+        message_id: MessageId::new(),
+        envelope: EncryptedEnvelope {
+            version: protocol::consts::PROTOCOL_VERSION - 1,
+            header: MessageHeader::Ratchet(ProtoRatchetHeader {
+                ratchet_key: B64.encode([0_u8; 32]),
+                previous_chain_length: 0,
+                message_number: 0,
+            }),
+            ciphertext: B64.encode(b"old ciphertext"),
+        },
+    };
+    manager.persist_outbound(&pending).unwrap();
+    drop(manager);
+
+    let Err(error) = CryptoManager::load_or_generate(directory.path()) else {
+        panic!("unsupported pending ciphertext should fail load");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("pending ciphertext uses protocol version")
+    );
+}
+
+#[test]
 fn prekey_replenishment_is_durable_correlated_and_monotonic() {
     let directory = tempfile::tempdir().unwrap();
     let mut manager = CryptoManager::load_or_generate(directory.path()).unwrap();
