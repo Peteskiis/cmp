@@ -1,3 +1,4 @@
+pub mod aad;
 pub mod consts;
 pub mod messages;
 pub mod types;

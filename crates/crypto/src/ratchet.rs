@@ -34,6 +34,14 @@ impl RatchetHeader {
     }
 }
 
+fn authenticated_data(envelope_aad: &[u8], header: &RatchetHeader) -> Vec<u8> {
+    let ratchet_aad = header.to_aad();
+    let mut aad = Vec::with_capacity(envelope_aad.len() + ratchet_aad.len());
+    aad.extend_from_slice(envelope_aad);
+    aad.extend_from_slice(&ratchet_aad);
+    aad
+}
+
 /// Encrypted message output from the ratchet.
 pub struct RatchetMessage {
     pub header: RatchetHeader,
@@ -127,7 +135,11 @@ pub fn initialize_bob(shared_secret: [u8; 32], bob_ratchet: RatchetKeyPair) -> S
 ///
 /// Returns an error if the sending chain is not initialized or the message
 /// counter has been exhausted (`u32::MAX` messages in a single chain).
-pub fn encrypt(state: &mut SessionState, plaintext: &[u8]) -> Result<RatchetMessage, CryptoError> {
+pub fn encrypt(
+    state: &mut SessionState,
+    plaintext: &[u8],
+    envelope_aad: &[u8],
+) -> Result<RatchetMessage, CryptoError> {
     // Pre-compute new count before any state mutation — fail fast on exhaustion
     let new_send_count = state
         .send_count
@@ -146,7 +158,7 @@ pub fn encrypt(state: &mut SessionState, plaintext: &[u8]) -> Result<RatchetMess
         message_number: state.send_count,
     };
 
-    let aad = header.to_aad();
+    let aad = authenticated_data(envelope_aad, &header);
     let ciphertext = crate::aead::encrypt(&ck_out.message_key, plaintext, &aad)?;
 
     // Commit state only after all fallible operations succeed
@@ -170,11 +182,12 @@ pub fn decrypt(
     state: &mut SessionState,
     header: &RatchetHeader,
     ciphertext: &[u8],
+    envelope_aad: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
     // Check if this is a skipped message (already authenticated in a prior step)
     let skip_key = (header.ratchet_key, header.message_number);
     if let Some(mut message_key) = state.skipped.remove(&skip_key) {
-        let aad = header.to_aad();
+        let aad = authenticated_data(envelope_aad, header);
         let result = crate::aead::decrypt(&message_key, ciphertext, &aad);
         if result.is_err() {
             // Re-insert the key since decryption failed — don't consume it
@@ -188,7 +201,7 @@ pub fn decrypt(
     // This prevents a forged message from permanently corrupting the session.
     let snapshot = state.clone();
 
-    let try_decrypt = try_decrypt_inner(state, header, ciphertext);
+    let try_decrypt = try_decrypt_inner(state, header, ciphertext, envelope_aad);
 
     if try_decrypt.is_err() {
         // Roll back all state mutations
@@ -203,6 +216,7 @@ fn try_decrypt_inner(
     state: &mut SessionState,
     header: &RatchetHeader,
     ciphertext: &[u8],
+    envelope_aad: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
     let need_dh_step = state.their_ratchet_key.as_ref() != Some(&header.ratchet_key);
 
@@ -240,7 +254,7 @@ fn try_decrypt_inner(
     let ck_out = kdf_ck(chain_key)?;
 
     // Attempt AEAD decryption — this is the authentication check
-    let aad = header.to_aad();
+    let aad = authenticated_data(envelope_aad, header);
     let plaintext = crate::aead::decrypt(&ck_out.message_key, ciphertext, &aad)?;
 
     // Only commit state after successful authentication.
@@ -344,6 +358,20 @@ mod skipped_keys_serde {
 mod tests {
     use super::*;
     use crate::keys::{IdentityKeyPair, SignedPreKey};
+
+    const TEST_ENVELOPE_AAD: &[u8] = b"test envelope context";
+
+    fn encrypt(state: &mut SessionState, plaintext: &[u8]) -> Result<RatchetMessage, CryptoError> {
+        super::encrypt(state, plaintext, TEST_ENVELOPE_AAD)
+    }
+
+    fn decrypt(
+        state: &mut SessionState,
+        header: &RatchetHeader,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        super::decrypt(state, header, ciphertext, TEST_ENVELOPE_AAD)
+    }
 
     fn setup_session() -> (SessionState, SessionState) {
         let alice_ik = IdentityKeyPair::generate();
@@ -511,6 +539,26 @@ mod tests {
         assert_eq!(
             decrypt(&mut bob, &m3.header, &m3.ciphertext).expect("d"),
             b"legit after forge"
+        );
+    }
+
+    #[test]
+    fn tampered_envelope_context_rejected_without_corrupting_session() {
+        let (mut alice, mut bob) = setup_session();
+        let message = encrypt(&mut alice, b"authenticated context").expect("encrypt");
+
+        assert!(
+            super::decrypt(
+                &mut bob,
+                &message.header,
+                &message.ciphertext,
+                b"tampered context",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            decrypt(&mut bob, &message.header, &message.ciphertext).expect("decrypt"),
+            b"authenticated context"
         );
     }
 

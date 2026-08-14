@@ -292,6 +292,9 @@ fn notify_receipt_senders(state: &AppState, acknowledged: Vec<(String, String)>)
 }
 
 pub(crate) fn validate_envelope(envelope: &EncryptedEnvelope) -> Result<(), &'static str> {
+    if envelope.version != consts::PROTOCOL_VERSION {
+        return Err("unsupported protocol version");
+    }
     if envelope.ciphertext.len() > consts::MAX_CIPHERTEXT_BYTES {
         return Err("ciphertext exceeds maximum size");
     }

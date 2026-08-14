@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn legacy_invalid_envelope_is_rejected_before_delivery() {
         let envelope = protocol::EncryptedEnvelope {
-            version: 1,
+            version: protocol::consts::PROTOCOL_VERSION,
             header: protocol::types::MessageHeader::Ratchet(protocol::types::RatchetHeader {
                 ratchet_key: base64::Engine::encode(
                     &base64::engine::general_purpose::STANDARD,
