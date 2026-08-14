@@ -1,3 +1,7 @@
+/// Current encrypted-envelope protocol version. Version 2 introduced canonical
+/// envelope metadata binding in AEAD associated data.
+pub const PROTOCOL_VERSION: u32 = 2;
+
 /// Maximum one-time pre-keys in a single upload or registration.
 pub const MAX_PREKEYS_PER_UPLOAD: usize = 200;
 

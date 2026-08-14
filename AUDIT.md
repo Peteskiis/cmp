@@ -8,6 +8,10 @@
 server correctness, automated testing, dependency health, packaging, and
 open-source release readiness.
 
+**Remediation status updated:** 2026-08-14. The findings and command output
+below preserve the original audit evidence; the status summary records the
+current implementation after PRs #2 through #4 and subsequent remediation.
+
 ## Executive summary
 
 CMP has a solid foundation, but it is not ready for a stable,
@@ -23,9 +27,27 @@ experimental and unaudited. CMP should not be described as production-secure
 until the P1 issues below are fixed and the protocol and implementation receive
 independent cryptographic review.
 
+## Remediation status
+
+- **All five P1 findings are resolved.** Ratchet transitions and every
+  ratchet-advancing outbound item are durable, duplicate delivery is
+  re-acknowledged through a correlated outbox, queued delivery is paged by
+  bytes and count, one-time and signed prekeys have bounded lifecycles, and the
+  canonical local gate is green with an enforced dependency policy.
+- **Protocol version enforcement and authentication are resolved.** Version 2
+  is defined in `protocol::consts`; the server rejects other
+  versions on every encrypted relay path; the client rejects them before
+  duplicate handling or crypto-state mutation; and AEAD associated data binds
+  the version, envelope type, X3DH header fields, and Double Ratchet header.
+- **Connection replacement remains open.** The displaced connection is
+  notified but its authenticated read loop is not cancelled immediately.
+- **Public-release material remains open.** The repository still needs the
+  policy, threat-model, contributor, packaging, and release documentation
+  listed below, followed by a full Git-history secret scan.
+
 ## Findings
 
-### P1 — Ratchet persistence can cause key and nonce reuse after a crash
+### P1 — Ratchet persistence can cause key and nonce reuse after a crash — Resolved
 
 Encryption advances the in-memory ratchet before its updated state is persisted
 (`crates/client/src/crypto_mgr.rs:234-275`). Session persistence returns no
@@ -49,7 +71,7 @@ Required work:
   ratchet state is durably committed.
 - Add disk-full, partial-write, and crash/restart fault-injection tests.
 
-### P1 — Lost acknowledgements create permanently undecryptable queued messages
+### P1 — Lost acknowledgements create permanently undecryptable queued messages — Resolved
 
 The network loop removes an outbound item from the channel before its WebSocket
 write succeeds (`crates/client/src/net.rs:122-127`). A disconnect can therefore
@@ -74,7 +96,7 @@ Required work:
   discarding send failures.
 - Test disconnects before, during, and after WebSocket writes and ACK delivery.
 
-### P1 — Queued delivery can allocate and transmit roughly 500 MiB at once
+### P1 — Queued delivery can allocate and transmit roughly 500 MiB at once — Resolved
 
 The protocol permits 1,000 queued messages in one response and approximately
 512 KiB of base64 ciphertext per message
@@ -95,7 +117,7 @@ Required work:
 - Add boundary tests for maximum ciphertext, maximum queue depth, slow clients,
   and reconnecting clients with large queues.
 
-### P1 — One-time prekeys permanently run out and can be deliberately drained
+### P1 — One-time prekeys permanently run out and can be deliberately drained — Resolved
 
 The client creates 100 one-time prekeys during initial registration
 (`crates/client/src/net.rs:177-201`). Each authenticated prekey-bundle fetch
@@ -120,7 +142,7 @@ Required work:
 - Test concurrent fetches, exhaustion, replenishment, malicious draining, and
   rotation across restarts.
 
-### P1 — The canonical release gate is red and dependencies have active advisories
+### P1 — The canonical release gate is red and dependencies have active advisories — Resolved
 
 `make check` currently stops at `fmt-check` because
 `crates/server/src/lib.rs` is not rustfmt-clean. Running the lint target
@@ -153,7 +175,7 @@ Required work:
 - Remove unused direct dependencies and rationalize duplicate major/minor
   dependency versions where practical.
 
-### P2 — Protocol versions are serialized but never authenticated or enforced
+### P2 — Protocol versions are serialized but never authenticated or enforced — Resolved
 
 `EncryptedEnvelope.version` is part of the wire format
 (`crates/protocol/src/types.rs:100-109`), but neither the client nor server
@@ -168,7 +190,7 @@ Required work:
   AEAD associated data.
 - Add upgrade, downgrade, unsupported-version, and header-tampering tests.
 
-### P2 — Connection replacement does not terminate the displaced session
+### P2 — Connection replacement does not terminate the displaced session — Open
 
 Replacing a registered connection sends the old connection a 409 response
 (`crates/server/src/connection.rs:42-56`), but the old server-side read loop is
@@ -182,7 +204,7 @@ Required work:
 - Test old-connection rejection, new-connection delivery, and conditional
   registry cleanup under races.
 
-### P2 — Public-release material is largely absent
+### P2 — Public-release material is largely absent — Open
 
 The repository has no root README, license text, security policy, contribution
 guide, code of conduct, changelog, CI workflow, automated release workflow, or

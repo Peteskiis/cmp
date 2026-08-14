@@ -117,7 +117,7 @@ async fn authenticate(
 
 fn envelope(ciphertext: String) -> EncryptedEnvelope {
     EncryptedEnvelope {
-        version: 1,
+        version: protocol::consts::PROTOCOL_VERSION,
         header: MessageHeader::Ratchet(RatchetHeader {
             ratchet_key: B64.encode([0; 32]),
             previous_chain_length: 0,

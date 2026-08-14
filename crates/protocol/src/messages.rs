@@ -196,7 +196,7 @@ mod tests {
 
     fn sample_envelope() -> EncryptedEnvelope {
         EncryptedEnvelope {
-            version: 1,
+            version: crate::consts::PROTOCOL_VERSION,
             header: MessageHeader::Ratchet(sample_ratchet_header()),
             ciphertext: "Y2lwaGVydGV4dA==".to_owned(),
         }
@@ -204,7 +204,7 @@ mod tests {
 
     fn sample_prekey_envelope() -> EncryptedEnvelope {
         EncryptedEnvelope {
-            version: 1,
+            version: crate::consts::PROTOCOL_VERSION,
             header: MessageHeader::PreKey {
                 sender_identity_key: "c2VuZGVyX2lk".to_owned(),
                 sender_ephemeral_key: "ZXBoZW1lcmFs".to_owned(),

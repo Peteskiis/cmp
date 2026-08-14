@@ -261,10 +261,17 @@ async fn e2ee_full_roundtrip() {
 
     // ── Alice encrypts and sends ──
     let alice_plaintext = b"hello bob, this is real E2EE";
-    let ratchet_msg = ratchet::encrypt(&mut alice_state, alice_plaintext).unwrap();
+    let alice_aad = protocol::aad::prekey(
+        protocol::consts::PROTOCOL_VERSION,
+        alice_id.verifying_key().as_bytes(),
+        x3dh_result.ephemeral_public.as_bytes(),
+        bundle.signed_prekey_id,
+        Some(bob_otk_proto.key_id),
+    );
+    let ratchet_msg = ratchet::encrypt(&mut alice_state, alice_plaintext, &alice_aad).unwrap();
 
     let envelope = EncryptedEnvelope {
-        version: 1,
+        version: protocol::consts::PROTOCOL_VERSION,
         header: MessageHeader::PreKey {
             sender_identity_key: B64.encode(alice_id.verifying_key().as_bytes()),
             sender_ephemeral_key: B64.encode(x3dh_result.ephemeral_public.as_bytes()),
@@ -305,9 +312,11 @@ async fn e2ee_full_roundtrip() {
     assert_eq!(inbound.message_id, msg_id);
 
     // Parse PreKey header
+    let inbound_version = inbound.envelope.version;
     let MessageHeader::PreKey {
         sender_identity_key,
         sender_ephemeral_key,
+        recipient_signed_prekey_id,
         recipient_one_time_prekey_id,
         ratchet: ref proto_rh,
         ..
@@ -316,9 +325,10 @@ async fn e2ee_full_roundtrip() {
         panic!("expected PreKey header");
     };
 
-    let alice_identity =
-        VerifyingKey::from_bytes(&b64_decode_fixed::<32>(&sender_identity_key)).unwrap();
-    let alice_ephemeral = X25519PublicKey::from(b64_decode_fixed::<32>(&sender_ephemeral_key));
+    let alice_identity_bytes = b64_decode_fixed::<32>(&sender_identity_key);
+    let alice_ephemeral_bytes = b64_decode_fixed::<32>(&sender_ephemeral_key);
+    let alice_identity = VerifyingKey::from_bytes(&alice_identity_bytes).unwrap();
+    let alice_ephemeral = X25519PublicKey::from(alice_ephemeral_bytes);
 
     // Find the OPK Bob registered
     let opk_id = recipient_one_time_prekey_id.unwrap();
@@ -349,15 +359,29 @@ async fn e2ee_full_roundtrip() {
         message_number: proto_rh.message_number,
     };
     let ciphertext_bytes = B64.decode(&inbound.envelope.ciphertext).unwrap();
-    let decrypted = ratchet::decrypt(&mut bob_state, &crypto_header, &ciphertext_bytes).unwrap();
+    let alice_aad = protocol::aad::prekey(
+        inbound_version,
+        &alice_identity_bytes,
+        &alice_ephemeral_bytes,
+        recipient_signed_prekey_id,
+        recipient_one_time_prekey_id,
+    );
+    let decrypted = ratchet::decrypt(
+        &mut bob_state,
+        &crypto_header,
+        &ciphertext_bytes,
+        &alice_aad,
+    )
+    .unwrap();
     assert_eq!(decrypted, alice_plaintext, "Alice → Bob decryption failed");
 
     // ── Bob replies (Ratchet message, no PreKey header) ──
     let bob_plaintext = b"hey alice, E2EE works!";
-    let bob_ratchet_msg = ratchet::encrypt(&mut bob_state, bob_plaintext).unwrap();
+    let bob_aad = protocol::aad::ratchet(protocol::consts::PROTOCOL_VERSION);
+    let bob_ratchet_msg = ratchet::encrypt(&mut bob_state, bob_plaintext, &bob_aad).unwrap();
 
     let reply_envelope = EncryptedEnvelope {
-        version: 1,
+        version: protocol::consts::PROTOCOL_VERSION,
         header: MessageHeader::Ratchet(ProtoRatchetHeader {
             ratchet_key: B64.encode(bob_ratchet_msg.header.ratchet_key),
             previous_chain_length: bob_ratchet_msg.header.previous_chain_length,
@@ -396,8 +420,14 @@ async fn e2ee_full_roundtrip() {
         message_number: reply_rh.message_number,
     };
     let reply_ciphertext = B64.decode(&reply_inbound.envelope.ciphertext).unwrap();
-    let alice_decrypted =
-        ratchet::decrypt(&mut alice_state, &reply_crypto_header, &reply_ciphertext).unwrap();
+    let reply_aad = protocol::aad::ratchet(reply_inbound.envelope.version);
+    let alice_decrypted = ratchet::decrypt(
+        &mut alice_state,
+        &reply_crypto_header,
+        &reply_ciphertext,
+        &reply_aad,
+    )
+    .unwrap();
     assert_eq!(
         alice_decrypted, bob_plaintext,
         "Bob → Alice decryption failed"

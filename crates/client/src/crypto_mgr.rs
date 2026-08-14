@@ -5,16 +5,16 @@ use std::fs;
 use std::path::Path;
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use crypto::keys::{IdentityKeyPair, OneTimePreKey, RatchetKeyPair, SignedPreKey};
-use crypto::ratchet::{self, RatchetHeader, RatchetMessage, SessionState};
+use crypto::keys::{IdentityKeyPair, OneTimePreKey, SignedPreKey};
+use crypto::ratchet::{self, RatchetMessage, SessionState};
 use crypto::x3dh::{self, PeerPreKeyBundle};
 use ed25519_dalek::VerifyingKey;
 use protocol::types::{EncryptedEnvelope, MessageHeader, RatchetHeader as ProtoRatchetHeader};
-use protocol::{ClientMessage, MessageId, UserId};
+use protocol::{ClientMessage, MessageId, UserId, aad, consts};
 use serde::{Deserialize, Serialize};
 use x25519_dalek::PublicKey as X25519PublicKey;
 
-use crate::crypto_decode::{b64_decode_fixed, decode_ratchet_header};
+use crate::crypto_decode::b64_decode_fixed;
 use crate::crypto_outbox::{PendingOutbound, ensure_capacity};
 use crate::crypto_replay::{ProcessedMessage, now_secs, prune_processed, validate_peer_ids};
 use crate::crypto_store;
@@ -31,6 +31,9 @@ mod prekeys;
 #[path = "crypto_mgr_outbound.rs"]
 mod outbound;
 
+#[path = "crypto_mgr_decrypt.rs"]
+mod decrypt;
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub(crate) enum CryptoError {
@@ -38,6 +41,8 @@ pub(crate) enum CryptoError {
     BadBundle,
     #[error("invalid envelope")]
     BadEnvelope,
+    #[error("unsupported protocol version {0}")]
+    UnsupportedVersion(u32),
     #[error("key agreement failed")]
     X3dhFailed,
     #[error("ratchet error")]
@@ -151,6 +156,7 @@ impl CryptoManager {
         let store = crypto_store::CryptoStore::open(&data_dir.join("crypto.db"))?;
         let persisted: CoreState = store.load_core()?;
         let pending_outbound = store.load_outbox()?;
+        validate_pending_protocol_versions(&pending_outbound)?;
         let mut processed_messages: HashMap<String, HashMap<String, ProcessedMessage>> =
             HashMap::new();
         for row in store.load_processed()? {
@@ -452,12 +458,25 @@ impl CryptoManager {
             .get(peer_id)
             .cloned()
             .ok_or(CryptoError::NoSession)?;
+        let identity_public = *self.identity.verifying_key().as_bytes();
         let session = self
             .sessions
             .get_mut(peer_id)
             .ok_or(CryptoError::NoSession)?;
+        let envelope_aad = session.prekey_header.as_ref().map_or_else(
+            || aad::ratchet(consts::PROTOCOL_VERSION),
+            |x3dh_data| {
+                aad::prekey(
+                    consts::PROTOCOL_VERSION,
+                    &identity_public,
+                    &x3dh_data.ephemeral_public,
+                    x3dh_data.recipient_signed_prekey_id,
+                    x3dh_data.recipient_one_time_prekey_id,
+                )
+            },
+        );
         let RatchetMessage { header, ciphertext } =
-            ratchet::encrypt(&mut session.ratchet, plaintext)
+            ratchet::encrypt(&mut session.ratchet, plaintext, &envelope_aad)
                 .map_err(|_| CryptoError::RatchetFailed)?;
         let proto_ratchet = ProtoRatchetHeader {
             ratchet_key: B64.encode(header.ratchet_key),
@@ -479,211 +498,11 @@ impl CryptoManager {
         Ok((
             original,
             EncryptedEnvelope {
-                version: 1,
+                version: consts::PROTOCOL_VERSION,
                 header,
                 ciphertext: B64.encode(ciphertext),
             },
         ))
-    }
-
-    #[allow(clippy::cognitive_complexity)]
-    #[cfg(test)]
-    pub(crate) fn decrypt(
-        &mut self,
-        peer_id: &str,
-        envelope: &EncryptedEnvelope,
-    ) -> Result<Vec<u8>, CryptoError> {
-        self.decrypt_with_marker(peer_id, envelope, None)
-    }
-
-    #[allow(clippy::cognitive_complexity)]
-    fn decrypt_with_marker(
-        &mut self,
-        peer_id: &str,
-        envelope: &EncryptedEnvelope,
-        processed_message_id: Option<&str>,
-    ) -> Result<Vec<u8>, CryptoError> {
-        self.check_persistence().map_err(CryptoError::Persistence)?;
-        let now = now_secs();
-        let cutoff = now.saturating_sub(crate::crypto_replay::RETENTION_SECS);
-        self.store
-            .prune_processed(cutoff)
-            .map_err(CryptoError::Persistence)?;
-        prune_processed(&mut self.processed_messages, now);
-        if processed_message_id.is_some()
-            && self
-                .processed_messages
-                .values()
-                .map(HashMap::len)
-                .sum::<usize>()
-                >= protocol::consts::MAX_PROCESSED_MESSAGES
-        {
-            return Err(CryptoError::ReplayLedgerFull);
-        }
-        if let MessageHeader::PreKey {
-            sender_identity_key,
-            sender_ephemeral_key,
-            recipient_signed_prekey_id,
-            recipient_one_time_prekey_id,
-            ratchet,
-            ..
-        } = &envelope.header
-        {
-            // Parse header + ciphertext BEFORE session creation so parsing
-            // failures can't leave an orphan session in the map.
-            let header = decode_ratchet_header(ratchet)?;
-            let ct = B64
-                .decode(&envelope.ciphertext)
-                .map_err(|_| CryptoError::BadEnvelope)?;
-
-            if self.sessions.contains_key(peer_id) {
-                return self.decrypt_existing(peer_id, &header, &ct, processed_message_id);
-            }
-
-            let mut session = self.create_bob_session(
-                sender_identity_key,
-                sender_ephemeral_key,
-                *recipient_signed_prekey_id,
-                *recipient_one_time_prekey_id,
-            )?;
-            let plaintext = ratchet::decrypt(&mut session, &header, &ct)
-                .map_err(|_| CryptoError::DecryptFailed)?;
-
-            self.sessions.insert(
-                peer_id.to_owned(),
-                PeerSession {
-                    ratchet: session,
-                    prekey_header: None,
-                    prekey_expires_at: None,
-                },
-            );
-            let consumed_opk = recipient_one_time_prekey_id
-                .and_then(|opk_id| self.take_one_time_prekey(opk_id).map(|opk| (opk_id, opk)));
-            let inserted_marker = processed_message_id
-                .is_some_and(|message_id| self.mark_processed(peer_id, message_id, &plaintext));
-
-            if let Err(error) = self.persist_decrypt(peer_id, processed_message_id) {
-                self.sessions.remove(peer_id);
-                if let Some((opk_id, (opk, created_at))) = consumed_opk {
-                    self.restore_one_time_prekey(opk_id, opk, created_at);
-                }
-                if inserted_marker {
-                    self.remove_processed(peer_id, processed_message_id.unwrap_or_default());
-                }
-                return Err(CryptoError::Persistence(error));
-            }
-            return Ok(plaintext);
-        }
-
-        // Normal ratchet message
-        let MessageHeader::Ratchet(ratchet_header) = &envelope.header else {
-            return Err(CryptoError::BadEnvelope);
-        };
-
-        let header = decode_ratchet_header(ratchet_header)?;
-
-        let ciphertext = B64
-            .decode(&envelope.ciphertext)
-            .map_err(|_| CryptoError::BadEnvelope)?;
-        self.decrypt_existing(peer_id, &header, &ciphertext, processed_message_id)
-    }
-
-    /// Bob's X3DH: use stored SPK (and optionally OPK) to derive the shared secret.
-    /// OPK is NOT consumed here — only after AEAD authentication succeeds.
-    #[allow(clippy::similar_names)]
-    fn create_bob_session(
-        &self,
-        sender_identity_key_b64: &str,
-        sender_ephemeral_key_b64: &str,
-        expected_spk_id: u32,
-        opk_id: Option<u32>,
-    ) -> Result<SessionState, CryptoError> {
-        let spk = self
-            .stored_spk
-            .iter()
-            .chain(&self.previous_spks)
-            .find(|spk| spk.key_id() == expected_spk_id)
-            .ok_or(CryptoError::BadEnvelope)?;
-
-        let ik_bytes = b64_decode_fixed::<32>(sender_identity_key_b64, CryptoError::BadEnvelope)?;
-        let peer_vk = VerifyingKey::from_bytes(&ik_bytes).map_err(|_| CryptoError::BadEnvelope)?;
-        let ek_bytes = b64_decode_fixed::<32>(sender_ephemeral_key_b64, CryptoError::BadEnvelope)?;
-        let peer_ek = X25519PublicKey::from(ek_bytes);
-
-        // If the sender claims to have used an OPK, we must have it — silent
-        // degradation to 3-DH would let a MITM strip OPK protection.
-        let opk_ref = match opk_id {
-            Some(id) => Some(self.stored_opks.get(&id).ok_or(CryptoError::BadEnvelope)?),
-            None => None,
-        };
-
-        let bob_secret = x3dh::bob_respond(&self.identity, spk, opk_ref, &peer_vk, &peer_ek)
-            .map_err(|_| CryptoError::X3dhFailed)?;
-
-        // Bob's initial ratchet key pair must be his SPK
-        let bob_ratchet =
-            RatchetKeyPair::from_bytes(spk.secret().to_bytes(), spk.public().to_bytes());
-        Ok(ratchet::initialize_bob(bob_secret, bob_ratchet))
-    }
-
-    fn decrypt_existing(
-        &mut self,
-        peer_id: &str,
-        header: &RatchetHeader,
-        ciphertext: &[u8],
-        processed_message_id: Option<&str>,
-    ) -> Result<Vec<u8>, CryptoError> {
-        let original = self
-            .sessions
-            .get(peer_id)
-            .cloned()
-            .ok_or(CryptoError::NoSession)?;
-        let plaintext = {
-            let session = self
-                .sessions
-                .get_mut(peer_id)
-                .ok_or(CryptoError::NoSession)?;
-            ratchet::decrypt(&mut session.ratchet, header, ciphertext)
-                .map_err(|_| CryptoError::DecryptFailed)?
-        };
-        let inserted_marker = processed_message_id
-            .is_some_and(|message_id| self.mark_processed(peer_id, message_id, &plaintext));
-
-        if let Err(error) = self.persist_decrypt(peer_id, processed_message_id) {
-            self.sessions.insert(peer_id.to_owned(), original);
-            if inserted_marker {
-                self.remove_processed(peer_id, processed_message_id.unwrap_or_default());
-            }
-            return Err(CryptoError::Persistence(error));
-        }
-        Ok(plaintext)
-    }
-
-    pub(crate) fn decrypt_message_to_text(
-        &mut self,
-        peer_id: &str,
-        message_id: &MessageId,
-        envelope: &EncryptedEnvelope,
-    ) -> InboundDecrypt {
-        let message_id = message_id.to_string();
-        if let Some(processed) = self
-            .processed_messages
-            .get(peer_id)
-            .and_then(|messages| messages.get(&message_id))
-        {
-            return processed
-                .pending_plaintext
-                .as_ref()
-                .map_or(InboundDecrypt::Duplicate, |text| {
-                    InboundDecrypt::Pending(text.clone())
-                });
-        }
-        match self.decrypt_with_marker(peer_id, envelope, Some(&message_id)) {
-            Ok(plaintext) => InboundDecrypt::Pending(
-                String::from_utf8(plaintext).unwrap_or_else(|_| "[invalid utf-8]".to_owned()),
-            ),
-            Err(_) => InboundDecrypt::Failed,
-        }
     }
 
     pub(crate) fn confirm_inbound_stored(
@@ -791,6 +610,25 @@ impl CryptoManager {
         }
         Ok(pending.to_client_message())
     }
+}
+
+fn validate_pending_protocol_versions(pending: &[PendingOutbound]) -> anyhow::Result<()> {
+    let unsupported = pending.iter().find_map(|item| match item {
+        PendingOutbound::Message { envelope, .. }
+        | PendingOutbound::ReadReceipt { envelope, .. }
+            if envelope.version != consts::PROTOCOL_VERSION =>
+        {
+            Some(envelope.version)
+        }
+        _ => None,
+    });
+    if let Some(version) = unsupported {
+        anyhow::bail!(
+            "pending ciphertext uses protocol version {version}; reset or drain it before using protocol version {}",
+            consts::PROTOCOL_VERSION
+        );
+    }
+    Ok(())
 }
 #[cfg(test)]
 #[path = "crypto_mgr_signed_prekey_tests.rs"]

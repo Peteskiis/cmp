@@ -120,6 +120,9 @@ cargo run -p client -- --user alice  # Run client (production server is default)
 - **Re-acknowledge authenticated duplicates without decrypting them again** — once plaintext and its replay marker are durably stored, a redelivery must produce another durable ACK rather than an undecryptable-message fallback.
 - **Replay the durable outbox before accepting new ratchet sends after reconnect** — transport reconnection must not let newer ciphertext overtake older persisted ciphertext.
 - **Read-receipt confirmation is a three-party durable handshake** — the server retains an acknowledged receipt tombstone until the original sender confirms `ReadReceiptSent`; losing any response must leave enough durable state to retry idempotently.
+- **Validate envelope versions before replay or duplicate short-circuits** — unsupported versions must be rejected at the client and server boundary even when a message ID is already known.
+- **Bump the protocol version for incompatible cryptographic semantics** — changing AAD, key derivation, header interpretation, or ciphertext compatibility must never reuse the previous version number.
+- **Gate version cutovers against durable ciphertext** — server queues and client outboxes must reject incompatible persisted versions at startup without deleting them. Never route unsupported-but-valid envelopes through corrupt-row cleanup.
 
 ## Reference Implementations
 

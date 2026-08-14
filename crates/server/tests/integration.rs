@@ -142,7 +142,7 @@ async fn auth_challenge_response(
 
 fn dummy_envelope(text: &str) -> EncryptedEnvelope {
     EncryptedEnvelope {
-        version: 1,
+        version: protocol::consts::PROTOCOL_VERSION,
         header: MessageHeader::Ratchet(ProtoRatchetHeader {
             ratchet_key: B64.encode([0u8; 32]),
             previous_chain_length: 0,
@@ -438,7 +438,7 @@ async fn malformed_envelope_keys_are_rejected_on_all_relay_paths() {
     register(&mut bob_sink, &mut bob_stream, "bob", &bob_id).await;
 
     let invalid = EncryptedEnvelope {
-        version: 1,
+        version: protocol::consts::PROTOCOL_VERSION,
         header: MessageHeader::Ratchet(ProtoRatchetHeader {
             ratchet_key: B64.encode([0u8; 31]),
             previous_chain_length: 0,
@@ -473,6 +473,54 @@ async fn malformed_envelope_keys_are_rejected_on_all_relay_paths() {
         recv(&mut alice_stream).await,
         ServerMessage::Error { code: 400, .. }
     ));
+    drop((bob_sink, bob_stream));
+}
+
+#[tokio::test]
+async fn unsupported_envelope_versions_are_rejected_on_all_relay_paths() {
+    let (url, _handle) = start_test_server().await;
+    let alice_id = make_identity();
+    let bob_id = make_identity();
+    let (mut alice_sink, mut alice_stream) = connect(&url).await;
+    register(&mut alice_sink, &mut alice_stream, "alice", &alice_id).await;
+    let (mut bob_sink, mut bob_stream) = connect(&url).await;
+    register(&mut bob_sink, &mut bob_stream, "bob", &bob_id).await;
+
+    for unsupported_version in [
+        protocol::consts::PROTOCOL_VERSION - 1,
+        protocol::consts::PROTOCOL_VERSION + 1,
+    ] {
+        let mut unsupported = dummy_envelope("opaque");
+        unsupported.version = unsupported_version;
+        send(
+            &mut alice_sink,
+            &ClientMessage::SendMessage {
+                recipient_id: UserId::new("bob").unwrap(),
+                message_id: MessageId::new(),
+                envelope: unsupported.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv(&mut alice_stream).await,
+            ServerMessage::Error { code: 400, .. }
+        ));
+
+        send(
+            &mut alice_sink,
+            &ClientMessage::SendReadReceipt {
+                recipient_id: UserId::new("bob").unwrap(),
+                receipt_id: MessageId::new(),
+                envelope: unsupported,
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv(&mut alice_stream).await,
+            ServerMessage::Error { code: 400, .. }
+        ));
+    }
+
     drop((bob_sink, bob_stream));
 }
 

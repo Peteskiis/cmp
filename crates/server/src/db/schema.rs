@@ -86,10 +86,37 @@ pub async fn initialize(conn: &Connection) -> anyhow::Result<()> {
             migrate_v8(conn)?;
         }
 
+        ensure_queued_protocol_versions(conn)?;
+
         Ok(())
     })
     .await?;
 
+    Ok(())
+}
+
+fn ensure_queued_protocol_versions(conn: &rusqlite::Connection) -> tokio_rusqlite::Result<()> {
+    let mut statement = conn.prepare(
+        "SELECT envelope FROM message_queue
+         UNION ALL
+         SELECT envelope FROM read_receipt_queue",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let encoded: String = row.get(0)?;
+        let Ok(envelope) = serde_json::from_str::<protocol::EncryptedEnvelope>(&encoded) else {
+            continue;
+        };
+        if envelope.version != protocol::consts::PROTOCOL_VERSION {
+            return Err(tokio_rusqlite::Error::Other(Box::new(
+                std::io::Error::other(format!(
+                    "queued ciphertext uses protocol version {}; drain or reset queued data before starting protocol version {}",
+                    envelope.version,
+                    protocol::consts::PROTOCOL_VERSION
+                )),
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -248,6 +275,25 @@ fn migrate_v8(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
 mod tests {
     use super::*;
 
+    fn old_envelope() -> String {
+        serde_json::to_string(&protocol::EncryptedEnvelope {
+            version: protocol::consts::PROTOCOL_VERSION - 1,
+            header: protocol::MessageHeader::Ratchet(protocol::RatchetHeader {
+                ratchet_key: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    [0_u8; 32],
+                ),
+                previous_chain_length: 0,
+                message_number: 0,
+            }),
+            ciphertext: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                b"old ciphertext",
+            ),
+        })
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn older_database_runs_all_later_migrations() {
         let conn = Connection::open_in_memory().await.unwrap();
@@ -330,5 +376,80 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_old_protocol_message_blocks_startup_without_deletion() {
+        let conn = Connection::open_in_memory().await.unwrap();
+        initialize(&conn).await.unwrap();
+        let envelope = old_envelope();
+        conn.call(move |conn| {
+            conn.execute(
+                "INSERT INTO users (user_id, identity_key) VALUES ('bob', X'00')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO message_queue (message_id, recipient_id, sender_id, envelope)
+                 VALUES ('pending', 'bob', 'alice', ?1)",
+                [envelope],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let error = initialize(&conn).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("queued ciphertext uses protocol version")
+        );
+        let count: i64 = conn
+            .call(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM message_queue", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn queued_old_protocol_receipt_blocks_startup_without_deletion() {
+        let conn = Connection::open_in_memory().await.unwrap();
+        initialize(&conn).await.unwrap();
+        let envelope = old_envelope();
+        conn.call(move |conn| {
+            conn.execute(
+                "INSERT INTO users (user_id, identity_key) VALUES ('bob', X'00')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO read_receipt_queue
+                    (receipt_id, recipient_id, sender_id, envelope)
+                 VALUES ('receipt', 'bob', 'alice', ?1)",
+                [envelope],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let error = initialize(&conn).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("queued ciphertext uses protocol version")
+        );
+        let count: i64 = conn
+            .call(|conn| {
+                Ok(
+                    conn.query_row("SELECT COUNT(*) FROM read_receipt_queue", [], |row| {
+                        row.get(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

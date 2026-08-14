@@ -48,6 +48,29 @@ fn alice_encrypt_bob_decrypt_prekey() {
 }
 
 #[test]
+fn unsupported_version_is_rejected_without_mutating_session() {
+    let (mut alice, mut bob, _a_dir, _b_dir) = setup_alice_and_bob();
+    let mut envelope = alice.encrypt("bob", b"version-bound").unwrap();
+    let opk_count = bob.stored_opks.len();
+
+    for unsupported in [
+        protocol::consts::PROTOCOL_VERSION - 1,
+        protocol::consts::PROTOCOL_VERSION + 1,
+    ] {
+        envelope.version = unsupported;
+        assert!(matches!(
+            bob.decrypt("alice", &envelope),
+            Err(CryptoError::UnsupportedVersion(version)) if version == unsupported
+        ));
+        assert!(!bob.has_session("alice"));
+        assert_eq!(bob.stored_opks.len(), opk_count);
+    }
+
+    envelope.version = protocol::consts::PROTOCOL_VERSION;
+    assert_eq!(bob.decrypt("alice", &envelope).unwrap(), b"version-bound");
+}
+
+#[test]
 fn unused_prekey_session_expires_before_first_encryption() {
     let (mut alice, _bob, _alice_dir, _bob_dir) = setup_alice_and_bob();
     alice.sessions.get_mut("bob").unwrap().prekey_expires_at = Some(0);
@@ -63,7 +86,7 @@ fn forged_prekey_no_orphan_session_no_opk_consumed() {
 
     // Forge a PreKey message with garbage ciphertext
     let forged = EncryptedEnvelope {
-        version: 1,
+        version: protocol::consts::PROTOCOL_VERSION,
         header: MessageHeader::PreKey {
             sender_identity_key: B64.encode([1u8; 32]),
             sender_ephemeral_key: B64.encode([2u8; 32]),
@@ -97,7 +120,7 @@ fn existing_session_not_destroyed_by_prekey() {
 
     // Forge a PreKey from "alice" with garbage — should NOT destroy session
     let forged = EncryptedEnvelope {
-        version: 1,
+        version: protocol::consts::PROTOCOL_VERSION,
         header: MessageHeader::PreKey {
             sender_identity_key: B64.encode([9u8; 32]),
             sender_ephemeral_key: B64.encode([9u8; 32]),
@@ -126,7 +149,7 @@ fn missing_opk_returns_error() {
 
     // PreKey message claiming OPK 999 which Bob doesn't have
     let forged = EncryptedEnvelope {
-        version: 1,
+        version: protocol::consts::PROTOCOL_VERSION,
         header: MessageHeader::PreKey {
             sender_identity_key: B64.encode([1u8; 32]),
             sender_ephemeral_key: B64.encode([2u8; 32]),
@@ -302,6 +325,24 @@ fn processed_message_is_reacknowledged_without_redecrypting_after_restart() {
 }
 
 #[test]
+fn duplicate_with_unsupported_version_is_not_reacknowledged() {
+    let (mut alice, mut bob, _a_dir, _b_dir) = setup_alice_and_bob();
+    let message_id = MessageId::new();
+    let mut envelope = alice.encrypt("bob", b"authenticated duplicate").unwrap();
+    assert!(matches!(
+        bob.decrypt_message_to_text("alice", &message_id, &envelope),
+        InboundDecrypt::Pending(_)
+    ));
+    bob.confirm_inbound_stored("alice", &message_id).unwrap();
+    envelope.version = protocol::consts::PROTOCOL_VERSION - 1;
+
+    assert!(matches!(
+        bob.decrypt_message_to_text("alice", &message_id, &envelope),
+        InboundDecrypt::Failed
+    ));
+}
+
+#[test]
 fn read_receipt_survives_restart_until_server_confirmation() {
     let (mut alice, mut bob, a_dir, _b_dir) = setup_alice_and_bob();
     let received_id = MessageId::new();
@@ -368,7 +409,7 @@ fn durable_outbox_rejects_new_items_at_capacity_before_ratchet_advances() {
     let (mut alice, _bob, a_dir, _b_dir) = setup_alice_and_bob();
     let recipient = UserId::new("bob").unwrap();
     let envelope = EncryptedEnvelope {
-        version: 1,
+        version: protocol::consts::PROTOCOL_VERSION,
         header: MessageHeader::Ratchet(ProtoRatchetHeader {
             ratchet_key: B64.encode([0_u8; 32]),
             previous_chain_length: 0,
@@ -554,6 +595,36 @@ fn corrupt_persisted_state_is_not_silently_discarded() {
     drop(connection);
 
     assert!(CryptoManager::load_or_generate(directory.path()).is_err());
+}
+
+#[test]
+fn pending_ciphertext_from_an_unsupported_protocol_fails_load() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = CryptoManager::load_or_generate(directory.path()).unwrap();
+    let pending = PendingOutbound::Message {
+        recipient_id: UserId::new("bob").unwrap(),
+        message_id: MessageId::new(),
+        envelope: EncryptedEnvelope {
+            version: protocol::consts::PROTOCOL_VERSION - 1,
+            header: MessageHeader::Ratchet(ProtoRatchetHeader {
+                ratchet_key: B64.encode([0_u8; 32]),
+                previous_chain_length: 0,
+                message_number: 0,
+            }),
+            ciphertext: B64.encode(b"old ciphertext"),
+        },
+    };
+    manager.persist_outbound(&pending).unwrap();
+    drop(manager);
+
+    let Err(error) = CryptoManager::load_or_generate(directory.path()) else {
+        panic!("unsupported pending ciphertext should fail load");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("pending ciphertext uses protocol version")
+    );
 }
 
 #[test]
