@@ -265,6 +265,11 @@ impl CryptoManager {
         if previously_accepted && let Some(published) = rejected_candidate.take() {
             self.previous_spks.insert(0, published);
         }
+        let dropped_history = if self.previous_spks.len() > SIGNED_PREKEY_PRIVATE_HISTORY {
+            self.previous_spks.split_off(SIGNED_PREKEY_PRIVATE_HISTORY)
+        } else {
+            Vec::new()
+        };
         let rejected_rotated_at = self.signed_prekey_rotated_at;
         let previous_next_signed_prekey_id = self.next_signed_prekey_id;
         let rejected_pending = std::mem::replace(&mut self.pending_outbound[index], replacement);
@@ -287,6 +292,7 @@ impl CryptoManager {
             } else {
                 rejected_candidate
             };
+            self.previous_spks.extend(dropped_history);
             drop(replacement);
             self.pending_outbound[index] = rejected_pending;
             self.signed_prekey_rotated_at = rejected_rotated_at;

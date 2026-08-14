@@ -173,3 +173,47 @@ fn accepted_older_key_reconciles_to_server_current() {
         b"queued for older key"
     );
 }
+
+#[test]
+fn repeated_older_key_reconciliation_is_bounded_and_atomic() {
+    let (_alice, mut bob, _alice_dir, bob_dir) = setup_alice_and_bob();
+    bob.signed_prekey_rotated_at = 0;
+    bob.queue_signed_prekey_rotation().unwrap();
+
+    for current_key_id in [2, 4, 6] {
+        let (rotation_id, _) = queued_rotation(&bob);
+        bob.confirm_signed_prekey_rotated(&rotation_id, false, true, current_key_id)
+            .unwrap();
+    }
+    assert_eq!(bob.previous_spks.len(), 3);
+    drop(bob);
+
+    let mut bob = CryptoManager::load_or_generate(bob_dir.path()).unwrap();
+    let before_key_id = bob.stored_spk.as_ref().unwrap().key_id();
+    let before_history = bob
+        .previous_spks
+        .iter()
+        .map(SignedPreKey::key_id)
+        .collect::<Vec<_>>();
+    let (rotation_id, _) = queued_rotation(&bob);
+    bob.store.inject_replace_outbound_failure();
+    assert!(
+        bob.confirm_signed_prekey_rotated(&rotation_id, false, true, 8)
+            .is_err()
+    );
+    assert_eq!(bob.stored_spk.as_ref().unwrap().key_id(), before_key_id);
+    assert_eq!(
+        bob.previous_spks
+            .iter()
+            .map(SignedPreKey::key_id)
+            .collect::<Vec<_>>(),
+        before_history
+    );
+    assert_eq!(queued_rotation(&bob).0, rotation_id);
+    drop(bob);
+
+    let bob = CryptoManager::load_or_generate(bob_dir.path()).unwrap();
+    assert_eq!(bob.stored_spk.as_ref().unwrap().key_id(), before_key_id);
+    assert_eq!(bob.previous_spks.len(), 3);
+    assert_eq!(queued_rotation(&bob).0, rotation_id);
+}
