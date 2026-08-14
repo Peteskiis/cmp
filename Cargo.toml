@@ -13,6 +13,9 @@ edition = "2024"
 # Kept in step with rust-toolchain.toml and release builders.
 rust-version = "1.97.1"
 license = "MIT"
+repository = "https://github.com/Peteskiis/cmp"
+homepage = "https://github.com/Peteskiis/cmp"
+readme = "README.md"
 
 [workspace.dependencies]
 # Shared

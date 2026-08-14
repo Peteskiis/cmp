@@ -1,4 +1,4 @@
-.PHONY: help fmt fmt-check cargo-check lint lint-fix test doc line-check dependencies check build-cli build-server run-server release release-server
+.PHONY: help fmt fmt-check cargo-check lint lint-fix test doc line-check dependencies secret-scan check build-cli build-server run-server release release-server
 .DEFAULT_GOAL := help
 
 MAC_TARGETS := aarch64-apple-darwin
@@ -16,6 +16,7 @@ help:
 	@echo "  doc        build documentation with warnings denied"
 	@echo "  line-check enforce the 800-line Rust source-file limit"
 	@echo "  dependencies check dependency advisories, licenses, bans, and sources"
+	@echo "  secret-scan  scan the complete Git history with Gitleaks"
 	@echo "  check      fmt-check + lint + test + dependency policy"
 	@echo "  build-cli    build and install client to ~/.local/bin/"
 	@echo "  build-server build and install server to ~/.local/bin/"
@@ -49,6 +50,9 @@ line-check:
 
 dependencies:
 	cargo deny check advisories bans licenses sources
+
+secret-scan:
+	gitleaks git --redact --no-banner --no-color --log-opts="--all" .
 
 check: fmt-check cargo-check lint test doc line-check dependencies
 

@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a reproducible non-security defect
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: Do not report vulnerabilities here. Follow SECURITY.md instead.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Version or commit
+      placeholder: 0.1.0-alpha.1 or commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Minimal steps using redacted test accounts and data
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, terminal, Rust version if building from source, and self-hosted or hosted relay
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety
+      options:
+        - label: I removed credentials, private keys, message content, and personal data.
+          required: true

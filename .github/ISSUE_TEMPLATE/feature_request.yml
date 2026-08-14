@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose a focused capability or hardening improvement
+title: "feat: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or operational problem needs solving?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior, not only an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and compatibility impact
+      description: Note protocol, metadata, persistence, deployment, or upgrade implications.
