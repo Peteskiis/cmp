@@ -756,12 +756,14 @@ fn handle_server_message(
         ServerMessage::SignedPreKeyRotated {
             rotation_id,
             accepted,
+            previously_accepted,
             current_key_id,
         } => prekeys::handle_signed_prekey_rotated(
             app,
             outgoing_tx,
             &rotation_id,
             accepted,
+            previously_accepted,
             current_key_id,
         ),
         ServerMessage::Error { message, .. } => {

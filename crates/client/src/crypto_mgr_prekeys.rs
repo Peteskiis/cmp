@@ -146,7 +146,6 @@ impl CryptoManager {
             key_id,
             public_key: B64.encode(new_spk.public().as_bytes()),
             signature: B64.encode(new_spk.signature().to_bytes()),
-            previous_rotated_at: self.signed_prekey_rotated_at,
         };
 
         let previous_current = self.stored_spk.replace(new_spk);
@@ -176,6 +175,7 @@ impl CryptoManager {
         &mut self,
         rotation_id: &MessageId,
         accepted: bool,
+        previously_accepted: bool,
         current_key_id: u32,
     ) -> anyhow::Result<Option<ClientMessage>> {
         let Some(index) = self.pending_outbound.iter().position(|pending| {
@@ -195,8 +195,13 @@ impl CryptoManager {
             self.confirm_accepted_signed_prekey_rotation(index, rotation_id)?;
             return Ok(None);
         }
-        self.reconcile_rejected_signed_prekey_rotation(index, rotation_id, current_key_id)
-            .map(Some)
+        self.reconcile_rejected_signed_prekey_rotation(
+            index,
+            rotation_id,
+            previously_accepted,
+            current_key_id,
+        )
+        .map(Some)
     }
 
     fn confirm_accepted_signed_prekey_rotation(
@@ -225,17 +230,10 @@ impl CryptoManager {
         &mut self,
         index: usize,
         rotation_id: &MessageId,
+        previously_accepted: bool,
         current_key_id: u32,
     ) -> anyhow::Result<ClientMessage> {
         self.check_persistence()?;
-        let PendingOutbound::SignedPreKeyRotation {
-            previous_rotated_at,
-            ..
-        } = &self.pending_outbound[index]
-        else {
-            anyhow::bail!("signed prekey rotation missing");
-        };
-        let previous_rotated_at = *previous_rotated_at;
         let restored_key_id = self
             .previous_spks
             .first()
@@ -258,10 +256,15 @@ impl CryptoManager {
             key_id: replacement_key_id,
             public_key: B64.encode(replacement_key.public().as_bytes()),
             signature: B64.encode(replacement_key.signature().to_bytes()),
-            previous_rotated_at,
         };
 
-        let rejected_candidate = self.stored_spk.replace(replacement_key);
+        if previously_accepted && self.stored_spk.is_none() {
+            anyhow::bail!("published signed prekey missing");
+        }
+        let mut rejected_candidate = self.stored_spk.replace(replacement_key);
+        if previously_accepted && let Some(published) = rejected_candidate.take() {
+            self.previous_spks.insert(0, published);
+        }
         let rejected_rotated_at = self.signed_prekey_rotated_at;
         let previous_next_signed_prekey_id = self.next_signed_prekey_id;
         let rejected_pending = std::mem::replace(&mut self.pending_outbound[index], replacement);
@@ -274,7 +277,17 @@ impl CryptoManager {
             &replacement.correlation_id(),
             replacement,
         ) {
-            self.stored_spk = rejected_candidate;
+            let replacement = self.stored_spk.take();
+            self.stored_spk = if previously_accepted {
+                if self.previous_spks.is_empty() {
+                    None
+                } else {
+                    Some(self.previous_spks.remove(0))
+                }
+            } else {
+                rejected_candidate
+            };
+            drop(replacement);
             self.pending_outbound[index] = rejected_pending;
             self.signed_prekey_rotated_at = rejected_rotated_at;
             self.next_signed_prekey_id = previous_next_signed_prekey_id;

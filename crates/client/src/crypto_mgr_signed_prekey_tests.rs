@@ -30,7 +30,7 @@ fn rotation_is_durable_and_bounded() {
     assert_eq!(bob.stored_spk.as_ref().unwrap().key_id(), 1);
     assert_eq!(bob.previous_spks[0].key_id(), 0);
     assert!(
-        bob.confirm_signed_prekey_rotated(&rotation_id, true, 1)
+        bob.confirm_signed_prekey_rotated(&rotation_id, true, false, 1)
             .unwrap()
             .is_none()
     );
@@ -41,7 +41,7 @@ fn rotation_is_durable_and_bounded() {
         let (rotation_id, key_id) = queued_rotation(&bob);
         assert_eq!(key_id, expected_id);
         assert!(
-            bob.confirm_signed_prekey_rotated(&rotation_id, true, expected_id)
+            bob.confirm_signed_prekey_rotated(&rotation_id, true, false, expected_id)
                 .unwrap()
                 .is_none()
         );
@@ -78,7 +78,7 @@ fn rejection_reconciles_and_survives_restart() {
     assert_eq!(rejected_key_id, 1);
 
     let replacement = bob
-        .confirm_signed_prekey_rotated(&rejected_id, false, 5)
+        .confirm_signed_prekey_rotated(&rejected_id, false, false, 5)
         .unwrap()
         .expect("replacement rotation");
     assert!(matches!(
@@ -93,7 +93,7 @@ fn rejection_reconciles_and_survives_restart() {
     assert_ne!(replacement_id, rejected_id);
     assert_eq!(bob.stored_spk.as_ref().unwrap().key_id(), 6);
     assert!(
-        bob.confirm_signed_prekey_rotated(&replacement_id, true, 6)
+        bob.confirm_signed_prekey_rotated(&replacement_id, true, false, 6)
             .unwrap()
             .is_none()
     );
@@ -110,7 +110,7 @@ fn rejection_reconciliation_is_atomic_on_failure() {
     bob.store.inject_replace_outbound_failure();
 
     assert!(
-        bob.confirm_signed_prekey_rotated(&rejected_id, false, 5)
+        bob.confirm_signed_prekey_rotated(&rejected_id, false, false, 5)
             .is_err()
     );
     assert_eq!(bob.stored_spk.as_ref().unwrap().key_id(), 1);
@@ -121,7 +121,7 @@ fn rejection_reconciliation_is_atomic_on_failure() {
     assert_eq!(bob.stored_spk.as_ref().unwrap().key_id(), 1);
     assert_eq!(queued_rotation(&bob).0, rejected_id);
     let replacement = bob
-        .confirm_signed_prekey_rotated(&rejected_id, false, 5)
+        .confirm_signed_prekey_rotated(&rejected_id, false, false, 5)
         .unwrap()
         .expect("replacement rotation");
     assert!(matches!(
@@ -137,9 +137,25 @@ fn accepted_older_key_reconciles_to_server_current() {
     bob.queue_signed_prekey_rotation().unwrap();
     let (older_id, older_key_id) = queued_rotation(&bob);
     assert_eq!(older_key_id, 1);
+    let sender_dir = tempfile::TempDir::new().unwrap();
+    let mut sender = CryptoManager::load_or_generate(sender_dir.path()).unwrap();
+    let published_key = bob.stored_spk.as_ref().unwrap();
+    sender
+        .init_session_from_bundle(
+            "bob",
+            &protocol::PreKeyBundle {
+                identity_key: B64.encode(bob.identity().verifying_key().as_bytes()),
+                signed_prekey: B64.encode(published_key.public().as_bytes()),
+                signed_prekey_id: published_key.key_id(),
+                signed_prekey_signature: B64.encode(published_key.signature().to_bytes()),
+                one_time_prekey: None,
+            },
+        )
+        .unwrap();
+    let delayed = sender.encrypt("bob", b"queued for older key").unwrap();
 
     let replacement = bob
-        .confirm_signed_prekey_rotated(&older_id, true, 2)
+        .confirm_signed_prekey_rotated(&older_id, false, true, 2)
         .unwrap()
         .expect("replacement rotation");
     assert!(matches!(
@@ -148,7 +164,12 @@ fn accepted_older_key_reconciles_to_server_current() {
     ));
     drop(bob);
 
-    let bob = CryptoManager::load_or_generate(bob_dir.path()).unwrap();
+    let mut bob = CryptoManager::load_or_generate(bob_dir.path()).unwrap();
     assert_eq!(queued_rotation(&bob).1, 3);
     assert_eq!(bob.stored_spk.as_ref().unwrap().key_id(), 3);
+    assert!(bob.previous_spks.iter().any(|key| key.key_id() == 1));
+    assert_eq!(
+        bob.decrypt("sender", &delayed).unwrap(),
+        b"queued for older key"
+    );
 }

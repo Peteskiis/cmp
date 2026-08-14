@@ -96,12 +96,15 @@ pub(super) fn handle_signed_prekey_rotated(
     outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
     rotation_id: &protocol::MessageId,
     accepted: bool,
+    previously_accepted: bool,
     current_key_id: u32,
 ) {
-    match app
-        .crypto
-        .confirm_signed_prekey_rotated(rotation_id, accepted, current_key_id)
-    {
+    match app.crypto.confirm_signed_prekey_rotated(
+        rotation_id,
+        accepted,
+        previously_accepted,
+        current_key_id,
+    ) {
         Ok(Some(replacement)) => {
             let _ = outgoing_tx.send(replacement);
             app.status("signed pre-key rotation reconciled; retrying");

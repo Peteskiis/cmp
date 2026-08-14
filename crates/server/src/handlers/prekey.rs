@@ -164,17 +164,20 @@ async fn store_signed_prekey_rotation(
     public_key: &[u8],
     signature: &[u8],
 ) -> ServerMessage {
-    let (accepted, current_key_id) =
+    let (accepted, previously_accepted, current_key_id) =
         match db::prekeys::rotate_signed_prekey(&state.db, user_id, key_id, public_key, signature)
             .await
         {
             Ok(db::prekeys::SignedPreKeyRotationResult::Accepted { current_key_id }) => {
-                (true, current_key_id)
+                (true, false, current_key_id)
+            }
+            Ok(db::prekeys::SignedPreKeyRotationResult::PreviouslyAccepted { current_key_id }) => {
+                (false, true, current_key_id)
             }
             Ok(
                 db::prekeys::SignedPreKeyRotationResult::InvalidSequence { current_key_id }
                 | db::prekeys::SignedPreKeyRotationResult::Conflict { current_key_id },
-            ) => (false, current_key_id),
+            ) => (false, false, current_key_id),
             Err(error) => {
                 tracing::error!("failed to rotate signed prekey: {error}");
                 return error_500_generic();
@@ -183,6 +186,7 @@ async fn store_signed_prekey_rotation(
     ServerMessage::SignedPreKeyRotated {
         rotation_id,
         accepted,
+        previously_accepted,
         current_key_id,
     }
 }

@@ -85,6 +85,7 @@ pub enum UploadResult {
 #[non_exhaustive]
 pub enum SignedPreKeyRotationResult {
     Accepted { current_key_id: u32 },
+    PreviouslyAccepted { current_key_id: u32 },
     InvalidSequence { current_key_id: u32 },
     Conflict { current_key_id: u32 },
 }
@@ -118,12 +119,15 @@ pub async fn rotate_signed_prekey(
         if let Some((existing_key, existing_signature)) = existing {
             tx.rollback()?;
             return Ok(
-                if key_id == current_id
-                    && existing_key == public_key
-                    && existing_signature == signature
-                {
-                    SignedPreKeyRotationResult::Accepted {
-                        current_key_id: current_id,
+                if existing_key == public_key && existing_signature == signature {
+                    if key_id == current_id {
+                        SignedPreKeyRotationResult::Accepted {
+                            current_key_id: current_id,
+                        }
+                    } else {
+                        SignedPreKeyRotationResult::PreviouslyAccepted {
+                            current_key_id: current_id,
+                        }
                     }
                 } else {
                     SignedPreKeyRotationResult::Conflict {
@@ -371,7 +375,7 @@ mod tests {
             rotate_signed_prekey(&conn, "alice", 2, &[2; 32], &[2; 64])
                 .await
                 .unwrap(),
-            SignedPreKeyRotationResult::Conflict { current_key_id: 3 }
+            SignedPreKeyRotationResult::PreviouslyAccepted { current_key_id: 3 }
         ));
         assert!(matches!(
             rotate_signed_prekey(&conn, "alice", 7, &[7; 32], &[7; 64])
