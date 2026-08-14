@@ -1,9 +1,21 @@
 use base64::Engine;
 
 use super::{
-    B64, CoreStateRef, CryptoManager, HashMap, OneTimePreKey, PeerSession, PendingOutbound,
-    SignedPreKey, StoredOpk, StoredSpk, crypto_store,
+    B64, CryptoManager, HashMap, OneTimePreKey, PeerSession, PendingOutbound, SignedPreKey,
+    StoredOpk, StoredSpk, crypto_store,
 };
+
+#[derive(serde::Serialize)]
+pub(super) struct CoreStateRef<'a> {
+    pub(super) signed_prekey: Option<StoredSpk>,
+    pub(super) previous_signed_prekeys: Vec<StoredSpk>,
+    pub(super) signed_prekey_rotated_at: u64,
+    pub(super) next_signed_prekey_id: u32,
+    pub(super) one_time_prekeys: Vec<StoredOpk>,
+    pub(super) sessions: &'a HashMap<String, PeerSession>,
+    pub(super) next_one_time_prekey_id: u32,
+    pub(super) one_time_prekey_created_at: &'a HashMap<u32, u64>,
+}
 
 impl CryptoManager {
     pub(super) fn persist_state(&self) -> anyhow::Result<()> {
@@ -49,6 +61,16 @@ impl CryptoManager {
             public_bytes: spk.public().to_bytes(),
             signature_b64: B64.encode(spk.signature().to_bytes()),
         });
+        let previous_signed_prekeys = self
+            .previous_spks
+            .iter()
+            .map(|spk| StoredSpk {
+                key_id: spk.key_id(),
+                secret_bytes: spk.secret().to_bytes(),
+                public_bytes: spk.public().to_bytes(),
+                signature_b64: B64.encode(spk.signature().to_bytes()),
+            })
+            .collect();
         let one_time_prekeys = self
             .stored_opks
             .values()
@@ -60,6 +82,9 @@ impl CryptoManager {
             .collect();
         CoreStateRef {
             signed_prekey,
+            previous_signed_prekeys,
+            signed_prekey_rotated_at: self.signed_prekey_rotated_at,
+            next_signed_prekey_id: self.next_signed_prekey_id,
             one_time_prekeys,
             sessions: &self.sessions,
             next_one_time_prekey_id: self.next_one_time_prekey_id,
@@ -93,6 +118,24 @@ pub(super) fn decode_stored_spk(stored: Option<StoredSpk>) -> anyhow::Result<Opt
         stored.public_bytes,
         ed25519_dalek::Signature::from_bytes(&sig_arr),
     )))
+}
+
+pub(super) fn decode_stored_spks(
+    current: Option<StoredSpk>,
+    previous: Vec<StoredSpk>,
+) -> anyhow::Result<(Option<SignedPreKey>, Vec<SignedPreKey>, u32)> {
+    let current = decode_stored_spk(current)?;
+    let next_id = current
+        .as_ref()
+        .map_or(0, |prekey| prekey.key_id().saturating_add(1));
+    let previous = previous
+        .into_iter()
+        .map(|stored| {
+            decode_stored_spk(Some(stored))?
+                .ok_or_else(|| anyhow::anyhow!("corrupt previous signed prekey"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((current, previous, next_id))
 }
 
 pub(super) fn decode_stored_opks(stored: Vec<StoredOpk>) -> HashMap<u32, OneTimePreKey> {

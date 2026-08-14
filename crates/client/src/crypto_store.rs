@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::fs::{self, File};
 #[cfg(test)]
 use std::io;
@@ -12,6 +14,8 @@ use tempfile::NamedTempFile;
 
 pub(crate) struct CryptoStore {
     connection: Connection,
+    #[cfg(test)]
+    fail_replace_outbound: Cell<bool>,
 }
 
 impl CryptoStore {
@@ -36,7 +40,11 @@ impl CryptoStore {
                 PRIMARY KEY (peer_id, message_id)
             );",
         )?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            #[cfg(test)]
+            fail_replace_outbound: Cell::new(false),
+        })
     }
 
     pub(crate) fn load_core<T: DeserializeOwned + Default>(&self) -> anyhow::Result<T> {
@@ -171,6 +179,42 @@ impl CryptoStore {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn save_core_and_replace_outbound<T: Serialize, U: Serialize>(
+        &self,
+        core: &T,
+        old_correlation_id: &str,
+        new_correlation_id: &str,
+        outbound: &U,
+    ) -> anyhow::Result<()> {
+        let core = serde_json::to_string(core)?;
+        let outbound = serde_json::to_string(outbound)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO core_state (id, json) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
+            [core],
+        )?;
+        transaction.execute(
+            "DELETE FROM outbox WHERE correlation_id = ?1",
+            [old_correlation_id],
+        )?;
+        #[cfg(test)]
+        if self.fail_replace_outbound.replace(false) {
+            anyhow::bail!("injected outbound replacement failure");
+        }
+        transaction.execute(
+            "INSERT INTO outbox (correlation_id, payload) VALUES (?1, ?2)",
+            params![new_correlation_id, outbound],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_replace_outbound_failure(&self) {
+        self.fail_replace_outbound.set(true);
     }
 
     pub(crate) fn confirm_ack(&self, ack_id: &str, message_ids: &[String]) -> anyhow::Result<()> {

@@ -105,6 +105,7 @@ cargo run -p client -- --user alice  # Run client (production server is default)
 
 ## Client Crypto Rules
 
+- **Signed prekeys rotate every 30 days** — the server retains the current and previous public keys, while the client retains the current and three previous private keys so queued first messages remain decryptable. New PreKey messages must reference a signed prekey still retained by the server.
 - **Never display unauthenticated content as message text** — when decryption fails, show `[undecryptable message]`, never base64-decode the ciphertext as a fallback. A malicious server can inject arbitrary text otherwise.
 - **Check plaintext size before encrypting** — the Double Ratchet advances irreversibly on `encrypt()`. If the ciphertext is then rejected as too large, the ratchet is desynchronized. Estimate the ciphertext size from plaintext length first.
 - **Identity key files must use restricted permissions** — `0o600` on Unix. `fs::write` defaults to `0o644` which is world-readable. Use `OpenOptionsExt::mode()`.

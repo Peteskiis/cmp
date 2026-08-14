@@ -211,13 +211,11 @@ pub(crate) async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
     print_banner(user_id, server_url);
 
     let (mut terminal, _guard) = ui::init()?;
-    let mut app = App::new(validated_uid, crypto, db);
-    if app.db.is_none() {
-        app.status("warning: message history unavailable");
-    }
-    app.chat_history
-        .push(ChatEntry::Tip("Tip: type / for commands".to_owned()));
+    let mut app = initialized_app(validated_uid, crypto, db);
     let mut event_stream = EventStream::new();
+    let mut lifecycle_tick = tokio::time::interval(Duration::from_mins(1));
+    lifecycle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    lifecycle_tick.tick().await;
 
     while app.running {
         let term_width = terminal.size()?.width as usize;
@@ -266,10 +264,27 @@ pub(crate) async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
             () = status_tick => {
                 app.status_bar.tick();
             }
+            _ = lifecycle_tick.tick() => {
+                prekeys::handle_lifecycle_tick(&mut app, &outgoing_tx);
+            }
         }
     }
 
     Ok(())
+}
+
+fn initialized_app(
+    user_id: UserId,
+    crypto: CryptoManager,
+    db: Option<rusqlite::Connection>,
+) -> App {
+    let mut app = App::new(user_id, crypto, db);
+    if app.db.is_none() {
+        app.status("warning: message history unavailable");
+    }
+    app.chat_history
+        .push(ChatEntry::Tip("Tip: type / for commands".to_owned()));
+    app
 }
 
 fn print_banner(user_id: &str, server_url: &str) {
@@ -557,6 +572,7 @@ fn handle_app_event(
             app.authenticated = true;
             app.status_bar
                 .set_connection(ConnectionStatus::Authenticated(Instant::now()));
+            prekeys::queue_signed_prekey_rotation(app);
             for pending in app.crypto.pending_messages() {
                 let _ = outgoing_tx.send(pending);
             }
@@ -729,45 +745,27 @@ fn handle_server_message(
                 InboundDecrypt::Failed => {}
             }
         }
-        ServerMessage::PreKeyLow { remaining } => match app.crypto.queue_prekey_replenishment() {
-            Ok(upload) => {
-                let _ = outgoing_tx.send(upload);
-                app.status(&format!(
-                    "replenishing one-time pre-keys ({remaining} remaining)"
-                ));
-            }
-            Err(error) => {
-                app.status(&format!("pre-key replenishment failed: {error}"));
-            }
-        },
+        ServerMessage::PreKeyLow { remaining } => {
+            prekeys::handle_prekey_low(app, outgoing_tx, remaining);
+        }
         ServerMessage::PreKeysUploaded {
             upload_id,
             accepted,
             remaining,
-        } => {
-            match app
-                .crypto
-                .confirm_prekeys_uploaded(&upload_id, accepted, remaining)
-            {
-                Ok(replacement) => {
-                    if let Some(upload) = replacement {
-                        let _ = outgoing_tx.send(upload);
-                    }
-                    if accepted {
-                        app.status(&format!(
-                            "one-time pre-keys replenished ({remaining} available)"
-                        ));
-                    } else {
-                        app.status(&format!(
-                            "pre-key upload rejected ({remaining} already available)"
-                        ));
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!("failed to confirm durable pre-key upload: {error}");
-                }
-            }
-        }
+        } => prekeys::handle_prekeys_uploaded(app, outgoing_tx, &upload_id, accepted, remaining),
+        ServerMessage::SignedPreKeyRotated {
+            rotation_id,
+            accepted,
+            previously_accepted,
+            current_key_id,
+        } => prekeys::handle_signed_prekey_rotated(
+            app,
+            outgoing_tx,
+            &rotation_id,
+            accepted,
+            previously_accepted,
+            current_key_id,
+        ),
         ServerMessage::Error { message, .. } => {
             app.status(&format!("server error: {message}"));
         }

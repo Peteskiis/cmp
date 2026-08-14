@@ -10,6 +10,10 @@ pub const ONE_TIME_PREKEY_PUBLIC_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 pub const ONE_TIME_PREKEY_PRIVATE_RETENTION_SECS: u64 = 61 * 24 * 60 * 60;
 pub const ONE_TIME_PREKEY_RESERVATION_SECS: u64 = 24 * 60 * 60;
 
+/// Signed pre-keys rotate monthly. Implementations retain prior keys long enough
+/// to decrypt first messages accepted during the previous key's lifetime.
+pub const SIGNED_PREKEY_ROTATION_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Maximum message IDs in a single Ack batch.
 pub const MAX_ACK_BATCH: usize = 1000;
 

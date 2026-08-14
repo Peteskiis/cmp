@@ -28,6 +28,12 @@ pub(super) enum PendingOutbound {
         upload_id: MessageId,
         prekeys: Vec<OneTimePreKey>,
     },
+    SignedPreKeyRotation {
+        rotation_id: MessageId,
+        key_id: u32,
+        public_key: String,
+        signature: String,
+    },
 }
 
 impl PendingOutbound {
@@ -70,6 +76,18 @@ impl PendingOutbound {
                 upload_id: upload_id.clone(),
                 prekeys: prekeys.clone(),
             },
+            Self::SignedPreKeyRotation {
+                rotation_id,
+                key_id,
+                public_key,
+                signature,
+                ..
+            } => ClientMessage::RotateSignedPreKey {
+                rotation_id: rotation_id.clone(),
+                key_id: *key_id,
+                public_key: public_key.clone(),
+                signature: signature.clone(),
+            },
         }
     }
 
@@ -81,6 +99,11 @@ impl PendingOutbound {
             Self::Ack { message_ids, .. } => message_ids.len() * 36,
             Self::ReadReceiptAck { receipt_ids, .. } => receipt_ids.len() * 36,
             Self::PreKeyUpload { prekeys, .. } => prekeys.len() * 48,
+            Self::SignedPreKeyRotation {
+                public_key,
+                signature,
+                ..
+            } => public_key.len() + signature.len(),
         }
     }
 
@@ -90,6 +113,7 @@ impl PendingOutbound {
             Self::ReadReceipt { receipt_id, .. } => receipt_id.to_string(),
             Self::Ack { ack_id, .. } | Self::ReadReceiptAck { ack_id, .. } => ack_id.to_string(),
             Self::PreKeyUpload { upload_id, .. } => upload_id.to_string(),
+            Self::SignedPreKeyRotation { rotation_id, .. } => rotation_id.to_string(),
         }
     }
 }

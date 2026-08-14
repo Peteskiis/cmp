@@ -228,3 +228,61 @@ async fn prekey_upload_is_correlated_capped_and_idempotent() {
         } if upload_id == accepted_id
     ));
 }
+
+#[tokio::test]
+async fn signed_prekey_rotation_is_authenticated_idempotent_and_published() {
+    let (url, _handle) = start_test_server().await;
+    let (mut alice_sink, mut alice_stream) = connect(&url).await;
+    let alice_identity = register_identity(&mut alice_sink, &mut alice_stream, "alice").await;
+    let signed_prekey = crypto::keys::SignedPreKey::generate(1, &alice_identity);
+    let rotation_id = MessageId::new();
+    let rotation = ClientMessage::RotateSignedPreKey {
+        rotation_id: rotation_id.clone(),
+        key_id: signed_prekey.key_id(),
+        public_key: B64.encode(signed_prekey.public().as_bytes()),
+        signature: B64.encode(signed_prekey.signature().to_bytes()),
+    };
+    for _ in 0..2 {
+        send(&mut alice_sink, &rotation).await;
+        assert!(matches!(
+            recv(&mut alice_stream).await,
+            ServerMessage::SignedPreKeyRotated {
+                rotation_id: response_id,
+                accepted: true,
+                previously_accepted: false,
+                current_key_id: 1,
+            } if response_id == rotation_id
+        ));
+    }
+
+    send(
+        &mut alice_sink,
+        &ClientMessage::RotateSignedPreKey {
+            rotation_id: MessageId::new(),
+            key_id: 2,
+            public_key: B64.encode([9_u8; 32]),
+            signature: B64.encode([0_u8; 64]),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut alice_stream).await,
+        ServerMessage::Error { code: 400, .. }
+    ));
+
+    let (mut bob_sink, mut bob_stream) = connect(&url).await;
+    register(&mut bob_sink, &mut bob_stream, "bob").await;
+    send(
+        &mut bob_sink,
+        &ClientMessage::FetchPreKeyBundle {
+            target_user_id: UserId::new("alice").unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut bob_stream).await,
+        ServerMessage::PreKeyBundleResponse { bundle, .. }
+            if bundle.signed_prekey_id == 1
+                && bundle.signed_prekey == B64.encode(signed_prekey.public().as_bytes())
+    ));
+}
