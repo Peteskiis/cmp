@@ -2,7 +2,7 @@ use super::*;
 use tempfile::TempDir;
 
 /// Set up Alice and Bob `CryptoManager` instances with registration keys.
-pub(super) fn setup_alice_and_bob() -> (CryptoManager, CryptoManager, TempDir, TempDir) {
+pub(crate) fn setup_alice_and_bob() -> (CryptoManager, CryptoManager, TempDir, TempDir) {
     let alice_dir = TempDir::new().unwrap();
     let bob_dir = TempDir::new().unwrap();
 

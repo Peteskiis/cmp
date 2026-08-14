@@ -46,8 +46,8 @@ permissions, not encryption at rest. They include plaintext message history and
 live cryptographic state. Malware, a compromised user account, root access,
 unsafe backups, terminal capture, or an unlocked device can expose them.
 
-Identity keys use trust on first use. A user must compare `/verify` safety
-numbers out of band to detect an incorrect first key or a later identity
+Identity keys use trust on first use. A user must open the safety-number view
+and compare it out of band to detect an incorrect first key or a later identity
 change. CMP has no certificate authority or account-recovery authority.
 
 ## Cryptographic lifecycle

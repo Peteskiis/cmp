@@ -1,7 +1,6 @@
 #![cfg_attr(test, allow(clippy::panic))]
 
 mod app;
-mod command_popup;
 mod crypto_decode;
 mod crypto_mgr;
 mod crypto_outbox;

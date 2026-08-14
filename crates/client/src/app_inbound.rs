@@ -36,10 +36,12 @@ pub(super) fn process_inbound(
         InboundDecrypt::Pending(text) => process_pending_inbound(app, inbound, sender, text),
         InboundDecrypt::Duplicate => (sender, inbound.message_id.clone(), true, false),
         InboundDecrypt::Failed => {
-            app.chat_history.push(ChatEntry::Received {
-                sender: sender.clone(),
-                text: "[undecryptable message]".to_owned(),
-            });
+            if is_active_peer(app, &sender) {
+                app.chat_history.push(ChatEntry::Received {
+                    sender: sender.clone(),
+                    text: "[undecryptable message]".to_owned(),
+                });
+            }
             (sender, inbound.message_id.clone(), false, false)
         }
     }
@@ -64,13 +66,19 @@ fn process_pending_inbound(
         tracing::warn!("failed to commit received message");
         return (sender, inbound.message_id.clone(), false, false);
     };
-    if inserted {
+    if inserted && is_active_peer(app, &sender) {
         app.chat_history.push(ChatEntry::Received {
             sender: sender.clone(),
             text,
         });
     }
     (sender, inbound.message_id.clone(), true, inserted)
+}
+
+fn is_active_peer(app: &App, peer_id: &str) -> bool {
+    app.target_user
+        .as_ref()
+        .is_some_and(|target| target.as_str() == peer_id)
 }
 
 fn commit_pending_inbound(
@@ -112,5 +120,45 @@ pub(super) fn accumulate_unread(app: &mut App, sender: String, message_id: Messa
     let entry = app.unread_messages.entry(sender).or_default();
     if entry.len() < consts::MAX_RECEIPT_BATCH {
         entry.push(message_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inactive_authenticated_message_stays_out_of_active_chat_until_selected() {
+        let (mut alice_crypto, bob_crypto, _alice_dir, bob_dir) =
+            crate::crypto_mgr::tests::setup_alice_and_bob();
+        let db = crate::db::open(&bob_dir.path().join("client.db")).unwrap();
+        let mut app = App::new(UserId::new("bob").unwrap(), bob_crypto, Some(db));
+        app.target_user = Some(UserId::new("carol").unwrap());
+        let message_id = MessageId::new();
+        let inbound = protocol::InboundMessage {
+            message_id: message_id.clone(),
+            sender_id: UserId::new("alice").unwrap(),
+            envelope: alice_crypto.encrypt("bob", b"private hello").unwrap(),
+            timestamp: 0,
+        };
+
+        let (sender, received_id, should_ack, fresh) = process_inbound(&mut app, &inbound);
+        if fresh {
+            accumulate_unread(&mut app, sender, received_id);
+        }
+
+        assert!(should_ack);
+        assert!(fresh);
+        assert!(app.chat_history.is_empty());
+        assert_eq!(app.unread_messages.get("alice"), Some(&vec![message_id]));
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        crate::app::open_conversation(&mut app, &tx, "alice").unwrap();
+
+        assert!(app.chat_history.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::Received { sender, text }
+                if sender == "alice" && text == "private hello"
+        )));
     }
 }

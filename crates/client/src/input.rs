@@ -1,464 +1,349 @@
-//! Keyboard event handling: key dispatch, input editing, history navigation.
+//! Focus-aware keyboard and paste handling for the full-screen interface.
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use protocol::ClientMessage;
 use tokio::sync::mpsc;
+use tui_textarea::{TextArea, WrapMode};
 
-use crate::app::App;
-use crate::command_popup::PopupAction;
-use crate::ui;
+use crate::app::{App, Focus, Modal};
 
-#[allow(
-    clippy::cognitive_complexity,
-    clippy::needless_pass_by_value,
-    clippy::too_many_lines
-)]
 pub(crate) fn handle_key_event(
     app: &mut App,
-    terminal: &ui::Term,
     outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
     event: Event,
 ) -> anyhow::Result<()> {
-    if let Event::Paste(text) = event {
-        let byte_pos = app
-            .input
-            .char_indices()
-            .nth(app.cursor_pos)
-            .map_or(app.input.len(), |(i, _)| i);
-        app.input.insert_str(byte_pos, &text);
-        app.cursor_pos += text.chars().count();
-        app.history_index = None;
-        app.sync_command_popup();
-        return Ok(());
-    }
-    let Event::Key(key) = event else {
-        return Ok(());
-    };
-
-    // Intercept keys when the command popup is active
-    if let Some(popup) = &mut app.command_popup {
-        match popup.handle_key(key.code) {
-            PopupAction::Consumed => return Ok(()),
-            PopupAction::Complete(text) => {
-                app.input = text;
-                app.cursor_pos = app.input.chars().count();
-                app.command_popup = None;
-                return Ok(());
-            }
-            PopupAction::Submit(text) => {
-                app.input = text;
-                app.cursor_pos = app.input.chars().count();
-                app.command_popup = None;
-                // Fall through to Enter handling below
-            }
-            PopupAction::Dismiss => {
-                app.command_popup = None;
-                return Ok(());
-            }
-            PopupAction::PassThrough => {} // continue to normal key handling
-        }
-    }
-
-    match (key.code, key.modifiers) {
-        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-            app.running = false;
-        }
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-            if app.input.is_empty() {
-                app.running = false;
-            } else {
-                app.discard_input();
-            }
-        }
-        // Plain Enter → submit
-        (KeyCode::Enter, KeyModifiers::NONE) => {
-            crate::app::handle_enter(app, outgoing_tx)?;
-        }
-        // Modified Enter (Shift/Alt) or Ctrl+J → insert newline
-        (KeyCode::Enter, _) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
-            app.insert_at_cursor('\n');
-        }
-        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-            if app.cursor_pos > 0 {
-                let target = line_start_pos(&app.input, app.cursor_pos);
-                delete_char_range(app, target, app.cursor_pos);
-            }
-        }
-        (KeyCode::Backspace, m) if m.contains(KeyModifiers::ALT) => {
-            if app.cursor_pos > 0 {
-                let old = app.cursor_pos;
-                word_jump_left(app);
-                delete_char_range(app, app.cursor_pos, old);
-            }
-        }
-        (KeyCode::Backspace, _) => {
-            if app.cursor_pos > 0 {
-                delete_char_range(app, app.cursor_pos - 1, app.cursor_pos);
-            }
-        }
-        // Alt+Left or Alt+b: jump word left
-        (KeyCode::Left, m) if m.contains(KeyModifiers::ALT) => {
-            word_jump_left(app);
-        }
-        (KeyCode::Char('b'), KeyModifiers::ALT) => {
-            word_jump_left(app);
-        }
-        // Alt+Right or Alt+f: jump word right
-        (KeyCode::Right, m) if m.contains(KeyModifiers::ALT) => {
-            word_jump_right(app);
-        }
-        (KeyCode::Char('f'), KeyModifiers::ALT) => {
-            word_jump_right(app);
-        }
-        // Ctrl+A / Home: start of current line
-        (KeyCode::Char('a'), KeyModifiers::CONTROL) | (KeyCode::Home, _) => {
-            app.cursor_pos = line_start_pos(&app.input, app.cursor_pos);
-        }
-        (KeyCode::Char('e'), KeyModifiers::CONTROL) | (KeyCode::End, _) => {
-            app.cursor_pos = line_end_pos(&app.input, app.cursor_pos);
-        }
-        (KeyCode::Left, _) => {
-            if app.cursor_pos > 0 {
-                app.cursor_pos -= 1;
-            }
-        }
-        (KeyCode::Right, _) => {
-            if app.cursor_pos < app.input.chars().count() {
-                app.cursor_pos += 1;
-            }
-        }
-        (KeyCode::Up, _) => {
-            let width = terminal.size()?.width as usize;
-            let max_cols = width.saturating_sub(ui::PREFIX_WIDTH);
-            let (lines, starts) = ui::wrap_input(&app.input, max_cols);
-            let (row, col) = ui::cursor_visual_pos(app.cursor_pos, &starts);
-            if row > 0 {
-                app.cursor_pos = ui::visual_to_cursor(row - 1, col, &starts, &lines);
-            } else {
-                history_back(app);
-            }
-        }
-        (KeyCode::Down, _) => {
-            let width = terminal.size()?.width as usize;
-            let max_cols = width.saturating_sub(ui::PREFIX_WIDTH);
-            let (lines, starts) = ui::wrap_input(&app.input, max_cols);
-            let (row, col) = ui::cursor_visual_pos(app.cursor_pos, &starts);
-            if row + 1 < lines.len() {
-                app.cursor_pos = ui::visual_to_cursor(row + 1, col, &starts, &lines);
-            } else {
-                history_forward(app);
-            }
-        }
-        (KeyCode::Char(c), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
-            app.insert_at_cursor(c);
-
-            // Send typing indicator (debounced, only if session exists)
-            if let Some(ref target) = app.target_user
-                && target.as_str() != app.user_id.as_str()
-                && app.crypto.has_session(target.as_str())
-            {
-                let now = Instant::now();
-                let should_send = app
-                    .last_typing_sent
-                    .is_none_or(|t| now.duration_since(t) > Duration::from_secs(3));
-                if should_send {
-                    let _ = outgoing_tx.send(ClientMessage::Typing {
-                        recipient_id: target.clone(),
-                    });
-                    app.last_typing_sent = Some(now);
-                }
-            }
+    match event {
+        Event::Paste(text) => handle_paste(app, outgoing_tx, &text),
+        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            handle_key(app, outgoing_tx, key)?;
         }
         _ => {}
-    }
-    // Exit history browsing only on keys that actually mutate input.
-    // Ctrl+A/E, Alt+b/f are navigation — they should not exit history mode.
-    let is_edit_key = matches!(
-        (key.code, key.modifiers),
-        (KeyCode::Char(_), m) if m.is_empty() || m == KeyModifiers::SHIFT
-    ) || matches!(
-        key.code,
-        KeyCode::Backspace | KeyCode::Delete | KeyCode::Enter | KeyCode::Tab
-    ) || matches!(
-        (key.code, key.modifiers),
-        (KeyCode::Char('u' | 'j'), KeyModifiers::CONTROL)
-    );
-    if app.history_index.is_some() && is_edit_key {
-        app.history_index = None;
-    }
-    // Don't show the command popup while browsing history — it would
-    // intercept up/down arrows and block further history navigation.
-    if app.history_index.is_some() {
-        app.command_popup = None;
-    } else {
-        app.sync_command_popup();
     }
     Ok(())
 }
 
-/// Delete characters in `[from, to)` by char index and set cursor to `from`.
-fn delete_char_range(app: &mut App, from: usize, to: usize) {
-    let start_byte = app
-        .input
-        .char_indices()
-        .nth(from)
-        .map_or(app.input.len(), |(i, _)| i);
-    let end_byte = app
-        .input
-        .char_indices()
-        .nth(to)
-        .map_or(app.input.len(), |(i, _)| i);
-    app.input.replace_range(start_byte..end_byte, "");
-    app.cursor_pos = from;
-}
-
-fn line_start_pos(input: &str, cursor: usize) -> usize {
-    let chars: Vec<char> = input.chars().collect();
-    let mut pos = cursor;
-    while pos > 0 && chars[pos - 1] != '\n' {
-        pos -= 1;
-    }
-    pos
-}
-
-fn line_end_pos(input: &str, cursor: usize) -> usize {
-    let chars: Vec<char> = input.chars().collect();
-    let len = chars.len();
-    let mut pos = cursor;
-    while pos < len && chars[pos] != '\n' {
-        pos += 1;
-    }
-    pos
-}
-
-fn word_jump_left(app: &mut App) {
-    let chars: Vec<char> = app.input.chars().collect();
-    let mut pos = app.cursor_pos;
-    while pos > 0 && chars[pos - 1].is_whitespace() {
-        pos -= 1;
-    }
-    while pos > 0 && !chars[pos - 1].is_whitespace() {
-        pos -= 1;
-    }
-    app.cursor_pos = pos;
-}
-
-fn word_jump_right(app: &mut App) {
-    let chars: Vec<char> = app.input.chars().collect();
-    let len = chars.len();
-    let mut pos = app.cursor_pos;
-    while pos < len && !chars[pos].is_whitespace() {
-        pos += 1;
-    }
-    while pos < len && chars[pos].is_whitespace() {
-        pos += 1;
-    }
-    app.cursor_pos = pos;
-}
-
-fn history_back(app: &mut App) {
-    if app.input_history.is_empty() {
+fn handle_paste(app: &mut App, outgoing_tx: &mpsc::UnboundedSender<ClientMessage>, text: &str) {
+    if let Some(Modal::NewChat(input)) = &mut app.modal {
+        input.insert_str(text.replace(['\r', '\n'], ""));
         return;
     }
-    let new_idx = match app.history_index {
-        None => {
-            app.history_draft = app.input.clone();
-            app.input_history.len() - 1
+    if app.modal.is_none() && app.focus == Focus::Composer && app.composer.insert_str(text) {
+        composer_changed(app, outgoing_tx);
+    }
+}
+
+fn handle_key(
+    app: &mut App,
+    outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
+    key: KeyEvent,
+) -> anyhow::Result<()> {
+    if matches!(
+        (key.code, key.modifiers),
+        (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL)
+    ) {
+        app.running = false;
+        return Ok(());
+    }
+
+    if app.modal.is_some() {
+        handle_modal_key(app, outgoing_tx, key);
+        return Ok(());
+    }
+    if key.code == KeyCode::Char('n') && key.modifiers == KeyModifiers::CONTROL {
+        app.modal = Some(Modal::NewChat(new_chat_input()));
+        return Ok(());
+    }
+    if key.code == KeyCode::F(2) {
+        crate::app::show_verification(app, "view");
+        return Ok(());
+    }
+
+    match key.code {
+        KeyCode::F(1) => app.modal = Some(Modal::Help),
+        KeyCode::PageUp => app.message_scroll = app.message_scroll.saturating_add(10),
+        KeyCode::PageDown => app.message_scroll = app.message_scroll.saturating_sub(10),
+        KeyCode::End if key.modifiers.is_empty() => app.message_scroll = 0,
+        _ => match app.focus {
+            Focus::Conversations => handle_conversation_key(app, outgoing_tx, key)?,
+            Focus::Composer => handle_composer_key(app, outgoing_tx, key),
+        },
+    }
+    Ok(())
+}
+
+fn handle_modal_key(
+    app: &mut App,
+    outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
+    key: KeyEvent,
+) {
+    if key.code == KeyCode::Esc {
+        app.modal = None;
+        return;
+    }
+
+    match app.modal.as_mut() {
+        Some(Modal::NewChat(input)) => {
+            if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+                let target = input.lines().join("").trim().to_owned();
+                if target.is_empty() {
+                    return;
+                }
+                app.modal = None;
+                if let Err(error) = crate::app::open_conversation(app, outgoing_tx, &target) {
+                    app.status(&format!("invalid username: {error}"));
+                }
+            } else {
+                input.input(key);
+            }
         }
-        Some(0) => return,
-        Some(i) => i - 1,
-    };
-    app.history_index = Some(new_idx);
-    app.input.clone_from(&app.input_history[new_idx]);
-    app.cursor_pos = app.input.chars().count();
-    app.input_scroll = 0;
+        Some(Modal::Help) => {
+            if matches!(key.code, KeyCode::F(1) | KeyCode::Char('?')) {
+                app.modal = None;
+            }
+        }
+        Some(Modal::Verification(_)) => match key.code {
+            KeyCode::Char('y') => crate::app::show_verification(app, "confirm"),
+            KeyCode::Char('x') => crate::app::show_verification(app, "clear"),
+            _ => {}
+        },
+        None => {}
+    }
 }
 
-fn history_forward(app: &mut App) {
-    let Some(idx) = app.history_index else {
+fn handle_conversation_key(
+    app: &mut App,
+    outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
+    key: KeyEvent,
+) -> anyhow::Result<()> {
+    let peers = app.conversations();
+    match key.code {
+        KeyCode::Up => move_conversation_selection(app, &peers, -1),
+        KeyCode::Down => move_conversation_selection(app, &peers, 1),
+        KeyCode::Enter => {
+            if let Some(peer) = &app.selected_conversation {
+                let peer = peer.clone();
+                crate::app::open_conversation(app, outgoing_tx, &peer)?;
+            }
+        }
+        KeyCode::Tab | KeyCode::Esc => app.focus = Focus::Composer,
+        KeyCode::Char('n') => app.modal = Some(Modal::NewChat(new_chat_input())),
+        KeyCode::Char('?') => app.modal = Some(Modal::Help),
+        KeyCode::Char('v') => crate::app::show_verification(app, "view"),
+        KeyCode::Char('q') => app.running = false,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_composer_key(
+    app: &mut App,
+    outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
+    key: KeyEvent,
+) {
+    match (key.code, key.modifiers) {
+        (KeyCode::Tab | KeyCode::Esc, _) => {
+            app.focus = Focus::Conversations;
+            sync_conversation_cursor(app);
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => crate::app::handle_enter(app, outgoing_tx),
+        (KeyCode::Enter, _) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+            app.composer.insert_newline();
+            composer_changed(app, outgoing_tx);
+        }
+        _ => {
+            if app.composer.input(key) {
+                composer_changed(app, outgoing_tx);
+            }
+        }
+    }
+}
+
+fn new_chat_input() -> Box<TextArea<'static>> {
+    let mut input = TextArea::default();
+    input.set_wrap_mode(WrapMode::None);
+    input.set_max_rows(3);
+    input.set_tab_length(0);
+    Box::new(input)
+}
+
+fn sync_conversation_cursor(app: &mut App) {
+    app.selected_conversation = app
+        .target_user
+        .as_ref()
+        .map(|active| active.as_str().to_owned())
+        .or_else(|| app.conversations().first().cloned());
+}
+
+fn move_conversation_selection(app: &mut App, peers: &[String], offset: isize) {
+    if peers.is_empty() {
+        app.selected_conversation = None;
+        return;
+    }
+    let current = app
+        .selected_conversation
+        .as_ref()
+        .and_then(|selected| peers.iter().position(|peer| peer == selected))
+        .unwrap_or(0);
+    let next = current
+        .saturating_add_signed(offset)
+        .min(peers.len().saturating_sub(1));
+    app.selected_conversation = peers.get(next).cloned();
+}
+
+fn composer_changed(app: &mut App, outgoing_tx: &mpsc::UnboundedSender<ClientMessage>) {
+    app.notice = None;
+    let Some(target) = &app.target_user else {
         return;
     };
-    if idx + 1 < app.input_history.len() {
-        let new_idx = idx + 1;
-        app.history_index = Some(new_idx);
-        app.input.clone_from(&app.input_history[new_idx]);
-    } else {
-        app.history_index = None;
-        app.input.clone_from(&app.history_draft);
-        app.history_draft.clear();
+    if target.as_str() == app.user_id.as_str() || !app.crypto.has_session(target.as_str()) {
+        return;
     }
-    app.cursor_pos = app.input.chars().count();
-    app.input_scroll = 0;
-}
-
-pub(crate) fn show_keybindings(app: &mut App) {
-    app.status("keyboard shortcuts:");
-    app.status("  Enter          send message");
-    app.status("  Shift+Enter    insert newline");
-    app.status("  Up / Down      input history");
-    app.status("  Ctrl+C         clear input / quit");
-    app.status("  Ctrl+D         quit");
-    app.status("  Ctrl+A         start of line");
-    app.status("  Ctrl+E         end of line");
-    app.status("  Ctrl+U         delete to line start");
-    app.status("  Alt+Backspace  delete word");
-    app.status("  Alt+b / Alt+f  jump word left / right");
-    app.status("  Ctrl+J         insert newline (alt)");
+    let now = Instant::now();
+    if app
+        .last_typing_sent
+        .is_none_or(|sent| now.duration_since(sent) > Duration::from_secs(3))
+    {
+        let _ = outgoing_tx.send(ClientMessage::Typing {
+            recipient_id: target.clone(),
+        });
+        app.last_typing_sent = Some(now);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_app() -> App {
-        let uid = protocol::UserId::new("testuser").unwrap();
+    fn make_app() -> (App, tempfile::TempDir) {
         let data_dir = tempfile::tempdir().unwrap();
         let crypto = crate::crypto_mgr::CryptoManager::load_or_generate(data_dir.path()).unwrap();
-        App::new(uid, crypto, None)
+        let user = protocol::UserId::new("alice").unwrap();
+        (App::new(user, crypto, None), data_dir)
     }
 
     #[test]
-    fn line_start_pos_single_line() {
-        assert_eq!(line_start_pos("hello world", 5), 0);
-        assert_eq!(line_start_pos("hello world", 0), 0);
+    fn new_chat_submission_flattens_unexpected_newlines() {
+        let mut input = new_chat_input();
+        input.insert_str("alice\nbob");
+        assert_eq!(input.lines(), ["alice", "bob"]);
+        let submitted = input.lines().join("");
+        assert_eq!(submitted, "alicebob");
     }
 
     #[test]
-    fn line_start_pos_multiline() {
-        assert_eq!(line_start_pos("first\nsecond\nthird", 8), 6);
-        assert_eq!(line_start_pos("first\nsecond\nthird", 6), 6);
+    fn enter_without_conversation_preserves_draft() {
+        let (mut app, _dir) = make_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.composer.insert_str("do not lose me");
+
+        handle_key_event(
+            &mut app,
+            &tx,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .unwrap();
+
+        assert_eq!(app.composer_text(), "do not lose me");
+        assert_eq!(
+            app.notice_text(),
+            Some("choose a conversation before sending")
+        );
     }
 
     #[test]
-    fn line_end_pos_single_line() {
-        assert_eq!(line_end_pos("hello world", 5), 11);
-        assert_eq!(line_end_pos("hello world", 11), 11);
+    fn shift_enter_inserts_newline_in_composer() {
+        let (mut app, _dir) = make_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.composer.insert_str("first line");
+
+        handle_key_event(
+            &mut app,
+            &tx,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+        )
+        .unwrap();
+
+        assert_eq!(app.composer.lines(), ["first line", ""]);
     }
 
     #[test]
-    fn line_end_pos_multiline() {
-        assert_eq!(line_end_pos("first\nsecond\nthird", 2), 5);
-        assert_eq!(line_end_pos("first\nsecond\nthird", 8), 12);
+    fn control_n_opens_new_conversation_from_composer() {
+        let (mut app, _dir) = make_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        handle_key_event(
+            &mut app,
+            &tx,
+            Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+        )
+        .unwrap();
+
+        assert!(matches!(app.modal, Some(Modal::NewChat(_))));
     }
 
     #[test]
-    fn word_jump_left_basics() {
-        let mut app = make_app();
-        app.input = "hello world foo".into();
-        app.cursor_pos = 15;
-        word_jump_left(&mut app);
-        assert_eq!(app.cursor_pos, 12);
-        word_jump_left(&mut app);
-        assert_eq!(app.cursor_pos, 6);
-        word_jump_left(&mut app);
-        assert_eq!(app.cursor_pos, 0);
-        word_jump_left(&mut app);
-        assert_eq!(app.cursor_pos, 0);
+    fn conversation_selection_survives_database_reordering() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let crypto = crate::crypto_mgr::CryptoManager::load_or_generate(data_dir.path()).unwrap();
+        let db = crate::db::open(&data_dir.path().join("client.db")).unwrap();
+        crate::db::insert_message(
+            &db,
+            "bob",
+            crate::db::MessageDirection::Received,
+            "m1",
+            "hello",
+        )
+        .unwrap();
+        let user = protocol::UserId::new("alice").unwrap();
+        let mut app = App::new(user, crypto, Some(db));
+        app.focus = Focus::Conversations;
+        app.selected_conversation = Some("bob".to_owned());
+        crate::db::insert_message(
+            app.db.as_ref().unwrap(),
+            "carol",
+            crate::db::MessageDirection::Received,
+            "m2",
+            "newer",
+        )
+        .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        handle_key_event(
+            &mut app,
+            &tx,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            app.target_user.as_ref().map(protocol::UserId::as_str),
+            Some("bob")
+        );
     }
 
     #[test]
-    fn word_jump_right_basics() {
-        let mut app = make_app();
-        app.input = "hello world foo".into();
-        app.cursor_pos = 0;
-        word_jump_right(&mut app);
-        assert_eq!(app.cursor_pos, 6);
-        word_jump_right(&mut app);
-        assert_eq!(app.cursor_pos, 12);
-        word_jump_right(&mut app);
-        assert_eq!(app.cursor_pos, 15);
-    }
+    fn pending_new_conversation_remains_visible_and_selectable() {
+        let (mut app, _dir) = make_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        crate::app::open_conversation(&mut app, &tx, "bob").unwrap();
 
-    #[test]
-    fn delete_char_range_middle() {
-        let mut app = make_app();
-        app.input = "abcdef".into();
-        app.cursor_pos = 4;
-        delete_char_range(&mut app, 2, 4);
-        assert_eq!(app.input, "abef");
-        assert_eq!(app.cursor_pos, 2);
-    }
+        assert!(app.conversations().iter().any(|peer| peer == "bob"));
+        assert_eq!(app.selected_conversation.as_deref(), Some("bob"));
 
-    #[test]
-    fn delete_char_range_single() {
-        let mut app = make_app();
-        app.input = "abc".into();
-        app.cursor_pos = 2;
-        delete_char_range(&mut app, 1, 2);
-        assert_eq!(app.input, "ac");
-        assert_eq!(app.cursor_pos, 1);
-    }
+        app.target_user = None;
+        app.focus = Focus::Conversations;
+        handle_key_event(
+            &mut app,
+            &tx,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .unwrap();
 
-    #[test]
-    fn history_back_forward_cycle() {
-        let mut app = make_app();
-        app.input = "first".into();
-        app.clear_input();
-        app.input = "second".into();
-        app.clear_input();
-        app.input = "current draft".into();
-
-        // Up → second
-        history_back(&mut app);
-        assert_eq!(app.input, "second");
-        assert!(app.history_index.is_some());
-
-        // Up → first
-        history_back(&mut app);
-        assert_eq!(app.input, "first");
-
-        // Up at oldest → stays
-        history_back(&mut app);
-        assert_eq!(app.input, "first");
-
-        // Down → second
-        history_forward(&mut app);
-        assert_eq!(app.input, "second");
-
-        // Down past end → restore draft
-        history_forward(&mut app);
-        assert_eq!(app.input, "current draft");
-        assert!(app.history_index.is_none());
-    }
-
-    #[test]
-    fn history_empty_does_nothing() {
-        let mut app = make_app();
-        app.input = "some text".into();
-        app.cursor_pos = 9;
-        history_back(&mut app);
-        assert_eq!(app.input, "some text");
-        assert!(app.history_index.is_none());
-    }
-
-    #[test]
-    fn history_dedup() {
-        let mut app = make_app();
-        app.input = "same".into();
-        app.clear_input();
-        app.input = "same".into();
-        app.clear_input();
-        assert_eq!(app.input_history.len(), 1);
-    }
-
-    #[test]
-    fn discard_input_does_not_save() {
-        let mut app = make_app();
-        app.input = "discarded".into();
-        app.discard_input();
-        assert!(app.input_history.is_empty());
-    }
-
-    #[test]
-    fn history_eviction_at_capacity() {
-        let mut app = make_app();
-        for i in 0..App::MAX_INPUT_HISTORY + 10 {
-            app.input = format!("msg {i}");
-            app.clear_input();
-        }
-        assert_eq!(app.input_history.len(), App::MAX_INPUT_HISTORY);
-        assert_eq!(app.input_history[0], "msg 10");
+        assert_eq!(
+            app.target_user.as_ref().map(protocol::UserId::as_str),
+            Some("bob")
+        );
     }
 }

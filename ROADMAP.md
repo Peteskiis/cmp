@@ -252,7 +252,7 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [x] `CryptoManager` — manages identity, sessions, encrypt/decrypt
 - [x] Persistent identity key (`~/.cmp/<user_id>/identity.key`, 0o600 permissions)
 - [x] Registration flow: generate identity key, signed prekey, 100 OPKs
-- [x] X3DH session init: `/chat <user>` → `FetchPreKeyBundle` → `init_session_from_bundle`
+- [x] X3DH session init: new conversation → `FetchPreKeyBundle` → `init_session_from_bundle`
 - [x] Alice sends `PreKey` header on first message (ephemeral key + SPK/OPK IDs)
 - [x] Bob handles `PreKey` messages via `init_session_from_prekey` + `bob_respond`
 - [x] Send: encrypt with Double Ratchet → `EncryptedEnvelope`
@@ -270,39 +270,33 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [x] `needs_registration()` guard (checks SPK presence, not first-launch)
 - [x] Bob-side X3DH tests (5 tests: happy path, forged PreKey, existing session, missing OPK, persistence)
 
-### Inline TUI (`ui.rs` + `app.rs`)
-- [x] `Viewport::Inline(INPUT_HEIGHT)` terminal setup (not full-screen)
-- [x] Raw mode with RAII `Drop` guard + panic hook (restores cursor style too)
-- [x] Input widget: dark bg `rgb(40,44,52)`, teal prompt `rgb(34,199,168)`, blinking cursor
-- [x] Placeholder text when input is empty
-- [x] Message rendering via `terminal.insert_before()`:
-  - [x] Your messages: `"› "` bold+dim prefix, dark background
-  - [x] Friend messages: `"• sender: "` dim prefix, plain background
-  - [x] Line wrapping with per-message-type prefix width
-- [x] Footer with keyboard hints
-- [x] Horizontal input scrolling for long messages
-- [x] Ctrl+modifier filtering (only printable chars inserted)
-- [ ] Adaptive background color (query terminal bg via crossterm)
-- [x] Input history (up/down arrow)
+### Full-screen TUI (`ui.rs` + `input.rs` + `app.rs`)
+- [x] Alternate-screen terminal setup with RAII and panic-safe restoration
+- [x] Responsive conversation list, active-chat header, message pane, composer, and footer
+- [x] Narrow-terminal single-pane layout and explicit minimum-size view
+- [x] `tui-textarea-2` multiline composer with Unicode wrapping, cursor movement, and paste
+- [x] Sent/right and received/left message alignment with viewport scrolling
+- [x] New-conversation, keyboard-help, and safety-number dialogs
+- [x] Conversation ordering from persisted message recency plus established sessions
+- [x] Unread badges without leaking inactive-peer messages into the active conversation
+- [x] Deterministic Ratatui `TestBackend` frame coverage
 
 ### App event loop (`app.rs`)
 - [x] `AppEvent` enum (Key, ServerMessage, Connected, Disconnected, AuthFailed)
 - [x] `App` struct owns `Terminal` exclusively
 - [x] `tokio::select!` loop: poll crossterm `EventStream` + network event channel
-- [x] Enter to send message (encrypt + send + insert_before for local echo)
-- [x] Display incoming messages (decrypt + insert_before)
+- [x] Enter to send message with immediate local echo
+- [x] Display authenticated incoming messages in the active conversation
 - [x] Connection status display
 - [x] Ctrl+D / Ctrl+C to quit (with raw mode cleanup)
-- [x] `/chat <username>` command with UserId validation
-- [x] `/quit` and `/q` command
-- [x] `/contacts` and `/c` command (shows session peers with active marker)
-- [x] `/help` and `/h` command
+- [x] Conversation-list navigation and validated new-conversation dialog
+- [x] Full-screen help and verification dialogs
 - [x] Typing indicators: debounced send (3s), peer display with auto-expire (5s)
 - [x] Delivery status display: ✓ sent (`MessageSent`), ✓✓ delivered (`MessageDelivered`)
 - [x] E2EE read receipts: encrypt message IDs via Double Ratchet, send on read, decrypt+display 👁
 
 ### Tests
-- [x] `wrap_message` unit tests (7 tests: empty, short, long, overflow, zero width)
+- [x] Full-screen wide, narrow, active-chat, and minimum-size render tests
 - [ ] Crypto store trait SQLite implementation tests
 - [ ] Network handler tests with mock WebSocket
 - [x] `cargo test -p client` passes (12 tests)
@@ -320,7 +314,7 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 
 ### Deferred (not M1 blockers)
 - [ ] SQLCipher-encrypted local database
-- [x] Message history persistence (SQLite, `/chat` reloads last 100 messages)
+- [x] Message history persistence (conversation selection reloads last 100 messages)
 - [ ] Adaptive terminal background color detection
 
 ---
@@ -358,7 +352,7 @@ Encrypted messaging service — milestone 1: 1:1 E2EE chat.
 - [x] Typing indicators (debounced, ephemeral relay, no queueing)
 - [x] Delivery receipts (server-generated on successful push)
 - [x] Read receipts (E2EE encrypted inside envelope, server can't see who read what)
-- [x] Safety number verification (`/verify`, `/verify confirm`, identity key change warnings)
+- [x] Safety number verification dialog with confirm/clear actions and identity-key warnings
 - [ ] Session reset UI
 - [x] TLS (wss://) for production server (rustls + ring)
 - [ ] Phone number auth (Signal/WhatsApp style OTP — SMS provider, phone-as-identity, server-side verification)

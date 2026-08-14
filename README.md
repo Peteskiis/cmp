@@ -69,9 +69,11 @@ cmp --user alice --server ws://127.0.0.1:3000/ws
 ```
 
 The first connection registers the username and its identity key. Later
-connections authenticate with that key. Inside the client, use `/chat <user>`
-to start a conversation, `/verify` to compare safety numbers out of band,
-`/contacts` to list known contacts, and `/keys` for shortcuts.
+connections authenticate with that key. The full-screen client lists existing
+conversations on the left. Press `n` from the list or `Ctrl+N` anywhere to start
+a conversation, `Tab` to move between the list and composer, `v` from the list
+or `F2` anywhere to compare safety numbers, and `F1` for all shortcuts. `Enter`
+sends a message and `Shift+Enter` inserts a newline.
 
 Client state is stored under `~/.cmp/<user>/`. It contains key material,
 ratchet state, durable encrypted outbox entries, and plaintext local message
