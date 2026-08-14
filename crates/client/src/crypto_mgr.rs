@@ -635,4 +635,4 @@ fn validate_pending_protocol_versions(pending: &[PendingOutbound]) -> anyhow::Re
 mod signed_prekey_tests;
 #[cfg(test)]
 #[path = "crypto_mgr_tests.rs"]
-mod tests;
+pub(crate) mod tests;

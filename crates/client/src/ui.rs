@@ -1,635 +1,525 @@
-use std::io::stdout;
+use std::io::{Stdout, stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossterm::cursor::SetCursorStyle;
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use ratatui::Terminal;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
+use ratatui::{Frame, Terminal};
 
-const INPUT_HEIGHT: u16 = 40;
-pub(crate) const PREFIX_WIDTH: usize = 3; // " › " or "   "
-const BG_DARK: Color = Color::Rgb(40, 44, 52);
-pub(crate) const ACCENT_COLOR: Color = Color::Rgb(34, 199, 168);
-const PLACEHOLDER_COLOR: Color = Color::Rgb(90, 90, 90);
+use crate::app::{App, ChatEntry, Focus, Modal};
 
-/// RAII guard that restores the terminal on drop.
-pub(crate) struct RawModeGuard;
+const ACCENT: Color = Color::Rgb(52, 211, 153);
+const SENT: Color = Color::Rgb(110, 231, 183);
+const MUTED: Color = Color::Rgb(120, 128, 140);
+const BORDER: Color = Color::Rgb(70, 78, 90);
+const MIN_WIDTH: u16 = 50;
+const MIN_HEIGHT: u16 = 14;
+const SIDEBAR_BREAKPOINT: u16 = 80;
 
-impl Drop for RawModeGuard {
+pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
+
+/// Restores the user's terminal even when the application returns an error.
+static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static KEYBOARD_FLAGS_PUSHED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) struct TerminalGuard;
+
+impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(stdout(), crossterm::event::DisableBracketedPaste);
-        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
-        // Move cursor above the status bar / spacer lines so the clear
-        // erases them too, not just the lines below the cursor.
-        let _ = execute!(
-            stdout(),
-            crossterm::cursor::MoveUp(3), // spacer + status bar + top padding
-            crossterm::style::ResetColor,
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown),
-        );
-        let _ = disable_raw_mode();
-        println!();
-        let _ = execute!(stdout(), SetCursorStyle::DefaultUserShape);
+        restore_terminal();
     }
 }
 
-pub(crate) type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
+fn restore_terminal() {
+    if !TERMINAL_ACTIVE.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let _ = disable_raw_mode();
+    if KEYBOARD_FLAGS_PUSHED.swap(false, Ordering::AcqRel) {
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(stdout(), DisableBracketedPaste, Show, LeaveAlternateScreen);
+}
 
-/// Set up the inline terminal viewport.
-pub(crate) fn init() -> anyhow::Result<(Term, RawModeGuard)> {
+pub(crate) fn init() -> anyhow::Result<(Term, TerminalGuard)> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(stdout(), crossterm::event::DisableBracketedPaste);
-        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
-        let _ = disable_raw_mode();
-        let _ = execute!(stdout(), SetCursorStyle::DefaultUserShape);
+        restore_terminal();
         original_hook(info);
     }));
 
     enable_raw_mode()?;
-    // Enable Kitty keyboard protocol so Shift+Enter is distinguishable from Enter.
-    // Fails silently on terminals that don't support it — Ctrl+J works as fallback.
-    let _ = execute!(
+    TERMINAL_ACTIVE.store(true, Ordering::Release);
+    let guard = TerminalGuard;
+    execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste, Hide)?;
+    if execute!(
         stdout(),
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    );
-    // Enable bracketed paste so multi-line paste arrives as a single Event::Paste
-    // instead of individual key events (which would trigger Enter = send).
-    let _ = execute!(stdout(), crossterm::event::EnableBracketedPaste);
-    let guard = RawModeGuard;
-
-    let backend = CrosstermBackend::new(stdout());
-    let terminal = Terminal::with_options(
-        backend,
-        ratatui::TerminalOptions {
-            viewport: ratatui::Viewport::Inline(INPUT_HEIGHT),
-        },
-    )?;
-
+    )
+    .is_ok()
+    {
+        KEYBOARD_FLAGS_PUSHED.store(true, Ordering::Release);
+    }
+    let terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     Ok((terminal, guard))
 }
 
-// ── Input wrapping helpers ──
-
-/// Wrap input text for the input widget using character-level wrapping.
-/// Returns `(visual_lines, line_start_char_indices)`.
-pub(crate) fn wrap_input(input: &str, max_cols: usize) -> (Vec<String>, Vec<usize>) {
-    if max_cols == 0 {
-        return (vec![input.to_owned()], vec![0]);
-    }
-
-    let mut lines = Vec::new();
-    let mut starts = Vec::new();
-    let mut current = String::new();
-    let mut line_start: usize = 0;
-    let mut char_idx: usize = 0;
-
-    for ch in input.chars() {
-        if ch == '\n' {
-            lines.push(std::mem::take(&mut current));
-            starts.push(line_start);
-            char_idx += 1;
-            line_start = char_idx;
-        } else {
-            current.push(ch);
-            char_idx += 1;
-            if current.chars().count() >= max_cols {
-                lines.push(std::mem::take(&mut current));
-                starts.push(line_start);
-                line_start = char_idx;
-            }
-        }
-    }
-    lines.push(current);
-    starts.push(line_start);
-
-    (lines, starts)
-}
-
-/// Map a cursor char index to visual `(row, col)`.
-pub(crate) fn cursor_visual_pos(cursor_pos: usize, line_starts: &[usize]) -> (usize, usize) {
-    for (i, &start) in line_starts.iter().enumerate().rev() {
-        if cursor_pos >= start {
-            return (i, cursor_pos - start);
-        }
-    }
-    (0, cursor_pos)
-}
-
-/// Map visual `(row, col)` back to a cursor char index.
-pub(crate) fn visual_to_cursor(
-    row: usize,
-    col: usize,
-    line_starts: &[usize],
-    lines: &[String],
-) -> usize {
-    if row >= lines.len() {
-        let last = lines.len() - 1;
-        return line_starts[last] + lines[last].chars().count();
-    }
-    let line_len = lines[row].chars().count();
-    line_starts[row] + col.min(line_len)
-}
-
-/// Maximum number of input lines visible in the viewport.
-/// Viewport rows minus spacer, status bar, top padding, bottom padding, and footer (5 rows).
-pub(crate) const fn max_visible_input_lines() -> usize {
-    (INPUT_HEIGHT as usize).saturating_sub(5)
-}
-
-/// Render a `ChatEntry` into display lines with optional background style.
-/// Single source of truth for message rendering — used by both viewport and scrollback.
-fn chat_entry_to_lines(
-    entry: &crate::app::ChatEntry,
-    width: u16,
-) -> Vec<(Line<'static>, Option<Style>)> {
-    let mut rows = Vec::new();
-    match entry {
-        crate::app::ChatEntry::Sent(text) => {
-            let wrapped = wrap_message(text, width, 2);
-            let sent_bg = Some(Style::default().bg(Color::Rgb(50, 54, 62)));
-            rows.push((Line::from(""), None));
-            for (i, lt) in wrapped.iter().enumerate() {
-                let pfx = if i == 0 {
-                    "\u{203a} ".to_owned()
-                } else {
-                    "  ".to_owned()
-                };
-                rows.push((
-                    Line::from(vec![
-                        Span::styled(
-                            pfx,
-                            Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
-                        ),
-                        Span::raw(lt.clone()),
-                    ]),
-                    sent_bg,
-                ));
-            }
-            rows.push((Line::from(""), None));
-        }
-        crate::app::ChatEntry::Received { sender, text } => {
-            let pw = 4 + sender.len();
-            let wrapped = wrap_message(text, width, pw);
-            rows.push((Line::from(""), None));
-            for (i, lt) in wrapped.iter().enumerate() {
-                let pfx = if i == 0 {
-                    format!("\u{2022} {sender}: ")
-                } else {
-                    " ".repeat(pw)
-                };
-                rows.push((
-                    Line::from(vec![
-                        Span::styled(pfx, Style::default().add_modifier(Modifier::DIM)),
-                        Span::raw(lt.clone()),
-                    ]),
-                    None,
-                ));
-            }
-            rows.push((Line::from(""), None));
-        }
-        crate::app::ChatEntry::Status(text) => {
-            rows.push((
-                Line::from(Span::styled(
-                    format!("  {text}"),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                None,
-            ));
-        }
-        crate::app::ChatEntry::Tip(text) => {
-            rows.push((
-                Line::from(Span::styled(
-                    format!("  {text}"),
-                    Style::default().fg(Color::White),
-                )),
-                None,
-            ));
-        }
-        crate::app::ChatEntry::Warning(text) => {
-            rows.push((
-                Line::from(Span::styled(
-                    format!("  \u{26a0} {text}"),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                )),
-                None,
-            ));
-        }
-    }
-    rows
-}
-
-/// Flush chat entries that exceed the visible area to terminal scrollback.
-#[allow(clippy::cast_possible_truncation)]
-pub(crate) fn flush_chat_to_scrollback(
-    terminal: &mut Term,
-    history: &mut Vec<crate::app::ChatEntry>,
-    max_chat_rows: usize,
-) -> anyhow::Result<()> {
-    if max_chat_rows == 0 || history.is_empty() {
-        return Ok(());
-    }
-
-    let width = terminal.size()?.width;
-
-    // Count display rows from the end (most recent), find where to cut
-    let mut rows_from_end: usize = 0;
-    let mut keep_from = 0;
-    for (i, entry) in history.iter().enumerate().rev() {
-        let entry_rows = chat_entry_to_lines(entry, width).len();
-        if rows_from_end + entry_rows > max_chat_rows {
-            keep_from = i + 1;
-            break;
-        }
-        rows_from_end += entry_rows;
-    }
-
-    if keep_from == 0 {
-        return Ok(());
-    }
-
-    // Flush oldest entries to scrollback via insert_before
-    let to_flush: Vec<crate::app::ChatEntry> = history.drain(..keep_from).collect();
-    for entry in &to_flush {
-        let lines = chat_entry_to_lines(entry, width);
-        #[allow(clippy::cast_possible_truncation)]
-        let height = lines.len() as u16;
-        if height == 0 {
-            continue;
-        }
-        terminal.insert_before(height, |buf| {
-            for (i, (line, bg)) in lines.iter().enumerate() {
-                let y = buf.area.y + i as u16;
-                let rect = Rect::new(buf.area.x, y, buf.area.width, 1);
-                if let Some(style) = bg {
-                    Paragraph::new(line.clone()).style(*style).render(rect, buf);
-                } else {
-                    line.clone().render(rect, buf);
-                }
-            }
-        })?;
-    }
-
+pub(crate) fn draw(terminal: &mut Term, app: &mut App) -> anyhow::Result<()> {
+    terminal.draw(|frame| render(frame, app))?;
     Ok(())
 }
 
-// ── Drawing ──
+fn render(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        render_too_small(frame, area);
+        return;
+    }
 
-/// Draw chat history + input, top-aligned in the viewport.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::too_many_lines,
-    clippy::too_many_arguments,
-    clippy::cognitive_complexity
-)]
-pub(crate) fn draw_input(
-    terminal: &mut Term,
-    history: &[crate::app::ChatEntry],
-    input_lines: &[String],
-    cursor_row: usize,
-    cursor_col: usize,
-    scroll: usize,
-    status_bar: &crate::status_bar::StatusBar,
-    command_popup: Option<&crate::command_popup::CommandPopup>,
-) -> anyhow::Result<()> {
-    terminal.draw(|frame| {
-        let area = frame.area();
-        let bg_style = Style::default().bg(BG_DARK);
+    let show_sidebar = area.width >= SIDEBAR_BREAKPOINT;
+    if !show_sidebar && app.focus == Focus::Conversations {
+        app.focus = Focus::Composer;
+    }
+    let columns = if show_sidebar {
+        Layout::horizontal([Constraint::Length(26), Constraint::Min(24)]).split(area)
+    } else {
+        Layout::horizontal([Constraint::Length(0), Constraint::Min(1)]).split(area)
+    };
 
-        let mut chat_rows: Vec<(Line<'_>, Option<Style>)> = Vec::new();
-        for entry in history {
-            chat_rows.extend(chat_entry_to_lines(entry, area.width));
-        }
+    if show_sidebar {
+        render_conversations(frame, columns[0], app);
+    }
+    render_chat(frame, columns[1], app, show_sidebar);
+    render_modal(frame, app);
+}
 
-        // Input gets priority — as it grows, chat shrinks (scrolls up)
-        let popup_height =
-            command_popup.map_or(0_u16, crate::command_popup::CommandPopup::row_count);
-        let footer_height = if popup_height > 0 {
-            popup_height
-        } else {
-            1_u16
+fn render_too_small(frame: &mut Frame<'_>, area: Rect) {
+    let message = Paragraph::new(vec![
+        Line::from("CMP needs a little more room").style(Style::default().bold()),
+        Line::from(format!("minimum: {MIN_WIDTH}x{MIN_HEIGHT}")).style(Style::default().fg(MUTED)),
+    ])
+    .alignment(Alignment::Center)
+    .block(Block::bordered().title(" CMP "));
+    frame.render_widget(message, area);
+}
+
+fn render_conversations(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let peers = app.conversations();
+    let items = peers.iter().map(|peer| {
+        let is_self = peer == app.user_id.as_str();
+        let verified = app
+            .db
+            .as_ref()
+            .and_then(|db| crate::db::get_verification(db, peer))
+            .is_some();
+        let unread = app.unread_messages.get(peer).map_or(0, Vec::len);
+        let label = if is_self { "Note to self" } else { peer };
+        let warning = app.identity_warnings.contains_key(peer);
+        let suffix = match (warning, verified, unread) {
+            (true, _, 0) => "  !".to_owned(),
+            (true, _, count) => format!("  ! {count}"),
+            (false, true, 0) => "  ✓".to_owned(),
+            (false, true, count) => format!("  ✓ {count}"),
+            (false, false, 0) => String::new(),
+            (false, false, count) => format!("  {count}"),
         };
-        let input_height = (input_lines.len() as u16)
-            .max(1)
-            .min(area.height.saturating_sub(4 + footer_height));
-        // non_chat = spacer(1) + status_bar(1) + top_pad(1) + input + bottom_pad(1) + footer
-        let non_chat = 1 + 1 + 1 + input_height + 1 + footer_height;
-        let chat_height = (chat_rows.len() as u16).min(area.height.saturating_sub(non_chat));
-
-        let chunks = Layout::vertical([
-            Constraint::Length(chat_height),
-            Constraint::Length(1),             // spacer above status bar
-            Constraint::Length(1),             // status bar
-            Constraint::Length(1),             // top padding (dark bg)
-            Constraint::Length(input_height),  // input
-            Constraint::Length(1),             // bottom padding (dark bg)
-            Constraint::Length(footer_height), // footer or popup
-            Constraint::Min(0),                // empty
-        ])
-        .split(area);
-
-        // Chat history
-        let chat_area = chunks[0];
-        let chat_skip = chat_rows.len().saturating_sub(chat_area.height as usize);
-        for (i, (line, bg)) in chat_rows
-            .iter()
-            .skip(chat_skip)
-            .take(chat_area.height as usize)
-            .enumerate()
-        {
-            let y = chat_area.y + i as u16;
-            let rect = Rect::new(chat_area.x, y, chat_area.width, 1);
-            if let Some(style) = bg {
-                Paragraph::new(line.clone())
-                    .style(*style)
-                    .render(rect, frame.buffer_mut());
-            } else {
-                line.clone().render(rect, frame.buffer_mut());
-            }
-        }
-
-        // Status bar (no dark background — sits above the dark input area)
-        // chunks[1] is an empty spacer line above the status bar
-        status_bar.render(chunks[2], frame.buffer_mut());
-
-        // Top padding (dark bg)
-        frame.render_widget(Paragraph::new("").style(bg_style), chunks[3]);
-
-        // Input lines
-        let input_area = chunks[4];
-        let visible_count = input_area.height as usize;
-
-        for row in 0..input_area.height {
-            let y = input_area.y + row;
-            let rect = Rect::new(input_area.x, y, input_area.width, 1);
-            frame.render_widget(Paragraph::new("").style(bg_style), rect);
-        }
-
-        for (i, line_text) in input_lines
-            .iter()
-            .skip(scroll)
-            .take(visible_count)
-            .enumerate()
-        {
-            let line_idx = scroll + i;
-            let prefix = if i == 0 {
-                Span::styled(
-                    " \u{203a} ",
-                    Style::default()
-                        .fg(ACCENT_COLOR)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::styled("   ", bg_style)
-            };
-
-            let content = if line_idx == 0 && line_text.is_empty() && input_lines.len() == 1 {
-                Line::from(vec![
-                    prefix,
-                    Span::styled("Type a message...", Style::default().fg(PLACEHOLDER_COLOR)),
-                ])
-            } else {
-                Line::from(vec![prefix, Span::raw(line_text.as_str())])
-            };
-
-            let y = input_area.y + i as u16;
-            let rect = Rect::new(input_area.x, y, input_area.width, 1);
-            frame.render_widget(Paragraph::new(content).style(bg_style), rect);
-        }
-
-        // Bottom padding
-        frame.render_widget(Paragraph::new("").style(bg_style), chunks[5]);
-
-        // Footer or command popup
-        if let Some(popup) = command_popup {
-            popup.render(chunks[6], frame.buffer_mut());
-        } else {
-            let footer = Line::from(vec![
-                Span::styled("  Enter", Style::default().fg(Color::DarkGray)),
-                Span::styled(" send  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Shift+Enter", Style::default().fg(Color::DarkGray)),
-                Span::styled(" newline  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Ctrl+D", Style::default().fg(Color::DarkGray)),
-                Span::styled(" quit", Style::default().fg(Color::DarkGray)),
-            ]);
-            frame.render_widget(Paragraph::new(footer), chunks[6]);
-        }
-
-        // Cursor
-        let cursor_visible_row = cursor_row.saturating_sub(scroll);
-        let cursor_x = input_area.x + PREFIX_WIDTH as u16 + cursor_col as u16;
-        let cursor_y = input_area.y + cursor_visible_row as u16;
-        frame.set_cursor_position((
-            cursor_x.min(input_area.right().saturating_sub(1)),
-            cursor_y.min(input_area.bottom().saturating_sub(1)),
-        ));
-    })?;
-
-    let _ = execute!(stdout(), SetCursorStyle::BlinkingBar);
-    Ok(())
+        ListItem::new(Line::from(vec![
+            Span::raw(label.to_owned()),
+            Span::styled(
+                suffix,
+                Style::default().fg(if warning { Color::Red } else { ACCENT }),
+            ),
+        ]))
+    });
+    let border_style = if app.focus == Focus::Conversations {
+        Style::default().fg(ACCENT)
+    } else {
+        Style::default().fg(BORDER)
+    };
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(border_style)
+                .title(" Conversations ")
+                .title_bottom(" n new "),
+        )
+        .highlight_style(Style::default().bg(Color::Rgb(42, 48, 58)).bold())
+        .highlight_symbol("› ");
+    let selected = app
+        .selected_conversation
+        .as_ref()
+        .and_then(|selected| peers.iter().position(|peer| peer == selected))
+        .unwrap_or(0);
+    let mut state = ListState::default().with_selected((!peers.is_empty()).then_some(selected));
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// Word wrap respecting terminal width and explicit newlines.
-/// `prefix_width` is the number of characters used by the first-line prefix.
-fn wrap_message(text: &str, width: u16, prefix_width: usize) -> Vec<String> {
-    let max_width = (width as usize).saturating_sub(prefix_width);
-    if max_width == 0 {
-        return vec![text.to_owned()];
+fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App, show_sidebar: bool) {
+    let composer_style = if app.focus == Focus::Composer && app.modal.is_none() {
+        Style::default().fg(ACCENT)
+    } else {
+        Style::default().fg(BORDER)
+    };
+    app.composer.set_block(
+        Block::bordered()
+            .border_style(composer_style)
+            .title(" Message "),
+    );
+    let composer_height = app.composer.measure(area.width).preferred_rows.max(3);
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(3),
+        Constraint::Length(1),
+        Constraint::Length(composer_height),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    render_header(frame, rows[0], app);
+    render_messages(frame, rows[1], app);
+    render_status(frame, rows[2], app);
+    frame.render_widget(&app.composer, rows[3]);
+    render_footer(frame, rows[4], show_sidebar);
+}
+
+fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let (title, subtitle) = app.target_user.as_ref().map_or_else(
+        || {
+            (
+                "No conversation".to_owned(),
+                "Choose or start a conversation".to_owned(),
+            )
+        },
+        |target| {
+            let peer = target.as_str();
+            let title = if peer == app.user_id.as_str() {
+                "Note to self".to_owned()
+            } else {
+                peer.to_owned()
+            };
+            let subtitle = if peer == app.user_id.as_str() {
+                "private notes on this device".to_owned()
+            } else if app.identity_warnings.contains_key(peer) {
+                "security alert: identity key changed".to_owned()
+            } else if app.crypto.has_session(peer) {
+                "end-to-end encrypted".to_owned()
+            } else {
+                "establishing encrypted session".to_owned()
+            };
+            (title, subtitle)
+        },
+    );
+    let has_warning = app
+        .target_user
+        .as_ref()
+        .is_some_and(|target| app.identity_warnings.contains_key(target.as_str()));
+    let subtitle_style = if has_warning {
+        Style::default().fg(Color::Red).bold()
+    } else {
+        Style::default().fg(MUTED)
+    };
+    let header = Paragraph::new(vec![
+        Line::from(title).style(Style::default().bold()),
+        Line::from(subtitle).style(subtitle_style),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(BORDER),
+    );
+    frame.render_widget(header, area);
+}
+
+fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let inner = area.inner(Margin::new(2, 0));
+    if app.target_user.is_none() {
+        app.last_rendered_max_scroll = None;
+        let empty = Paragraph::new("Press Ctrl+N to start a conversation")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(MUTED));
+        frame.render_widget(empty, inner);
+        return;
     }
 
+    let text = message_text(&app.chat_history);
+    let paragraph = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .block(Block::default());
+    let content_rows = paragraph.line_count(inner.width);
+    let visible_rows = inner.height as usize;
+    let max_scroll = content_rows.saturating_sub(visible_rows);
+    if app.message_scroll > 0
+        && let Some(previous_max) = app.last_rendered_max_scroll
+    {
+        app.message_scroll = app
+            .message_scroll
+            .saturating_add(max_scroll.saturating_sub(previous_max));
+    }
+    app.message_scroll = app.message_scroll.min(max_scroll);
+    app.last_rendered_max_scroll = Some(max_scroll);
+    let top = max_scroll.saturating_sub(app.message_scroll);
+    #[allow(clippy::cast_possible_truncation)]
+    let top = top.min(u16::MAX as usize) as u16;
+    frame.render_widget(paragraph.scroll((top, 0)), inner);
+
+    if content_rows > visible_rows {
+        let mut state = ScrollbarState::new(max_scroll).position(top as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area,
+            &mut state,
+        );
+    }
+}
+
+fn message_text(history: &[ChatEntry]) -> Text<'static> {
     let mut lines = Vec::new();
-    for paragraph in text.split('\n') {
-        let mut current = String::new();
-        for word in paragraph.split_whitespace() {
-            if current.is_empty() {
-                word.clone_into(&mut current);
-            } else if current.len() + 1 + word.len() <= max_width {
-                current.push(' ');
-                current.push_str(word);
-            } else {
-                lines.push(current);
-                current = String::new();
-                word.clone_into(&mut current);
-            }
+    for entry in history {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
         }
-        // Always push one line per paragraph (empty for blank lines)
-        lines.push(current);
+        match entry {
+            ChatEntry::Sent(text) => {
+                lines.push(
+                    Line::from("You")
+                        .alignment(Alignment::Right)
+                        .style(Style::default().fg(SENT).bold()),
+                );
+                lines.extend(text.split('\n').map(|part| {
+                    Line::from(part.to_owned())
+                        .alignment(Alignment::Right)
+                        .style(Style::default().fg(Color::White))
+                }));
+            }
+            ChatEntry::Received { sender, text } => {
+                lines.push(Line::from(sender.clone()).style(Style::default().fg(ACCENT).bold()));
+                lines.extend(text.split('\n').map(|part| Line::from(part.to_owned())));
+            }
+            ChatEntry::Status(text) => lines.push(
+                Line::from(text.clone())
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(MUTED)),
+            ),
+            ChatEntry::Warning(text) => lines.push(
+                Line::from(format!("⚠ {text}"))
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::Red).bold()),
+            ),
+        }
     }
-    if lines.is_empty() {
-        lines.push(String::new());
+    Text::from(lines)
+}
+
+fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if let Some(notice) = app.notice_text() {
+        frame.render_widget(
+            Paragraph::new(Line::from(notice.to_owned()).style(Style::default().fg(MUTED))),
+            area,
+        );
+    } else {
+        app.status_bar.render(area, frame.buffer_mut());
     }
-    lines
+}
+
+fn render_footer(frame: &mut Frame<'_>, area: Rect, show_sidebar: bool) {
+    let footer = if area.width < 60 {
+        " Ctrl+N new  Enter send  F1 help"
+    } else if show_sidebar {
+        " Enter send  Shift+Enter newline  PgUp/PgDn scroll  F1 help"
+    } else {
+        " Ctrl+N new  Enter send  Shift+Enter newline  F1 help"
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(MUTED)),
+        area,
+    );
+}
+
+fn render_modal(frame: &mut Frame<'_>, app: &mut App) {
+    let dimensions = match app.modal.as_ref() {
+        Some(Modal::NewChat(_)) => (62, 5),
+        Some(Modal::Help | Modal::Verification(_)) => (62, 16),
+        None => return,
+    };
+    let Some(modal) = &mut app.modal else {
+        return;
+    };
+    let area = centered_rect(frame.area(), dimensions.0, dimensions.1);
+    frame.render_widget(Clear, area);
+    match modal {
+        Modal::NewChat(input) => {
+            input.set_block(
+                Block::bordered()
+                    .border_style(Style::default().fg(ACCENT))
+                    .title(" New conversation ")
+                    .title_bottom(" Enter open  Esc cancel "),
+            );
+            input.set_placeholder_text("username");
+            frame.render_widget(&**input, area);
+        }
+        Modal::Help => render_help(frame, area),
+        Modal::Verification(entries) => render_verification(frame, area, entries),
+    }
+}
+
+fn render_help(frame: &mut Frame<'_>, area: Rect) {
+    let help = Paragraph::new(vec![
+        Line::from("Tab / Esc       move focus"),
+        Line::from("↑ / ↓           choose conversation"),
+        Line::from("n               new conversation"),
+        Line::from("Ctrl+N          new conversation from anywhere"),
+        Line::from("Enter           open or send"),
+        Line::from("Shift+Enter     newline"),
+        Line::from("PageUp/PageDown scroll messages"),
+        Line::from("End             newest message"),
+        Line::from("v / F2          verify contact"),
+        Line::from("Ctrl+C/Ctrl+D   quit"),
+    ])
+    .block(
+        Block::bordered()
+            .border_style(Style::default().fg(ACCENT))
+            .title(" Keyboard help ")
+            .title_bottom(" Esc close "),
+    );
+    frame.render_widget(help, area);
+}
+
+fn render_verification(frame: &mut Frame<'_>, area: Rect, entries: &[ChatEntry]) {
+    let content = message_text(entries);
+    let view = Paragraph::new(content).wrap(Wrap { trim: false }).block(
+        Block::bordered()
+            .border_style(Style::default().fg(ACCENT))
+            .title(" Safety number ")
+            .title_bottom(" y confirm  x clear  Esc close "),
+    );
+    frame.render_widget(view, area);
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(4));
+    let height = height.min(area.height.saturating_sub(2));
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use ratatui::backend::TestBackend;
+
     use super::*;
 
-    // ── wrap_message tests ──
+    fn make_app() -> (App, tempfile::TempDir) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let crypto = crate::crypto_mgr::CryptoManager::load_or_generate(data_dir.path()).unwrap();
+        let user = protocol::UserId::new("alice").unwrap();
+        (App::new(user, crypto, None), data_dir)
+    }
 
-    #[test]
-    fn wrap_empty_string() {
-        let result = wrap_message("", 80, 4);
-        assert_eq!(result, vec![""]);
+    fn render_text(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
-    fn wrap_single_short_word() {
-        let result = wrap_message("hello", 80, 4);
-        assert_eq!(result, vec!["hello"]);
+    fn wide_layout_renders_conversations_and_composer() {
+        let (mut app, _dir) = make_app();
+        let screen = render_text(&mut app, 100, 28);
+
+        assert!(screen.contains("Conversations"));
+        assert!(screen.contains("Note to self"));
+        assert!(screen.contains("No conversation"));
+        assert!(screen.contains("Press Ctrl+N to start a conversation"));
+        assert!(screen.contains("Write a message"));
     }
 
     #[test]
-    fn wrap_fits_in_one_line() {
-        let result = wrap_message("hello world", 80, 4);
-        assert_eq!(result, vec!["hello world"]);
+    fn narrow_layout_keeps_chat_usable_without_sidebar() {
+        let (mut app, _dir) = make_app();
+        let screen = render_text(&mut app, 70, 22);
+
+        assert!(!screen.contains("Conversations"));
+        assert!(screen.contains("No conversation"));
+        assert!(screen.contains("Press Ctrl+N to start a conversation"));
+        assert!(screen.contains("Write a message"));
     }
 
     #[test]
-    fn wrap_splits_long_text() {
-        // width=20, minus 4 prefix = 16 chars max per line
-        let result = wrap_message("the quick brown fox jumps over the lazy dog", 20, 4);
-        assert!(result.len() > 1);
-        for line in &result {
-            assert!(line.len() <= 16, "line too long: {line}");
+    fn active_chat_renders_sent_received_and_warning_entries() {
+        let (mut app, _dir) = make_app();
+        app.target_user = Some(protocol::UserId::new("bob").unwrap());
+        app.chat_history.push(ChatEntry::Received {
+            sender: "bob".to_owned(),
+            text: "hello".to_owned(),
+        });
+        app.chat_history.push(ChatEntry::Sent("hi back".to_owned()));
+        app.chat_history
+            .push(ChatEntry::Warning("identity changed".to_owned()));
+        let screen = render_text(&mut app, 100, 28);
+
+        assert!(screen.contains("bob"));
+        assert!(screen.contains("hello"));
+        assert!(screen.contains("hi back"));
+        assert!(screen.contains("identity changed"));
+    }
+
+    #[test]
+    fn too_small_terminal_shows_clear_requirement() {
+        let (mut app, _dir) = make_app();
+        let screen = render_text(&mut app, 40, 10);
+        assert!(screen.contains("CMP needs a little more room"));
+        assert!(screen.contains("minimum: 50x14"));
+    }
+
+    #[test]
+    fn incoming_content_preserves_scrolled_viewport_anchor() {
+        let (mut app, _dir) = make_app();
+        app.target_user = Some(protocol::UserId::new("bob").unwrap());
+        for index in 0..20 {
+            app.chat_history.push(ChatEntry::Received {
+                sender: "bob".to_owned(),
+                text: format!("message {index}"),
+            });
         }
-    }
+        let _ = render_text(&mut app, 70, 22);
+        app.message_scroll = 5;
+        let previous_max = app.last_rendered_max_scroll.unwrap();
 
-    #[test]
-    fn wrap_single_word_longer_than_width() {
-        // A single word that exceeds max_width stays on one line (no mid-word break)
-        let result = wrap_message("superlongwordthatexceedswidth", 10, 4);
-        assert_eq!(result, vec!["superlongwordthatexceedswidth"]);
-    }
+        app.chat_history.push(ChatEntry::Received {
+            sender: "bob".to_owned(),
+            text: "new message".to_owned(),
+        });
+        let _ = render_text(&mut app, 70, 22);
 
-    #[test]
-    fn wrap_zero_width() {
-        let result = wrap_message("hello", 0, 4);
-        assert_eq!(result, vec!["hello"]);
-    }
-
-    #[test]
-    fn wrap_width_4_leaves_zero_for_text() {
-        // width=4 means max_width=0 after subtracting prefix
-        let result = wrap_message("hello", 4, 4);
-        assert_eq!(result, vec!["hello"]);
-    }
-
-    #[test]
-    fn wrap_message_respects_newlines() {
-        let result = wrap_message("line1\nline2\nline3", 80, 4);
-        assert_eq!(result, vec!["line1", "line2", "line3"]);
-    }
-
-    #[test]
-    fn wrap_message_blank_line_preserved() {
-        let result = wrap_message("above\n\nbelow", 80, 4);
-        assert_eq!(result, vec!["above", "", "below"]);
-    }
-
-    // ── wrap_input tests ──
-
-    #[test]
-    fn wrap_input_single_line() {
-        let (lines, starts) = wrap_input("hello", 20);
-        assert_eq!(lines, vec!["hello"]);
-        assert_eq!(starts, vec![0]);
-    }
-
-    #[test]
-    fn wrap_input_character_wrap() {
-        let (lines, starts) = wrap_input("abcdefghij", 7);
-        assert_eq!(lines, vec!["abcdefg", "hij"]);
-        assert_eq!(starts, vec![0, 7]);
-    }
-
-    #[test]
-    fn wrap_input_explicit_newline() {
-        let (lines, starts) = wrap_input("hello\nworld", 20);
-        assert_eq!(lines, vec!["hello", "world"]);
-        assert_eq!(starts, vec![0, 6]);
-    }
-
-    #[test]
-    fn wrap_input_empty() {
-        let (lines, starts) = wrap_input("", 20);
-        assert_eq!(lines, vec![""]);
-        assert_eq!(starts, vec![0]);
-    }
-
-    #[test]
-    fn wrap_input_newline_at_end() {
-        let (lines, starts) = wrap_input("hello\n", 20);
-        assert_eq!(lines, vec!["hello", ""]);
-        assert_eq!(starts, vec![0, 6]);
-    }
-
-    #[test]
-    fn wrap_input_zero_width() {
-        let (lines, starts) = wrap_input("hello", 0);
-        assert_eq!(lines, vec!["hello"]);
-        assert_eq!(starts, vec![0]);
-    }
-
-    // ── cursor_visual_pos tests ──
-
-    #[test]
-    fn cursor_pos_start() {
-        assert_eq!(cursor_visual_pos(0, &[0]), (0, 0));
-    }
-
-    #[test]
-    fn cursor_pos_mid_first_line() {
-        assert_eq!(cursor_visual_pos(3, &[0, 7]), (0, 3));
-    }
-
-    #[test]
-    fn cursor_pos_second_line() {
-        assert_eq!(cursor_visual_pos(8, &[0, 7]), (1, 1));
-    }
-
-    #[test]
-    fn cursor_pos_at_wrap_boundary() {
-        // Cursor at position 7, line starts at [0, 7]
-        assert_eq!(cursor_visual_pos(7, &[0, 7]), (1, 0));
-    }
-
-    // ── visual_to_cursor tests ──
-
-    #[test]
-    fn visual_to_cursor_start() {
-        assert_eq!(visual_to_cursor(0, 0, &[0], &["hello".into()]), 0);
-    }
-
-    #[test]
-    fn visual_to_cursor_mid() {
-        assert_eq!(visual_to_cursor(0, 3, &[0], &["hello".into()]), 3);
-    }
-
-    #[test]
-    fn visual_to_cursor_second_line() {
-        assert_eq!(
-            visual_to_cursor(1, 2, &[0, 7], &["abcdefg".into(), "hij".into()]),
-            9
-        );
-    }
-
-    #[test]
-    fn visual_to_cursor_clamps_to_line_end() {
-        // Col 10 on a 5-char line → clamp to col 5 (end of line)
-        assert_eq!(visual_to_cursor(0, 10, &[0], &["hello".into()]), 5);
-    }
-
-    #[test]
-    fn visual_to_cursor_past_last_line() {
-        assert_eq!(visual_to_cursor(5, 0, &[0], &["hello".into()]), 5);
+        let growth = app.last_rendered_max_scroll.unwrap() - previous_max;
+        assert_eq!(app.message_scroll, 5 + growth);
     }
 }

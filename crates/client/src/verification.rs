@@ -25,7 +25,7 @@ pub(crate) fn check_peer_identity(
         Ok(db::IdentityKeyStatus::Changed { .. }) => Some(format!(
             "security alert: {peer_id}'s identity key has changed! \
              Previous verification is no longer valid. \
-             Use /verify to see the new safety number."
+             Open verification to see the new safety number."
         )),
         Ok(_) => None,
         Err(e) => {
@@ -35,18 +35,18 @@ pub(crate) fn check_peer_identity(
     }
 }
 
-/// Route `/verify`, `/verify confirm`, and `/verify clear` to the appropriate handler.
-pub(crate) fn handle_command(
+/// Route verification view, confirm, and clear actions to the appropriate handler.
+pub(crate) fn handle_action(
     local_user_id: &str,
     local_key_b64: &str,
     peer_id: &str,
     text: &str,
     conn: Option<&Connection>,
 ) -> Vec<ChatEntry> {
-    if text == "/verify clear" {
+    if text == "clear" {
         return clear_verification(peer_id, conn);
     }
-    if text == "/verify confirm" {
+    if text == "confirm" {
         let Some(conn) = conn else {
             return vec![ChatEntry::Status("database unavailable".to_owned())];
         };
@@ -129,7 +129,7 @@ fn format_verify_output(
         }
         None => {
             lines.push(ChatEntry::Status(
-                "not yet verified — use /verify confirm after comparing numbers".to_owned(),
+                "not yet verified — press y after comparing numbers".to_owned(),
             ));
         }
     }

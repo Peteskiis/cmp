@@ -6,7 +6,7 @@ CMP is an end-to-end encrypted messaging service built in Rust. Uses Signal Prot
 - `protocol` — shared wire types (serde JSON), no business logic
 - `crypto` — Signal Protocol implementation from primitives (pure, no I/O, WASM-portable, `#![deny(unsafe_code)]`)
 - `server` — axum WebSocket relay + store-and-forward queue
-- `client` — ratatui inline TUI (Codex-style chat, CCP `db connect` pattern)
+- `client` — full-screen Ratatui chat workspace with conversation navigation
 
 ## Development Workflow
 
@@ -87,7 +87,7 @@ cargo run -p client -- --user alice  # Run client (production server is default)
 - `protocol` and `crypto` crates must stay platform-agnostic (no TUI, no async runtime in core API)
 - Server never depends on `crypto` — it only routes opaque encrypted blobs
 - Discuss breaking protocol changes before implementation
-- Client TUI uses `ratatui::Viewport::Inline` with `insert_before()` — NOT full-screen alternate screen
+- Client TUI uses a full-screen alternate-screen Ratatui layout with panic-safe restoration
 - Terminal is exclusively owned by the UI task; network task communicates via `mpsc` channels
 - `UserId` is ASCII-only to prevent Unicode normalization attacks
 - `UserId` must reject `/`, `\`, and `..` — peer IDs are used in file paths for session persistence
@@ -130,15 +130,15 @@ cargo run -p client -- --user alice  # Run client (production server is default)
 
 ## Reference Implementations
 
-- CCP `db connect` inline TUI pattern: `~/Developer/projects/cluster/infra/crates/cli/src/commands/db/connect.rs`
 - Codex TUI message styling: `~/Developer/research/codex/codex-rs/tui/src/history_cell.rs`
 - Codex adaptive background: `~/Developer/research/codex/codex-rs/tui/src/style.rs`
 
 ## TUI Rules
 
-- **`Viewport::Inline(N)` height is immutable** — `resize()` ignores the height for inline viewports. Use a large N (40) and top-align content: chat messages fill from top, input sits below, `Min(0)` fills unused space at the bottom. The dark input area expands downward as lines are added.
-- **Render chat messages inside the viewport, not via `insert_before`** — store messages in `chat_history: Vec<ChatEntry>` and render them in `draw_input`. When messages exceed the visible chat area, flush old entries to terminal scrollback via `flush_chat_to_scrollback` (which uses `insert_before`). This keeps recent messages near the input while old ones persist in scrollback.
-- **Use `chat_entry_to_lines` as the single source of truth** for message rendering — both viewport rendering and scrollback flushing use this function. Never duplicate message styling logic.
+- **The terminal must always be restored** — full-screen setup enters the alternate screen and raw mode; normal return, error, and panic paths must leave the alternate screen, disable raw mode, and restore cursor and keyboard flags.
+- **The textarea owns editing behavior** — keep composing, Unicode wrapping, visual-line navigation, paste, selection, undo, and redo in `tui-textarea-2`. Do not reintroduce manual cursor-coordinate or wrapping implementations.
+- **Inactive conversations never render in the active chat** — persist their authenticated messages and increment unread state, then load them only when that conversation is selected.
+- **Message scroll is viewport state** — zero means following the newest message; incoming messages must not force a reader back to the bottom while they are inspecting older history.
 - **Always use immediate local echo for sent messages** — never defer display until server confirmation. Deferred display causes messages to vanish on errors and feels laggy.
 
 ## Self-Improvement

@@ -15,6 +15,7 @@ protocol.workspace = true
 crypto.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+tui-textarea.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 rustls.workspace = true

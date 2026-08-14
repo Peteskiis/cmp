@@ -244,6 +244,18 @@ pub(crate) fn load_recent_messages(
     Ok(messages)
 }
 
+/// List peers with stored messages, most recently active first.
+pub(crate) fn list_conversation_peers(conn: &Connection) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT peer_id
+         FROM messages
+         GROUP BY peer_id
+         ORDER BY MAX(id) DESC",
+    )?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +331,16 @@ mod tests {
         assert_eq!(bob_msgs.len(), 1);
         assert_eq!(alice_msgs[0].body, "to alice");
         assert_eq!(bob_msgs[0].body, "to bob");
+    }
+
+    #[test]
+    fn conversation_peers_are_most_recent_first() {
+        let (conn, _dir) = open_temp_db();
+        insert_message(&conn, "alice", MessageDirection::Sent, "a1", "first").unwrap();
+        insert_message(&conn, "bob", MessageDirection::Received, "b1", "second").unwrap();
+        insert_message(&conn, "alice", MessageDirection::Sent, "a2", "latest").unwrap();
+
+        assert_eq!(list_conversation_peers(&conn).unwrap(), ["alice", "bob"]);
     }
 
     #[test]
