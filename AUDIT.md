@@ -10,7 +10,7 @@ open-source release readiness.
 
 **Remediation status updated:** 2026-08-14. The findings and command output
 below preserve the original audit evidence; the status summary records the
-current implementation after PRs #2 through #4 and subsequent remediation.
+current implementation after PRs #2 through #5 and subsequent remediation.
 
 ## Executive summary
 
@@ -39,8 +39,11 @@ independent cryptographic review.
   versions on every encrypted relay path; the client rejects them before
   duplicate handling or crypto-state mutation; and AEAD associated data binds
   the version, envelope type, X3DH header fields, and Double Ratchet header.
-- **Connection replacement remains open.** The displaced connection is
-  notified but its authenticated read loop is not cancelled immediately.
+- **Connection replacement is resolved.** Each connection registers an explicit
+  cancellation signal; replacement sends the 409 response and cancels the old
+  authenticated read loop before it accepts another message. Cleanup remains
+  conditional on the connection ID, so the displaced loop cannot evict its
+  replacement.
 - **Public-release material remains open.** The repository still needs the
   policy, threat-model, contributor, packaging, and release documentation
   listed below, followed by a full Git-history secret scan.
@@ -190,7 +193,7 @@ Required work:
   AEAD associated data.
 - Add upgrade, downgrade, unsupported-version, and header-tampering tests.
 
-### P2 — Connection replacement does not terminate the displaced session — Open
+### P2 — Connection replacement does not terminate the displaced session — Resolved
 
 Replacing a registered connection sends the old connection a 409 response
 (`crates/server/src/connection.rs:42-56`), but the old server-side read loop is
@@ -261,7 +264,6 @@ Required work:
 - Maximum-size message and queue tests with bounded-memory assertions.
 - Concurrent prekey fetch, malicious draining, replenishment, and signed-prekey
   rotation.
-- Connection replacement and cancellation races.
 - Unsupported versions and authenticated-header tampering.
 - Client network-layer tests using mock or local WebSocket peers.
 - Property tests and fuzz targets for wire JSON, persisted session state,

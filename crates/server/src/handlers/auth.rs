@@ -93,7 +93,11 @@ pub(crate) async fn handle_register(
     }
 
     session.authed_user = Some(uid.to_owned());
-    session.conn_id = Some(state.connections.insert(uid.to_owned(), tx.clone()));
+    session.conn_id = Some(state.connections.insert(
+        uid.to_owned(),
+        tx.clone(),
+        session.cancel.clone(),
+    ));
     info!(user_id = uid, "registered and authenticated");
 
     ServerMessage::AuthSuccess
@@ -194,7 +198,11 @@ pub(crate) async fn handle_auth_response(
 
     // Move user_id out of challenge to avoid double-clone
     let user_id = challenge.user_id;
-    session.conn_id = Some(state.connections.insert(user_id.clone(), tx.clone()));
+    session.conn_id = Some(state.connections.insert(
+        user_id.clone(),
+        tx.clone(),
+        session.cancel.clone(),
+    ));
     session.authed_user = Some(user_id.clone());
     session.deliver_prekey_status = true;
     info!(user_id, "authenticated");

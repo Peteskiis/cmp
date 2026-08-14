@@ -6,7 +6,7 @@ use std::collections::HashSet;
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use protocol::{ClientMessage, OneTimePreKey, ServerMessage};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
 use crate::state::AppState;
@@ -19,21 +19,17 @@ pub(crate) struct Session {
     pub conn_id: Option<u64>,
     pub pending_challenge: Option<auth::PendingChallenge>,
     pub deliver_prekey_status: bool,
-}
-
-impl Default for Session {
-    fn default() -> Self {
-        Self::new()
-    }
+    pub cancel: watch::Sender<bool>,
 }
 
 impl Session {
-    pub(crate) const fn new() -> Self {
+    pub(crate) const fn new(cancel: watch::Sender<bool>) -> Self {
         Self {
             authed_user: None,
             conn_id: None,
             pending_challenge: None,
             deliver_prekey_status: false,
+            cancel,
         }
     }
 }
