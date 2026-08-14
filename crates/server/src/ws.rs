@@ -7,7 +7,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientMessage, ServerMessage};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
 use crate::handlers;
@@ -47,9 +47,26 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
         }
     });
 
-    let mut session = Session::new();
+    let (cancel, mut cancelled) = watch::channel(false);
+    let mut session = Session::new(cancel);
+    let mut was_replaced = false;
 
-    while let Some(Ok(msg)) = stream.next().await {
+    loop {
+        let next = tokio::select! {
+            biased;
+            changed = cancelled.changed() => {
+                was_replaced = changed.is_ok() && *cancelled.borrow();
+                break;
+            }
+            next = stream.next() => next,
+        };
+        let Some(Ok(msg)) = next else {
+            break;
+        };
+        if *cancelled.borrow() {
+            was_replaced = true;
+            break;
+        }
         let text = match msg {
             Message::Text(t) => t,
             Message::Close(_) => break,
@@ -96,5 +113,23 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
         info!(user_id, "disconnected");
     }
 
-    write_task.abort();
+    finish_writer(was_replaced, tx, write_task).await;
+}
+
+async fn finish_writer(
+    was_replaced: bool,
+    tx: mpsc::Sender<ServerMessage>,
+    mut write_task: tokio::task::JoinHandle<()>,
+) {
+    if !was_replaced {
+        write_task.abort();
+        return;
+    }
+    drop(tx);
+    if tokio::time::timeout(std::time::Duration::from_secs(1), &mut write_task)
+        .await
+        .is_err()
+    {
+        write_task.abort();
+    }
 }
