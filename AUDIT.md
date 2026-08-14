@@ -44,9 +44,14 @@ independent cryptographic review.
   authenticated read loop before it accepts another message. Cleanup remains
   conditional on the connection ID, so the displaced loop cannot evict its
   replacement.
-- **Public-release material remains open.** The repository still needs the
-  policy, threat-model, contributor, packaging, and release documentation
-  listed below, followed by a full Git-history secret scan.
+- **Public-source material is resolved.** The repository now includes the
+  license, security and vulnerability-reporting policy, threat model,
+  contributor and conduct guidance, changelog, hosted-service privacy and abuse
+  terms, self-hosting/backup documentation, issue and pull-request templates,
+  explicit Cargo non-publication policy, and credential-free deployment
+  manifest. The complete Git history was scanned with Gitleaks before public
+  visibility. Reproducible signed release automation remains a separate alpha
+  release gate.
 
 ## Findings
 
@@ -207,7 +212,7 @@ Required work:
 - Test old-connection rejection, new-connection delivery, and conditional
   registry cleanup under races.
 
-### P2 — Public-release material is largely absent — Open
+### P2 — Public-release material is largely absent — Resolved for source visibility
 
 The repository has no root README, license text, security policy, contribution
 guide, code of conduct, changelog, CI workflow, automated release workflow, or

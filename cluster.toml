@@ -1,6 +1,9 @@
 name = "cmp"
 mode = "binary"
 
+# Safe, credential-free deployment manifest. Build the target binary before
+# deploying and keep environment-specific secrets outside this file.
+
 [binary]
 path = "./target/x86_64-unknown-linux-gnu/release/server"
 runtime = "debian"

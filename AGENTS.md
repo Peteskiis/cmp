@@ -14,6 +14,10 @@ CMP is an end-to-end encrypted messaging service built in Rust. Uses Signal Prot
 2. `make check` (runs formatting, type, lint, test, documentation, source-size,
    and dependency-policy checks)
 
+Before running a recursive worktree scanner, derive its input from
+`git ls-files --cached --others --exclude-standard`. Never point scanners at the
+repository root when ignored build outputs such as `target/` are present.
+
 Or individually:
 1. `make fmt` — format code
 2. `make lint` — clippy (strict)
