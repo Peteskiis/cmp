@@ -118,7 +118,10 @@ pub async fn rotate_signed_prekey(
         if let Some((existing_key, existing_signature)) = existing {
             tx.rollback()?;
             return Ok(
-                if existing_key == public_key && existing_signature == signature {
+                if key_id == current_id
+                    && existing_key == public_key
+                    && existing_signature == signature
+                {
                     SignedPreKeyRotationResult::Accepted {
                         current_key_id: current_id,
                     }
@@ -129,7 +132,7 @@ pub async fn rotate_signed_prekey(
                 },
             );
         }
-        if current_id.checked_add(1) != Some(key_id) {
+        if key_id <= current_id {
             tx.rollback()?;
             return Ok(SignedPreKeyRotationResult::InvalidSequence {
                 current_key_id: current_id,
@@ -364,8 +367,21 @@ mod tests {
             ));
         }
 
+        assert!(matches!(
+            rotate_signed_prekey(&conn, "alice", 2, &[2; 32], &[2; 64])
+                .await
+                .unwrap(),
+            SignedPreKeyRotationResult::Conflict { current_key_id: 3 }
+        ));
+        assert!(matches!(
+            rotate_signed_prekey(&conn, "alice", 7, &[7; 32], &[7; 64])
+                .await
+                .unwrap(),
+            SignedPreKeyRotationResult::Accepted { current_key_id: 7 }
+        ));
+
         let current = get_signed_prekey(&conn, "alice").await.unwrap().unwrap();
-        assert_eq!(current.0, 3);
+        assert_eq!(current.0, 7);
         conn.call(|conn| {
             let ids = conn
                 .prepare(
@@ -374,7 +390,7 @@ mod tests {
                 )?
                 .query_map([], |row| row.get::<_, u32>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            assert_eq!(ids, vec![3, 2]);
+            assert_eq!(ids, vec![7, 3]);
             Ok(())
         })
         .await

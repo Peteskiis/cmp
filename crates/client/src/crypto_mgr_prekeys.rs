@@ -7,6 +7,11 @@ use super::{B64, CryptoError, CryptoManager, PendingOutbound, ensure_capacity};
 const SIGNED_PREKEY_PRIVATE_HISTORY: usize = 3;
 
 impl CryptoManager {
+    #[cfg(test)]
+    pub(crate) const fn force_signed_prekey_rotation_due(&mut self) {
+        self.signed_prekey_rotated_at = 0;
+    }
+
     pub(crate) fn expire_stale_prekey_session(
         &mut self,
         peer_id: &str,
@@ -108,20 +113,20 @@ impl CryptoManager {
         Ok(())
     }
 
-    pub(crate) fn queue_signed_prekey_rotation(&mut self) -> Result<(), CryptoError> {
+    pub(crate) fn queue_signed_prekey_rotation(&mut self) -> Result<bool, CryptoError> {
         if self
             .pending_outbound
             .iter()
             .any(|pending| matches!(pending, PendingOutbound::SignedPreKeyRotation { .. }))
         {
-            return Ok(());
+            return Ok(false);
         }
         let now = crate::crypto_replay::now_secs();
         if self.signed_prekey_rotated_at != 0
             && now.saturating_sub(self.signed_prekey_rotated_at)
                 < protocol::consts::SIGNED_PREKEY_ROTATION_SECS
         {
-            return Ok(());
+            return Ok(false);
         }
         let current_id = self
             .stored_spk
@@ -164,7 +169,7 @@ impl CryptoManager {
             self.next_signed_prekey_id = previous_next_signed_prekey_id;
             return Err(CryptoError::Persistence(error));
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn confirm_signed_prekey_rotated(
@@ -182,7 +187,11 @@ impl CryptoManager {
         }) else {
             return Ok(None);
         };
-        if accepted {
+        let candidate_key_id = match &self.pending_outbound[index] {
+            PendingOutbound::SignedPreKeyRotation { key_id, .. } => *key_id,
+            _ => anyhow::bail!("signed prekey rotation missing"),
+        };
+        if accepted && candidate_key_id == current_key_id {
             self.confirm_accepted_signed_prekey_rotation(index, rotation_id)?;
             return Ok(None);
         }

@@ -211,13 +211,11 @@ pub(crate) async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
     print_banner(user_id, server_url);
 
     let (mut terminal, _guard) = ui::init()?;
-    let mut app = App::new(validated_uid, crypto, db);
-    if app.db.is_none() {
-        app.status("warning: message history unavailable");
-    }
-    app.chat_history
-        .push(ChatEntry::Tip("Tip: type / for commands".to_owned()));
+    let mut app = initialized_app(validated_uid, crypto, db);
     let mut event_stream = EventStream::new();
+    let mut lifecycle_tick = tokio::time::interval(Duration::from_mins(1));
+    lifecycle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    lifecycle_tick.tick().await;
 
     while app.running {
         let term_width = terminal.size()?.width as usize;
@@ -266,10 +264,27 @@ pub(crate) async fn run(user_id: &str, server_url: &str) -> anyhow::Result<()> {
             () = status_tick => {
                 app.status_bar.tick();
             }
+            _ = lifecycle_tick.tick() => {
+                prekeys::handle_lifecycle_tick(&mut app, &outgoing_tx);
+            }
         }
     }
 
     Ok(())
+}
+
+fn initialized_app(
+    user_id: UserId,
+    crypto: CryptoManager,
+    db: Option<rusqlite::Connection>,
+) -> App {
+    let mut app = App::new(user_id, crypto, db);
+    if app.db.is_none() {
+        app.status("warning: message history unavailable");
+    }
+    app.chat_history
+        .push(ChatEntry::Tip("Tip: type / for commands".to_owned()));
+    app
 }
 
 fn print_banner(user_id: &str, server_url: &str) {

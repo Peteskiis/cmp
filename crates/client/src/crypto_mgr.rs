@@ -793,5 +793,8 @@ impl CryptoManager {
     }
 }
 #[cfg(test)]
+#[path = "crypto_mgr_signed_prekey_tests.rs"]
+mod signed_prekey_tests;
+#[cfg(test)]
 #[path = "crypto_mgr_tests.rs"]
 mod tests;

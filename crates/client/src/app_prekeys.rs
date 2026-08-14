@@ -9,6 +9,35 @@ pub(super) fn queue_signed_prekey_rotation(app: &mut App) {
     }
 }
 
+pub(super) fn handle_lifecycle_tick(
+    app: &mut App,
+    outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
+) {
+    if !app.authenticated {
+        return;
+    }
+    queue_due_rotation(app, outgoing_tx);
+}
+
+fn queue_due_rotation(app: &mut App, outgoing_tx: &mpsc::UnboundedSender<ClientMessage>) {
+    match app.crypto.queue_signed_prekey_rotation() {
+        Ok(true) => send_pending_rotation(app, outgoing_tx),
+        Ok(false) => {}
+        Err(error) => tracing::warn!("failed to queue scheduled signed prekey rotation: {error}"),
+    }
+}
+
+fn send_pending_rotation(app: &App, outgoing_tx: &mpsc::UnboundedSender<ClientMessage>) {
+    if let Some(rotation) = app
+        .crypto
+        .pending_messages()
+        .into_iter()
+        .find(|message| matches!(message, ClientMessage::RotateSignedPreKey { .. }))
+    {
+        let _ = outgoing_tx.send(rotation);
+    }
+}
+
 pub(super) fn handle_prekey_low(
     app: &mut App,
     outgoing_tx: &mpsc::UnboundedSender<ClientMessage>,
@@ -119,5 +148,36 @@ pub(super) fn handle_message_rejected(
         }
         Ok(None) => {}
         Err(error) => tracing::warn!("failed to retire rejected outbound message: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crypto::keys::SignedPreKey;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::crypto_mgr::CryptoManager;
+
+    #[test]
+    fn lifecycle_tick_queues_and_sends_due_rotation_once() {
+        let data_dir = TempDir::new().unwrap();
+        let mut crypto = CryptoManager::load_or_generate(data_dir.path()).unwrap();
+        let signed_prekey = SignedPreKey::generate(0, crypto.identity());
+        crypto
+            .persist_registration_keys(&signed_prekey, &[])
+            .unwrap();
+        crypto.force_signed_prekey_rotation_due();
+        let mut app = App::new(UserId::new("alice").unwrap(), crypto, None);
+        app.authenticated = true;
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+
+        handle_lifecycle_tick(&mut app, &outgoing_tx);
+        assert!(matches!(
+            outgoing_rx.try_recv().unwrap(),
+            ClientMessage::RotateSignedPreKey { key_id: 1, .. }
+        ));
+        handle_lifecycle_tick(&mut app, &outgoing_tx);
+        assert!(outgoing_rx.try_recv().is_err());
     }
 }
