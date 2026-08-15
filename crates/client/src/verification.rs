@@ -22,7 +22,7 @@ pub(crate) fn check_peer_identity(
         return None;
     }
     match db::store_peer_identity_key(conn, peer_id, identity_key_b64) {
-        Ok(db::IdentityKeyStatus::Changed { .. }) => Some(format!(
+        Ok(db::IdentityKeyStatus::Changed) => Some(format!(
             "security alert: {peer_id}'s identity key has changed! \
              Previous verification is no longer valid. \
              Open verification to see the new safety number."
@@ -207,7 +207,7 @@ mod tests {
 
         assert!(matches!(
             db::store_peer_identity_key(&conn, "bob", &key2).unwrap(),
-            db::IdentityKeyStatus::Changed { .. }
+            db::IdentityKeyStatus::Changed
         ));
     }
 

@@ -110,14 +110,13 @@ pub(crate) fn insert_message(
 }
 
 /// Result of storing a peer's identity key — indicates whether it changed.
-#[allow(dead_code)] // `Changed::old_key` reserved for future identity-change UI
 pub(crate) enum IdentityKeyStatus {
     /// First time seeing this peer's key.
     New,
     /// Key matches the stored value.
     Unchanged,
     /// Key differs from the stored value.
-    Changed { old_key: String },
+    Changed,
 }
 
 /// Store a peer's identity key. Returns the status indicating whether this is
@@ -142,7 +141,7 @@ pub(crate) fn store_peer_identity_key(
 
     let status = match existing {
         Some(ref stored) if stored == identity_key_b64 => IdentityKeyStatus::Unchanged,
-        Some(old_key) => {
+        Some(_) => {
             tx.execute(
                 "UPDATE peer_identity_keys SET identity_key = ?2, first_seen = unixepoch()
                  WHERE peer_id = ?1",
@@ -152,7 +151,7 @@ pub(crate) fn store_peer_identity_key(
                 "DELETE FROM verified_contacts WHERE peer_id = ?1",
                 params![peer_id],
             )?;
-            IdentityKeyStatus::Changed { old_key }
+            IdentityKeyStatus::Changed
         }
         None => {
             tx.execute(

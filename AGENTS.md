@@ -23,6 +23,9 @@ Or individually:
 2. `make lint` — clippy (strict)
 3. `make test` — run all tests
 
+`cargo test` accepts only one positional test filter. Run separate commands when
+verifying multiple focused test modules.
+
 ## Commands Reference
 
 ```sh

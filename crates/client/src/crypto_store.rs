@@ -83,11 +83,7 @@ impl CryptoStore {
 
     pub(crate) fn save_core<T: Serialize>(&self, core: &T) -> anyhow::Result<()> {
         let json = serde_json::to_string(core)?;
-        self.connection.execute(
-            "INSERT INTO core_state (id, json) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
-            [json],
-        )?;
+        upsert_core_state(&self.connection, &json)?;
         Ok(())
     }
 
@@ -100,11 +96,7 @@ impl CryptoStore {
         let core = serde_json::to_string(core)?;
         let outbound = serde_json::to_string(outbound)?;
         let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute(
-            "INSERT INTO core_state (id, json) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
-            [core],
-        )?;
+        upsert_core_state(&transaction, &core)?;
         transaction.execute(
             "INSERT INTO outbox (correlation_id, payload) VALUES (?1, ?2)",
             params![correlation_id, outbound],
@@ -120,11 +112,7 @@ impl CryptoStore {
     ) -> anyhow::Result<()> {
         let core = serde_json::to_string(core)?;
         let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute(
-            "INSERT INTO core_state (id, json) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
-            [core],
-        )?;
+        upsert_core_state(&transaction, &core)?;
         transaction.execute(
             "INSERT INTO processed_messages
                 (peer_id, message_id, pending_plaintext, processed_at)
@@ -168,11 +156,7 @@ impl CryptoStore {
     ) -> anyhow::Result<()> {
         let core = serde_json::to_string(core)?;
         let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute(
-            "INSERT INTO core_state (id, json) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
-            [core],
-        )?;
+        upsert_core_state(&transaction, &core)?;
         transaction.execute(
             "DELETE FROM outbox WHERE correlation_id = ?1",
             [correlation_id],
@@ -191,11 +175,7 @@ impl CryptoStore {
         let core = serde_json::to_string(core)?;
         let outbound = serde_json::to_string(outbound)?;
         let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute(
-            "INSERT INTO core_state (id, json) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
-            [core],
-        )?;
+        upsert_core_state(&transaction, &core)?;
         transaction.execute(
             "DELETE FROM outbox WHERE correlation_id = ?1",
             [old_correlation_id],
@@ -237,6 +217,15 @@ impl CryptoStore {
         )?;
         Ok(())
     }
+}
+
+fn upsert_core_state(connection: &Connection, json: &str) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO core_state (id, json) VALUES (1, ?1)
+         ON CONFLICT(id) DO UPDATE SET json = excluded.json",
+        [json],
+    )?;
+    Ok(())
 }
 
 pub(crate) struct ProcessedRow {
